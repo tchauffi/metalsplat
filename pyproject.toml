@@ -1,0 +1,24 @@
+[project]
+name = "metalsplat"
+version = "0.1.0"
+description = "Differentiable 3D Gaussian Splatting for PyTorch on Apple Metal/MPS"
+readme = "README.md"
+authors = [
+    { name = "Thibaut CHAUFFIER", email = "tchauffi@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "pillow>=12.3.0",
+    "pycolmap>=4.2.0",
+    "torch>=2.14.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

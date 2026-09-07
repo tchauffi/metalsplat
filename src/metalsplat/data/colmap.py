@@ -1,0 +1,115 @@
+"""Loads a COLMAP sparse reconstruction (cameras/images/points3D) into
+Camera objects, images, and an initial point cloud for GaussianModel.
+
+Expects the standard COLMAP project layout:
+    <scene_root>/sparse/0/{cameras,images,points3D}.bin
+    <scene_root>/<image_dir>/*.jpg  (image_dir defaults to "images")
+
+The images on disk may be downsampled relative to the resolution COLMAP was
+calibrated at (common in released datasets, e.g. MipNeRF360's `images` vs.
+`images_4`); intrinsics are rescaled per-image to match each image's actual
+size on disk.
+
+Only undistorted camera models (PINHOLE, SIMPLE_PINHOLE) are supported --
+this pipeline's projection assumes an ideal pinhole camera with no lens
+distortion (see README roadmap).
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+# torch and pycolmap each bundle their own OpenMP runtime; loading both in
+# one process aborts with "OMP: Error #15: Initializing libomp.dylib, but
+# found libomp.dylib already initialized" unless this is set before
+# pycolmap is imported. Benign here -- there's no shared OpenMP state
+# between the two libraries in this codebase.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import pycolmap  # noqa: E402
+import torch  # noqa: E402
+from PIL import Image  # noqa: E402
+
+from metalsplat.camera import Camera
+
+_SUPPORTED_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
+
+
+@dataclass
+class ColmapScene:
+    cameras: list[Camera]
+    images: list[torch.Tensor]  # (H, W, 3) float32 in [0, 1], aligned with `cameras`
+    image_names: list[str]
+    points: torch.Tensor  # (P, 3) float32
+    colors: torch.Tensor  # (P, 3) float32 in [0, 1]
+
+
+def _camera_intrinsics(cam: "pycolmap.Camera") -> tuple[float, float, float, float]:
+    model = cam.model.name
+    if model not in _SUPPORTED_MODELS:
+        raise ValueError(
+            f"Unsupported COLMAP camera model '{model}' -- only {sorted(_SUPPORTED_MODELS)} "
+            "are supported (this pipeline assumes an undistorted pinhole camera)."
+        )
+    if model == "PINHOLE":
+        fx, fy, cx, cy = cam.params
+    else:  # SIMPLE_PINHOLE
+        f, cx, cy = cam.params
+        fx = fy = f
+    return float(fx), float(fy), float(cx), float(cy)
+
+
+def load_colmap_scene(
+    scene_root: str | Path,
+    image_dir: str = "images",
+    sparse_subdir: str = "sparse/0",
+    device: str | torch.device = "cpu",
+) -> ColmapScene:
+    scene_root = Path(scene_root)
+    rec = pycolmap.Reconstruction(str(scene_root / sparse_subdir))
+
+    images_by_name = sorted(rec.images.values(), key=lambda im: im.name)
+
+    cameras: list[Camera] = []
+    images: list[torch.Tensor] = []
+    image_names: list[str] = []
+
+    for colmap_image in images_by_name:
+        image_path = scene_root / image_dir / colmap_image.name
+        pil_image = Image.open(image_path).convert("RGB")
+        actual_width, actual_height = pil_image.size
+
+        colmap_cam = rec.cameras[colmap_image.camera_id]
+        fx, fy, cx, cy = _camera_intrinsics(colmap_cam)
+        scale = actual_width / colmap_cam.width
+        fx, fy, cx, cy = fx * scale, fy * scale, cx * scale, cy * scale
+
+        cam_from_world = colmap_image.cam_from_world()
+        R_wc = torch.from_numpy(np.array(cam_from_world.rotation.matrix(), dtype=np.float32))
+        t_wc = torch.from_numpy(np.array(cam_from_world.translation, dtype=np.float32))
+
+        cameras.append(
+            Camera(
+                R_wc=R_wc, t_wc=t_wc, fx=fx, fy=fy, cx=cx, cy=cy,
+                img_width=actual_width, img_height=actual_height,
+            ).to(device)
+        )
+        image_tensor = torch.from_numpy(np.array(pil_image, dtype=np.float32) / 255.0)
+        images.append(image_tensor.to(device))
+        image_names.append(colmap_image.name)
+
+    points3d = list(rec.points3D.values())
+    points = torch.from_numpy(
+        np.stack([p.xyz for p in points3d]).astype(np.float32)
+    ).to(device)
+    colors = torch.from_numpy(
+        (np.stack([p.color for p in points3d]).astype(np.float32)) / 255.0
+    ).to(device)
+
+    return ColmapScene(
+        cameras=cameras, images=images, image_names=image_names, points=points, colors=colors
+    )
