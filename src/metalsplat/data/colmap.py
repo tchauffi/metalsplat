@@ -18,6 +18,7 @@ distortion (see README roadmap).
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,10 +40,49 @@ from metalsplat.camera import Camera
 _SUPPORTED_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
 
 
+class ImageStore(Sequence):
+    """Training images held as uint8 on device, converted on access.
+
+    A capture's images dominate GPU memory, not the model. On the garden
+    scene (185 images at 1297x840) they take 2.42GB as float32 against
+    103MB for a 438k-gaussian degree-3 model plus 207MB of Adam state --
+    24x the model, and the reason an "idle" session showed 2.5GB
+    allocated. Stored as uint8 they take 0.60GB.
+
+    Indexing returns float32 in [0, 1], so callers are unchanged and there
+    is no way to accidentally use raw 0-255 values as if they were
+    normalised. The cost is one cast per access -- about 13MB for a single
+    image, against a ~100ms training step, so it does not register.
+
+    Use `.nbytes` to measure the store itself; iterating it materialises
+    every image as float and defeats the point.
+    """
+
+    def __init__(self, images_u8: list[torch.Tensor]):
+        self._images = images_u8
+
+    def __len__(self) -> int:
+        return len(self._images)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        return self._images[index].float() / 255.0
+
+    @property
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self._images)
+
+    @property
+    def raw(self) -> list[torch.Tensor]:
+        """The underlying uint8 tensors, for callers that want them undivided."""
+        return self._images
+
+
 @dataclass
 class ColmapScene:
     cameras: list[Camera]
-    images: list[torch.Tensor]  # (H, W, 3) float32 in [0, 1], aligned with `cameras`
+    images: ImageStore  # indexes to (H, W, 3) float32 in [0, 1], aligned with `cameras`
     image_names: list[str]
     points: torch.Tensor  # (P, 3) float32
     colors: torch.Tensor  # (P, 3) float32 in [0, 1]
@@ -98,7 +138,8 @@ def load_colmap_scene(
                 img_width=actual_width, img_height=actual_height,
             ).to(device)
         )
-        image_tensor = torch.from_numpy(np.array(pil_image, dtype=np.float32) / 255.0)
+        # Kept as uint8; ImageStore converts on access. See its docstring.
+        image_tensor = torch.from_numpy(np.array(pil_image, dtype=np.uint8))
         images.append(image_tensor.to(device))
         image_names.append(colmap_image.name)
 
@@ -111,5 +152,6 @@ def load_colmap_scene(
     ).to(device)
 
     return ColmapScene(
-        cameras=cameras, images=images, image_names=image_names, points=points, colors=colors
+        cameras=cameras, images=ImageStore(images), image_names=image_names,
+        points=points, colors=colors
     )

@@ -258,9 +258,13 @@ def memory_report(model: GaussianModel, cam: Camera, images: list | None = None)
 
     print()
     if images:
-        img_bytes = sum(t.numel() * t.element_size() for t in images)
-        print(f"  {f'training images ({len(images)}, {images[0].dtype})':<40}{img_bytes / 1e6:>9.1f}MB")
-        print(f"  {'  ... the same images as uint8':<40}{img_bytes / 4 / 1e6:>9.1f}MB")
+        # .nbytes, not a sum over the store: iterating it would convert
+        # every image to float32 and allocate the very thing we avoid.
+        img_bytes = getattr(images, "nbytes", None)
+        if img_bytes is None:
+            img_bytes = sum(t.numel() * t.element_size() for t in images)
+        print(f"  {f'training images ({len(images)}, uint8 on device)':<40}{img_bytes / 1e6:>9.1f}MB")
+        print(f"  {'  ... had they been float32':<40}{img_bytes * 4 / 1e6:>9.1f}MB")
     print(f"  {'model parameters':<40}{total_param_bytes / 1e6:>9.1f}MB")
     print(f"  {'+ Adam state (2 moments per param)':<40}{2 * total_param_bytes / 1e6:>9.1f}MB")
     print(f"  {'live tensors, idle':<40}{base / 1e6:>9.1f}MB")
