@@ -53,7 +53,20 @@ INIT_OPACITY = 0.1
 DENSIFY_START = 1000
 DENSIFY_STOP = 15_000
 DENSIFY_INTERVAL = 250
-DENSIFY_GRAD_PERCENTILE = 0.9  # top 10% by screen-space gradient each round
+# Densification bar. The percentile is only used to *calibrate*: the first
+# densification round takes this quantile of the observed gradients and
+# freezes it as an absolute threshold for the rest of training.
+#
+# A percentile applied every round never self-limits -- it promotes a fixed
+# fraction however well-fit the model already is, so the count grows
+# geometrically (measured: ~9.5% per round) until it hits DENSIFY_MAX_POINTS
+# and then sits there with ~10% of the model brand new every 250 steps. With
+# the old 400k cap that saturated early and the model settled; with a 5M cap
+# and a 14000-step window it would have compounded to ~22M and never
+# settled. An absolute bar decays naturally as gaussians fit their region,
+# which is what the reference implementation relies on.
+DENSIFY_GRAD_PERCENTILE = 0.9  # calibration quantile for the first round only
+DENSIFY_GRAD_THRESHOLD = None  # None = calibrate from the first round
 DENSIFY_MAX_POINTS = 5_000_000
 
 # Loss-driven seeding schedule (fills sky/distant-background gaps that
@@ -236,6 +249,9 @@ def main() -> None:
             model.means.detach(), scene.cameras, sampling_scale=FILTER_3D_SCALE
         )
 
+    # Calibrated on the first densification round, then held fixed.
+    densify_threshold = DENSIFY_GRAD_THRESHOLD
+
     filter_3d = recompute_filter_3d()
     if filter_3d is not None:
         seen = (filter_3d > 0).float().mean().item()
@@ -289,7 +305,15 @@ def main() -> None:
             model, stats = densify_and_prune(
                 model, grad_accum, grad_count, scene_scale=scene_scale,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE, max_points=DENSIFY_MAX_POINTS,
+                grad_threshold=densify_threshold,
             )
+            if densify_threshold is None:
+                densify_threshold = stats.grad_threshold
+                print(
+                    f"  densify threshold calibrated to {densify_threshold:.3e} "
+                    f"(p{100 * DENSIFY_GRAD_PERCENTILE:.0f} of round 1); fixed from here",
+                    flush=True,
+                )
             optimizer = migrate_optimizer_state(
                 optimizer, make_optimizer(model, lr_means, lr_other), stats.source_index
             )

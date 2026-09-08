@@ -29,6 +29,9 @@ class DensifyStats:
     n_cloned: int  # gaussians duplicated in place
     n_pruned: int  # gaussians removed (low opacity)
     n_after: int
+    # The absolute screen-space gradient bar used this round. Pass it back in
+    # as `grad_threshold` to freeze it; see densify_and_prune.
+    grad_threshold: float = 0.0
     # (n_after,) int64: where each surviving gaussian came from in the old
     # model, or NEW_GAUSSIAN (-1) if it was just created. Feed this to
     # metalsplat.optim.migrate_optimizer_state -- rebuilding the optimizer
@@ -48,10 +51,28 @@ def densify_and_prune(
     grad_count: torch.Tensor,  # (N,) number of steps each gaussian was visible
     scene_scale: float,
     grad_percentile: float = 0.8,
+    grad_threshold: float | None = None,
     prune_opacity_thresh: float = 0.005,
     split_scale_factor: float = 1.6,
     max_points: int | None = None,
 ) -> tuple[GaussianModel, DensifyStats]:
+    """Splits, clones and prunes, returning the new model and stats.
+
+    `grad_threshold`, if given, is an *absolute* bar on the average
+    screen-space gradient: a gaussian is a split/clone candidate only if it
+    exceeds it. This is what the reference implementation does, and it
+    matters because it self-limits -- as gaussians fit their region their
+    gradients fall below the bar and densification stops on its own.
+
+    With `grad_threshold=None` the bar is the `grad_percentile` quantile of
+    this round's gradients instead, which does *not* self-limit: it
+    promotes a fixed fraction every round no matter how well-fit the model
+    is, so the count grows geometrically until it hits `max_points` and
+    then sits there with a large fraction of the model perpetually new.
+    That is fine when the cap is the real constraint and disastrous when it
+    is not, so the returned `stats.grad_threshold` lets a caller calibrate
+    on the first round and freeze it thereafter.
+    """
     device = model.means.device
     n = model.num_points
 
@@ -59,11 +80,16 @@ def densify_and_prune(
     n_before = n
     if not bool(visible.any()) or (max_points is not None and n >= max_points):
         unchanged = torch.arange(n, device=device)
-        return model, DensifyStats(n_before, 0, 0, 0, n_before, unchanged, unchanged)
+        return model, DensifyStats(
+            n_before, 0, 0, 0, n_before, float(grad_threshold or 0.0), unchanged, unchanged
+        )
 
     avg_grad = torch.zeros(n, device=device)
     avg_grad[visible] = grad_accum[visible] / grad_count[visible]
-    threshold = torch.quantile(avg_grad[visible], grad_percentile)
+    if grad_threshold is None:
+        threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
+    else:
+        threshold = float(grad_threshold)
     candidates = visible & (avg_grad >= threshold)
 
     means = model.means.detach()
@@ -152,6 +178,7 @@ def densify_and_prune(
         n_cloned=int(clone_idx.numel()),
         n_pruned=n_pruned,
         n_after=n_after,
+        grad_threshold=threshold,
         source_index=source_index,
         parent_index=parent_index,
     )

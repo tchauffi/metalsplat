@@ -158,3 +158,87 @@ def test_rebuilds_preserve_active_sh_degree():
     pruned, n_pruned, _ = prune_low_opacity(densified)
     assert n_pruned > 0
     assert pruned.active_sh_degree == 1
+
+
+def _grad_scene(n, top_frac=0.1, big=10.0, small=1.0):
+    model = _model(n)
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), small)
+    grad_accum[: int(n * top_frac)] = big
+    return model, grad_accum, grad_count
+
+
+def test_absolute_threshold_selects_only_gaussians_above_it():
+    n = 100
+    model, grad_accum, grad_count = _grad_scene(n)
+
+    # A bar between the two populations promotes exactly the large-gradient
+    # ones, regardless of what fraction of the model they happen to be.
+    _, stats = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_threshold=5.0
+    )
+    assert stats.n_split + stats.n_cloned == 10
+
+    # A bar above everything promotes nothing: this is what lets
+    # densification stop on its own.
+    _, none_stats = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_threshold=50.0
+    )
+    assert none_stats.n_split + none_stats.n_cloned == 0
+    assert none_stats.n_after == none_stats.n_before
+
+
+def test_percentile_promotes_a_fixed_fraction_however_well_fit():
+    # The failure mode the absolute bar exists to avoid: with a percentile,
+    # a uniformly well-fit model still densifies 10% of itself.
+    n = 100
+    model = _model(n)
+    grad_count = torch.ones(n)
+
+    for magnitude in (10.0, 1e-6):  # large gradients, then essentially converged
+        _, stats = densify_and_prune(
+            model, torch.full((n,), magnitude), grad_count,
+            scene_scale=SCENE_SCALE, grad_percentile=0.9,
+        )
+        assert stats.n_split + stats.n_cloned > 0, (
+            "percentile densified nothing; the test no longer shows the problem"
+        )
+
+
+def test_calibrated_threshold_makes_densification_decay():
+    # Freeze the bar from round one, then let the gradients fall as a model
+    # settles: the same threshold must promote steadily fewer gaussians.
+    n = 200
+    model, grad_accum, grad_count = _grad_scene(n)
+
+    _, first = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.9
+    )
+    bar = first.grad_threshold
+    assert bar > 0
+
+    promoted = []
+    for decay in (1.0, 0.5, 0.1):
+        m = _model(n)
+        _, stats = densify_and_prune(
+            m, grad_accum * decay, grad_count, scene_scale=SCENE_SCALE, grad_threshold=bar
+        )
+        promoted.append(stats.n_split + stats.n_cloned)
+
+    assert promoted[0] > 0
+    assert promoted == sorted(promoted, reverse=True), promoted
+    assert promoted[-1] == 0, "a settled model should stop densifying entirely"
+
+
+def test_reported_threshold_round_trips():
+    n = 50
+    model, grad_accum, grad_count = _grad_scene(n)
+    _, stats = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.9
+    )
+    # Feeding the reported bar back in reproduces the same selection.
+    m2 = _model(n)
+    _, again = densify_and_prune(
+        m2, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_threshold=stats.grad_threshold
+    )
+    assert again.n_split + again.n_cloned == stats.n_split + stats.n_cloned
