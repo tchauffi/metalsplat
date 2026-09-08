@@ -43,16 +43,25 @@ class Camera:
         img_width: int,
         img_height: int,
     ) -> Camera:
-        """Builds a camera looking from `eye` toward `target`."""
+        """Builds a camera looking from `eye` toward `target`.
+
+        `up` is the world-space up direction; it only needs to be roughly
+        right, it gets orthogonalised against the view direction.
+        """
         forward = target - eye
         forward = forward / forward.norm()
         right = torch.linalg.cross(forward, up)
         right = right / right.norm()
-        true_up = torch.linalg.cross(right, forward)
+        # Camera +y is image-*down* (v = fy*y/z + cy, and v grows downward),
+        # so the middle row is the down direction, not the up one. It also
+        # has to be cross(forward, right), not cross(right, forward): the
+        # basis must satisfy right x down = forward to be a rotation
+        # (det +1) rather than a reflection (det -1).
+        down = torch.linalg.cross(forward, right)
 
-        # Camera looks down +z; rows are the camera axes expressed in world
-        # space, so R_wc (world -> camera) is exactly this stacked matrix.
-        R_wc = torch.stack([right, true_up, forward], dim=0)
+        # Rows are the camera axes expressed in world space, so R_wc
+        # (world -> camera) is exactly this stacked matrix.
+        R_wc = torch.stack([right, down, forward], dim=0)
         t_wc = -R_wc @ eye
         return Camera(R_wc=R_wc, t_wc=t_wc, fx=fx, fy=fy, cx=cx, cy=cy, img_width=img_width, img_height=img_height)
 
