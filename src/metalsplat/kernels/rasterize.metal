@@ -20,16 +20,18 @@ kernel void rasterize_forward(
     device const float* conics,               // (N,3) a,b,c
     device const float* opacities,             // (N,)
     device const float* colors,                 // (N,3)
-    device const int* sorted_ids,                // (M,)
-    device const int* tile_bins,                  // (num_tiles,2)
+    device const float* depths,                  // (N,) camera-space z
+    device const int* sorted_ids,                 // (M,)
+    device const int* tile_bins,                   // (num_tiles,2)
     constant int& tiles_x,
     constant int& img_width,
     constant int& img_height,
     constant int& tile_size,
     constant float* background,
-    device float* out_image,                        // (H,W,3)
-    device float* out_final_T,                        // (H,W)
-    device int* out_last_contributor,                   // (H,W)
+    device float* out_image,                         // (H,W,3)
+    device float* out_depth,                           // (H,W) alpha-weighted expected depth
+    device float* out_final_T,                          // (H,W)
+    device int* out_last_contributor,                     // (H,W)
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint2 local_pos [[thread_position_in_threadgroup]])
 {
@@ -43,6 +45,7 @@ kernel void rasterize_forward(
 
     float2 pixel_center = float2(float(px) + 0.5, float(py) + 0.5);
     float3 accum = float3(0.0, 0.0, 0.0);
+    float accum_depth = 0.0;
     float T = 1.0;
     int last_contributor = -1;
 
@@ -59,7 +62,9 @@ kernel void rasterize_forward(
         if (test_T < 1e-4) break;
 
         float3 color = float3(colors[gid * 3 + 0], colors[gid * 3 + 1], colors[gid * 3 + 2]);
-        accum += T * alpha * color;
+        float weight = T * alpha;
+        accum += weight * color;
+        accum_depth += weight * depths[gid];
         T = test_T;
         last_contributor = idx;
     }
@@ -70,6 +75,7 @@ kernel void rasterize_forward(
     out_image[pixel_idx * 3 + 0] = accum.x;
     out_image[pixel_idx * 3 + 1] = accum.y;
     out_image[pixel_idx * 3 + 2] = accum.z;
+    out_depth[pixel_idx] = accum_depth;
     out_final_T[pixel_idx] = T;
     out_last_contributor[pixel_idx] = last_contributor;
 }
@@ -93,6 +99,7 @@ kernel void rasterize_backward(
     device atomic_float* d_conics,                          // (N,3)
     device atomic_float* d_opacities,                        // (N,)
     device atomic_float* d_colors,                            // (N,3)
+    device atomic_float* d_means2d_abs,                        // (N,) sum of |per-pixel contribution|
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint2 local_pos [[thread_position_in_threadgroup]])
 {
@@ -151,6 +158,16 @@ kernel void rasterize_backward(
         float d_dy = d_power * (-(b * d.x + c * d.y));
         atomic_fetch_add_explicit(&d_means2d[gid * 2 + 0], -d_dx, memory_order_relaxed);
         atomic_fetch_add_explicit(&d_means2d[gid * 2 + 1], -d_dy, memory_order_relaxed);
+
+        // AbsGS-style densification signal: sum of |per-pixel contribution|
+        // magnitudes rather than the (signed) gradient of the summed loss.
+        // Contributions from different pixels can have opposite signs and
+        // cancel out in d_means2d above, hiding gaussians that are being
+        // pulled in conflicting directions by different parts of the image
+        // -- exactly the over-reconstructed/blurry case densification is
+        // supposed to catch. This accumulator never cancels, so it stays a
+        // reliable split/clone signal even for those gaussians.
+        atomic_fetch_add_explicit(&d_means2d_abs[gid], sqrt(d_dx * d_dx + d_dy * d_dy), memory_order_relaxed);
 
         A = alpha * color + (1.0 - alpha) * A;
     }

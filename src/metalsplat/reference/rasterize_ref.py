@@ -23,7 +23,15 @@ def rasterize_gaussians(
     img_width: int,
     img_height: int,
     background: torch.Tensor | None = None,  # (3,)
-) -> torch.Tensor:
+    return_depth: bool = False,
+):
+    """Returns the (H, W, 3) image, or `(image, depth)` if `return_depth`.
+
+    `depth` is the alpha-weighted expected depth per pixel, i.e. the same
+    front-to-back compositing weights the colour uses but accumulating each
+    gaussian's camera-space z instead of its colour. Pixels nothing covers
+    stay 0 (divide by the accumulated alpha, 1 - final_T, to normalise).
+    """
     device, dtype = means2d.device, means2d.dtype
     if background is None:
         background = torch.zeros(3, device=device, dtype=dtype)
@@ -39,6 +47,7 @@ def rasterize_gaussians(
     pixels = torch.stack([xs, ys], dim=-1)  # (H, W, 2)
 
     image = torch.zeros(img_height, img_width, 3, device=device, dtype=dtype)
+    depth_map = torch.zeros(img_height, img_width, device=device, dtype=dtype)
     trans = torch.ones(img_height, img_width, device=device, dtype=dtype)
 
     for i in order:
@@ -57,9 +66,12 @@ def rasterize_gaussians(
         # loop early.
         active = trans >= 1e-4
         alpha_eff = torch.where(active & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha))
-        contrib = (trans * alpha_eff)[..., None] * colors[i]
-        image = image + contrib
+        weight = trans * alpha_eff
+        image = image + weight[..., None] * colors[i]
+        depth_map = depth_map + weight * depths[i]
         trans = trans * (1 - alpha_eff)
 
     image = image + trans[..., None] * background
+    if return_depth:
+        return image, depth_map
     return image

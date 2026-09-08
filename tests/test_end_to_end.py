@@ -64,3 +64,64 @@ def test_sh_render_and_gradients_flow_end_to_end():
     # non-DC coefficients should get real (nonzero) gradient too, not just the DC term
     assert model.raw_sh.grad[:, 1:, :].abs().sum() > 0
     assert model.means.grad is not None and torch.isfinite(model.means.grad).all()
+
+
+def test_render_aux_works_under_no_grad():
+    # Inference-mode aux (depth / coverage) must not require a graph.
+    model, camera = _scene("mps")
+    with torch.no_grad():
+        aux = render(model, camera, return_aux=True)
+        torch.mps.synchronize()
+
+    assert aux.image.shape == (H, W, 3)
+    assert aux.depth.shape == (H, W)
+    assert aux.final_T.shape == (H, W)
+    assert torch.isfinite(aux.depth).all()
+    assert (aux.depth >= 0).all()
+
+
+def test_near_fade_suppresses_gaussians_inside_the_sphere():
+    model, camera = _scene("mps")
+    # _scene puts everything at z in [2, 3] straight ahead, so a band that
+    # ends beyond the far end of the scene fades every gaussian to nothing.
+    full = render(model, camera)
+    faded = render(model, camera, near_fade=(4.0, 5.0))
+    torch.mps.synchronize()
+
+    assert full.abs().sum() > 0
+    assert torch.allclose(faded, torch.zeros_like(faded), atol=1e-6)
+
+
+def test_near_fade_leaves_distant_gaussians_untouched():
+    model, camera = _scene("mps")
+    full = render(model, camera)
+    # Band entirely inside the empty space between camera and scene.
+    faded = render(model, camera, near_fade=(0.1, 0.5))
+    torch.mps.synchronize()
+
+    assert torch.allclose(faded, full, atol=1e-6)
+
+
+def test_near_fade_is_gradual_across_the_band():
+    # The band is the whole point: a hard cut pops as the camera crosses a
+    # gaussian. Partway through, the render must sit strictly between the
+    # unfaded and fully-faded extremes rather than snapping to one of them.
+    model, camera = _scene("mps")
+    full = render(model, camera)
+    partial = render(model, camera, near_fade=(2.0, 4.0))
+    torch.mps.synchronize()
+
+    energy_full = full.abs().sum().item()
+    energy_partial = partial.abs().sum().item()
+    assert 0.0 < energy_partial < energy_full
+
+
+def test_near_fade_keeps_gradients_flowing():
+    model, camera = _scene("mps")
+    image = render(model, camera, near_fade=(1.0, 2.5))
+    image.pow(2).mean().backward()
+    torch.mps.synchronize()
+
+    assert model.raw_opacities.grad is not None
+    assert torch.isfinite(model.raw_opacities.grad).all()
+    assert model.means.grad is not None and torch.isfinite(model.means.grad).all()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from metalsplat.camera import Camera
@@ -9,6 +11,16 @@ from metalsplat.gaussians import GaussianModel
 from metalsplat.ops.project import project_gaussians
 from metalsplat.ops.rasterize import rasterize_gaussians
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE
+
+
+class RenderAux(NamedTuple):
+    """Auxiliary render outputs (see `render(..., return_aux=True)`)."""
+
+    image: torch.Tensor  # (H, W, 3)
+    means2d: torch.Tensor  # (N, 2), with retain_grad() called
+    valid: torch.Tensor  # (N,)
+    final_T: torch.Tensor  # (H, W) per-pixel transmittance
+    depth: torch.Tensor  # (H, W) alpha-weighted expected depth, forward-only
 
 
 def render(
@@ -19,17 +31,40 @@ def render(
     tile_size: int = DEFAULT_TILE_SIZE,
     background: torch.Tensor | None = None,
     return_aux: bool = False,
+    abs_grad_accum: torch.Tensor | None = None,
+    near_fade: tuple[float, float] | None = None,
 ):
     """Renders `model` from `camera`'s viewpoint. Returns an (H, W, 3) image.
 
-    If `return_aux` is True, instead returns `(image, means2d, valid,
-    final_T)`, with `means2d.retain_grad()` already called. `means2d` /
-    `valid` are used by training loops that need per-gaussian screen-space
-    gradient magnitudes for densification (metalsplat.densify), since
-    means2d is otherwise just an internal intermediate tensor discarded
-    after this call; `final_T` (per-pixel transmittance, close to 1 where
-    ~no gaussian contributed) is used by metalsplat.seed to find uncovered
-    regions.
+    If `return_aux` is True, instead returns a `RenderAux` (a NamedTuple, so
+    both `aux.depth` and positional unpacking work), with
+    `means2d.retain_grad()` already called. `valid` is used by training
+    loops to count how many steps each gaussian was visible for; `final_T`
+    (per-pixel transmittance, close to 1 where ~no gaussian contributed) is
+    used by metalsplat.seed to find uncovered regions; `depth` is the
+    alpha-weighted expected depth (forward-only, no gradient).
+
+    `abs_grad_accum`, if given, is passed through to rasterize_gaussians:
+    an (N,) tensor that backward() atomically adds each gaussian's
+    |screen-space gradient contribution| into (AbsGS-style densification
+    signal, metalsplat.densify) -- prefer this over means2d.grad.norm()
+    for that purpose, since contributions from different pixels can have
+    opposite signs and cancel out in means2d.grad's signed sum.
+
+    `near_fade`, if given, is `(r0, r1)` in world units: a sphere around the
+    camera inside which gaussians are suppressed. Opacity is scaled by a
+    smoothstep that is 0 closer than `r0` and 1 beyond `r1`, so gaussians
+    sitting in the empty space just in front of the camera stop contributing.
+    Reconstruction puts spurious gaussians there -- they are only ever seen
+    by a couple of training views, so nothing constrains them -- and because
+    they are near the camera they sweep across the whole frame during a
+    camera move, which is what makes an orbit flicker.
+
+    The fade band is the point: a hard cut makes each gaussian vanish in a
+    single frame as the camera crosses it, which trades flicker for popping.
+    `r1` must be comfortably below the distance to the nearest real geometry
+    (for an orbit, the camera's height above the ground) or this punches a
+    hole in the scene instead.
     """
     means2d, depths, conics, radii, valid = project_gaussians(
         model.means,
@@ -46,8 +81,21 @@ def render(
         near=near,
         eps2d=eps2d,
     )
-    if return_aux:
+    if return_aux and means2d.requires_grad:
+        # No-op under torch.no_grad() / inference, where aux is still useful
+        # for depth and coverage but there's no graph to retain a grad on.
         means2d.retain_grad()
+
+    opacities = model.opacities
+    if near_fade is not None:
+        r0, r1 = near_fade
+        dist = (model.means - camera.position).norm(dim=-1)
+        w = ((dist - r0) / max(r1 - r0, 1e-6)).clamp(0.0, 1.0)
+        w = w * w * (3.0 - 2.0 * w)  # smoothstep: flat at both ends, no crease
+        opacities = opacities * w
+        # Fully-faded gaussians contribute nothing, so drop them from tile
+        # binning too rather than paying to composite a zero.
+        valid = valid * (w > 0.0).to(valid.dtype)
 
     if model.sh_degree == 0:
         colors = model.colors
@@ -59,7 +107,7 @@ def render(
         means2d,
         depths,
         conics,
-        model.opacities,
+        opacities,
         colors,
         radii,
         valid,
@@ -68,8 +116,9 @@ def render(
         tile_size=tile_size,
         background=background,
         return_aux=return_aux,
+        abs_grad_accum=abs_grad_accum,
     )
     if return_aux:
-        image, final_T = result
-        return image, means2d, valid, final_T
+        image, depth, final_T = result
+        return RenderAux(image=image, means2d=means2d, valid=valid, final_T=final_T, depth=depth)
     return result
