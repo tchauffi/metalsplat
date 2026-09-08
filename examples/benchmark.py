@@ -89,13 +89,13 @@ def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
     p_fwd, _ = timeit(project_fwd, repeats)
 
     def project_bwd():
-        m2d, _, conics, _, _ = project_gaussians(means, scales, quats, *args)
+        m2d, _, conics, _, _, _ = project_gaussians(means, scales, quats, *args)
         (m2d.sum() + conics.sum()).backward()
 
     p_both, _ = timeit(project_bwd, repeats)
 
     with torch.no_grad():
-        means2d, depths, conics, radii, valid = project_gaussians(means, scales, quats, *args)
+        means2d, depths, conics, radii, valid, _ = project_gaussians(means, scales, quats, *args)
         torch.mps.synchronize()
 
     def binning():
@@ -246,7 +246,7 @@ def memory_report(model: GaussianModel, cam: Camera, images: list | None = None)
     driver = torch.mps.driver_allocated_memory()
 
     with torch.no_grad():
-        means2d, depths, _, radii, valid = project_gaussians(
+        means2d, depths, _, radii, valid, _ = project_gaussians(
             model.means, model.scales, model.quats, cam.R_wc, cam.t_wc,
             cam.fx, cam.fy, cam.cx, cam.cy, cam.img_width, cam.img_height,
         )
