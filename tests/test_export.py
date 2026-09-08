@@ -1,5 +1,6 @@
 import struct
 
+import pytest
 import torch
 
 from metalsplat.export import load_ply, save_ply
@@ -115,3 +116,36 @@ def test_save_load_roundtrip_sh(tmp_path):
     assert loaded.sh_degree == 2
     assert torch.allclose(loaded.raw_sh, model.raw_sh, atol=1e-5)
     assert torch.allclose(loaded.means, model.means, atol=1e-5)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_save_load_roundtrip_every_sh_degree(tmp_path, degree):
+    from metalsplat.reference.sh_ref import num_sh_coeffs
+
+    torch.manual_seed(degree)
+    n = 5
+    k = num_sh_coeffs(degree)
+    model = GaussianModel(torch.randn(n, 3), colors=torch.rand(n, 3), sh_degree=degree)
+    with torch.no_grad():
+        model.raw_sh.copy_(torch.randn(n, k, 3) * 0.3)
+
+    path = tmp_path / f"rt_sh{degree}.ply"
+    save_ply(model, path)
+    loaded = load_ply(path)
+
+    assert loaded.sh_degree == degree
+    assert loaded.raw_sh.shape == (n, k, 3)
+    assert torch.allclose(loaded.raw_sh, model.raw_sh, atol=1e-5)
+
+
+def test_degree_3_ply_has_the_reference_45_f_rest_entries(tmp_path):
+    # The original 3DGS implementation writes 45 f_rest properties (15 non-DC
+    # coefficients x 3 channels). Matching that exactly is what lets viewers
+    # that assume degree 3 read our files.
+    model = GaussianModel(torch.randn(4, 3), colors=torch.rand(4, 3), sh_degree=3)
+    path = tmp_path / "deg3.ply"
+    save_ply(model, path)
+
+    header = path.read_bytes().split(b"end_header")[0].decode()
+    assert sum(1 for line in header.splitlines() if "f_rest_" in line) == 45
+    assert "f_rest_44" in header and "f_rest_45" not in header

@@ -26,7 +26,7 @@ import torch
 
 from metalsplat.camera import Camera
 from metalsplat.gaussians import GaussianModel
-from metalsplat.reference.sh_ref import NUM_SH_COEFFS, SH_C0
+from metalsplat.reference.sh_ref import SH_C0
 
 
 @dataclass
@@ -119,7 +119,8 @@ def seed_uncovered_regions(
             opacities=final_opacities, colors=final_color_like,
         ).to(device)
     else:
-        new_sh = torch.zeros(k, NUM_SH_COEFFS, 3, device=device)
+        # Match the model's own coefficient count, which depends on its degree.
+        new_sh = torch.zeros(k, color_like.shape[1], 3, device=device)
         new_sh[:, 0, :] = (new_colors - 0.5) / SH_C0
         final_color_like = torch.cat([color_like, new_sh], dim=0)
         new_model = GaussianModel(

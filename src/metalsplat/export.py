@@ -10,13 +10,13 @@ raw/pre-activation), f_rest_* (higher-degree SH, raw, channel-major),
 opacity (raw/pre-sigmoid), scale_0-2 (raw/pre-exp, i.e. log-scale),
 rot_0-3 (unit quaternion, w,x,y,z).
 
-Our SH is capped at degree 2 (9 coefficients, vs. the reference
-implementation's degree 3 / 16), so f_rest has 24 entries (8 non-DC
-coefficients x 3 channels) rather than 45. Viewers that read the SH
-degree from the header's property count (most modern ones do) render this
-correctly; older/hardcoded-degree-3 viewers may not. A flat-RGB model
-(sh_degree=0) is exported as degree-0-only SH (f_rest all zero), via the
-standard RGB2SH formula.
+f_rest holds (K-1)*3 entries for a model with K coefficients per channel,
+so a degree-3 model writes the reference implementation's full 45 and a
+degree-2 model writes 24. Viewers that read the SH degree from the
+header's property count (most modern ones do) render either correctly;
+older viewers that hardcode degree 3 may not render a lower-degree file. A
+flat-RGB model (sh_degree=0) is exported as degree-0-only SH (f_rest all
+zero), via the standard RGB2SH formula.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from metalsplat.gaussians import GaussianModel
-from metalsplat.reference.sh_ref import NUM_SH_COEFFS, SH_C0
+from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
 
 
 def save_ply(model: GaussianModel, path: str | Path) -> None:
@@ -41,9 +41,10 @@ def save_ply(model: GaussianModel, path: str | Path) -> None:
         dc = ((model.colors.detach() - 0.5) / SH_C0).cpu().numpy().astype(np.float32)  # (N, 3)
         rest = np.zeros((n, 24), dtype=np.float32)
     else:
-        sh = model.raw_sh.detach().cpu()  # (N, 9, 3)
+        sh = model.raw_sh.detach().cpu()  # (N, K, 3)
         dc = sh[:, 0, :].numpy().astype(np.float32)  # (N, 3)
-        rest = sh[:, 1:, :].transpose(1, 2).contiguous().reshape(n, -1).numpy().astype(np.float32)  # (N, 24)
+        # channel-major: all of channel 0's non-DC coefficients, then 1, then 2
+        rest = sh[:, 1:, :].transpose(1, 2).contiguous().reshape(n, -1).numpy().astype(np.float32)
 
     opacity = model.raw_opacities.detach().cpu().numpy().astype(np.float32).reshape(n, 1)
     scale = model.raw_scales.detach().cpu().numpy().astype(np.float32)  # (N, 3), log-space
@@ -116,10 +117,11 @@ def load_ply(path: str | Path, device: str = "cpu") -> GaussianModel:
 
     n_rest = sum(1 for name in names if name.startswith("f_rest_"))
     coeffs_per_channel = n_rest // 3  # channel-major: [ch0 coeffs..., ch1..., ch2...]
-    if coeffs_per_channel > NUM_SH_COEFFS - 1:
+    max_coeffs = num_sh_coeffs(MAX_SH_DEGREE)
+    if coeffs_per_channel > max_coeffs - 1:
         warnings.warn(
             f"{path.name} has {coeffs_per_channel + 1} SH coefficients/channel; this package "
-            f"supports {NUM_SH_COEFFS}. Dropping the higher-degree ones.",
+            f"supports {max_coeffs}. Dropping the higher-degree ones.",
             stacklevel=2,
         )
 
@@ -128,14 +130,23 @@ def load_ply(path: str | Path, device: str = "cpu") -> GaussianModel:
         colors = (dc * SH_C0 + 0.5).clamp(0, 1)
         model = GaussianModel(means, scales=scales, quats=quats, opacities=opacities, colors=colors)
     else:
-        sh = torch.zeros(n, NUM_SH_COEFFS, 3)
+        # Round the stored count *down* to a whole degree: a file carrying a
+        # partial band cannot be evaluated as that degree, so keep the
+        # complete bands and drop the remainder.
+        keep = min(coeffs_per_channel + 1, max_coeffs)
+        degree = 0
+        while num_sh_coeffs(degree + 1) <= keep:
+            degree += 1
+        n_coeffs = num_sh_coeffs(degree)
+
+        sh = torch.zeros(n, n_coeffs, 3)
         sh[:, 0, :] = dc
-        keep = min(coeffs_per_channel, NUM_SH_COEFFS - 1)
         for ch in range(3):
-            for k in range(keep):
+            for k in range(n_coeffs - 1):
                 sh[:, k + 1, ch] = torch.from_numpy(col[f"f_rest_{ch * coeffs_per_channel + k}"].copy())
         model = GaussianModel(
-            means, scales=scales, quats=quats, opacities=opacities, sh_degree=2, sh_coeffs=sh
+            means, scales=scales, quats=quats, opacities=opacities,
+            sh_degree=degree, sh_coeffs=sh,
         )
 
     return model.to(device)

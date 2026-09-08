@@ -24,12 +24,12 @@ from metalsplat.seed import seed_uncovered_regions
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
 OUT_DIR = Path(__file__).parent
-NUM_ITERS = 5000
-EVAL_EVERY = 500
+NUM_ITERS = 30_000
+EVAL_EVERY = 1000
 LR_OTHER_INIT = 0.01
 LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # color/scale/rotation are decayed, like means
 LR_OPACITY = 0.05
-SH_DEGREE = 2  # 0 = plain RGB, 2 = view-dependent spherical harmonics
+SH_DEGREE = 3  # 0 = plain RGB; 1..3 = spherical harmonics (3 = the 3DGS default)
 SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
 LAMBDA_DSSIM = 0.2  # 3DGS default: loss = (1-lambda)*L1 + lambda*D-SSIM
 EVAL_HOLDOUT_STRIDE = 8  # every 8th image is held out for eval, matching common NeRF/gsplat convention
@@ -37,11 +37,11 @@ EVAL_IMAGES_SAVED = 3  # how many held-out renders to write to disk (all are sco
 INIT_OPACITY = 0.1
 
 # Adaptive density control schedule
-DENSIFY_START = 100
-DENSIFY_STOP = 4000
+DENSIFY_START = 1000
+DENSIFY_STOP = 7000
 DENSIFY_INTERVAL = 250
 DENSIFY_GRAD_PERCENTILE = 0.9  # top 10% by screen-space gradient each round
-DENSIFY_MAX_POINTS = 400_000
+DENSIFY_MAX_POINTS = 5_000_000
 
 # Loss-driven seeding schedule (fills sky/distant-background gaps that
 # split/clone alone can't reach, since those start with ~no gaussians)

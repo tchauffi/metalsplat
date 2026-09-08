@@ -7,7 +7,7 @@ opacity = sigmoid(raw_opacity) (in [0, 1]).
 
 Color is either plain per-gaussian RGB (`sh_degree=0`, the default: color =
 sigmoid(raw_color), in [0, 1]) or degree<=2 spherical harmonics
-(`sh_degree=2`: view-dependent color = eval_sh(raw_sh, view_dir) + 0.5,
+(`sh_degree=1..3`: view-dependent color = eval_sh(raw_sh, view_dir) + 0.5,
 matching standard 3DGS convention -- unconstrained/unclamped internally,
 consumers clamp to [0, 1] for display). SH needs a view direction so it
 can't be a plain property; use `colors_from_view(view_dirs)`.
@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from metalsplat.ops.sh import eval_sh
-from metalsplat.reference.sh_ref import NUM_SH_COEFFS, SH_C0
+from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
 
 
 class GaussianModel(nn.Module):
@@ -30,16 +30,16 @@ class GaussianModel(nn.Module):
         quats: torch.Tensor | None = None,  # (N, 4), unit; defaults to identity
         opacities: torch.Tensor | None = None,  # (N,), in [0, 1]; defaults to 0.5
         colors: torch.Tensor | None = None,  # (N, 3), in [0, 1]; defaults to 0.5 gray
-        sh_degree: int = 0,  # 0 = plain RGB, 2 = view-dependent spherical harmonics
-        sh_coeffs: torch.Tensor | None = None,  # (N, 9, 3) raw SH; overrides `colors`-derived DC init if given
+        sh_degree: int = 0,  # 0 = plain RGB; 1..3 = view-dependent spherical harmonics
+        sh_coeffs: torch.Tensor | None = None,  # (N, (deg+1)^2, 3) raw SH; overrides `colors`-derived DC init if given
         active_sh_degree: int | None = None,  # defaults to sh_degree; preserved across rebuilds
     ):
         super().__init__()
         n = means.shape[0]
         device = means.device
 
-        if sh_degree not in (0, 2):
-            raise ValueError(f"sh_degree must be 0 or 2, got {sh_degree}")
+        if not 0 <= sh_degree <= MAX_SH_DEGREE:
+            raise ValueError(f"sh_degree must be between 0 and {MAX_SH_DEGREE}, got {sh_degree}")
         self.sh_degree = sh_degree
         # Degrees actually evaluated right now. Training can start this
         # at 0 and grow it (see increase_sh_degree): fitting all bands
@@ -66,9 +66,15 @@ class GaussianModel(nn.Module):
         if sh_degree == 0:
             self.raw_colors = nn.Parameter(logit(colors.clone()))
         elif sh_coeffs is not None:
+            expected = num_sh_coeffs(sh_degree)
+            if sh_coeffs.shape[1] != expected:
+                raise ValueError(
+                    f"sh_degree={sh_degree} needs {expected} coefficients per channel, "
+                    f"got sh_coeffs with shape {tuple(sh_coeffs.shape)}"
+                )
             self.raw_sh = nn.Parameter(sh_coeffs.clone())
         else:
-            raw_sh = torch.zeros(n, NUM_SH_COEFFS, 3, device=device)
+            raw_sh = torch.zeros(n, num_sh_coeffs(sh_degree), 3, device=device)
             raw_sh[:, 0, :] = (colors.clone() - 0.5) / SH_C0
             self.raw_sh = nn.Parameter(raw_sh)
 
@@ -88,7 +94,7 @@ class GaussianModel(nn.Module):
     def colors(self) -> torch.Tensor:
         if self.sh_degree != 0:
             raise AttributeError(
-                "This model uses spherical harmonics (sh_degree=2); color depends on "
+                f"This model uses spherical harmonics (sh_degree={self.sh_degree}); color depends on "
                 "viewing direction, so use colors_from_view(view_dirs) instead."
             )
         return torch.sigmoid(self.raw_colors)
