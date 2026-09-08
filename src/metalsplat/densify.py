@@ -34,6 +34,12 @@ class DensifyStats:
     # metalsplat.optim.migrate_optimizer_state -- rebuilding the optimizer
     # without it discards Adam's moments for every gaussian.
     source_index: torch.Tensor | None = None
+    # (n_after,) int64: like source_index, but split children and clones point
+    # at the gaussian they came *from* rather than -1. Adam state deliberately
+    # does not follow that (new gaussians start cold, as in the reference), but
+    # per-gaussian quantities derived from position -- the 3D filter radius --
+    # can be carried from the parent instead of recomputed from scratch.
+    parent_index: torch.Tensor | None = None
 
 
 def densify_and_prune(
@@ -53,7 +59,7 @@ def densify_and_prune(
     n_before = n
     if not bool(visible.any()) or (max_points is not None and n >= max_points):
         unchanged = torch.arange(n, device=device)
-        return model, DensifyStats(n_before, 0, 0, 0, n_before, unchanged)
+        return model, DensifyStats(n_before, 0, 0, 0, n_before, unchanged, unchanged)
 
     avg_grad = torch.zeros(n, device=device)
     avg_grad[visible] = grad_accum[visible] / grad_count[visible]
@@ -135,6 +141,8 @@ def densify_and_prune(
     fresh = torch.full((2 * split_idx.numel() + clone_idx.numel(),), NEW_GAUSSIAN,
                        dtype=torch.int64, device=device)
     source_index = torch.cat([keep_idx, fresh])
+    # Split children and clones sit essentially where their parent did.
+    parent_index = torch.cat([keep_idx, split_idx, split_idx, clone_idx])
 
     n_after = final_means.shape[0]
     n_pruned = int((~keep_mask & ~is_large).sum().item())  # low-opacity prunes among non-split gaussians
@@ -145,6 +153,7 @@ def densify_and_prune(
         n_pruned=n_pruned,
         n_after=n_after,
         source_index=source_index,
+        parent_index=parent_index,
     )
     return new_model, stats
 

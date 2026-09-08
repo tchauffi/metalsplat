@@ -18,7 +18,7 @@ import torch
 from metalsplat import GaussianModel, render, save_ply
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
-from metalsplat.filter3d import compute_3d_filter
+from metalsplat.filter3d import carry_filter_3d, compute_3d_filter
 from metalsplat.losses import gaussian_splatting_loss
 from metalsplat.optim import migrate_optimizer_state
 from metalsplat.seed import seed_uncovered_regions
@@ -38,6 +38,12 @@ SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
 # cannot invent sub-sampling-rate structure that shows up as speckle when
 # the camera moves closer than any training view. 0 disables.
 FILTER_3D_SCALE = 0.2  # the Mip-Splatting paper's value
+# A full recompute is O(gaussians x cameras) -- 184ms at 438k gaussians and
+# 185 views, and it grows linearly, so running it after every densify,
+# seed and prune (once per ~77 steps) came to dominate a step as the model
+# grew. Between refreshes the filter is carried across by inheritance;
+# this is how often it is rebuilt from scratch to pick up drifting means.
+FILTER_3D_REFRESH = 1000
 LAMBDA_DSSIM = 0.2  # 3DGS default: loss = (1-lambda)*L1 + lambda*D-SSIM
 EVAL_HOLDOUT_STRIDE = 8  # every 8th image is held out for eval, matching common NeRF/gsplat convention
 EVAL_IMAGES_SAVED = 3  # how many held-out renders to write to disk (all are scored)
@@ -223,14 +229,14 @@ def main() -> None:
     # The 3D filter is per-gaussian, so it has to be recomputed every time
     # the gaussian set changes -- a stale one is indexed by the old ordering
     # and would silently band-limit the wrong gaussians.
-    def current_filter_3d():
+    def recompute_filter_3d():
         if not FILTER_3D_SCALE:
             return None
         return compute_3d_filter(
             model.means.detach(), scene.cameras, sampling_scale=FILTER_3D_SCALE
         )
 
-    filter_3d = current_filter_3d()
+    filter_3d = recompute_filter_3d()
     if filter_3d is not None:
         seen = (filter_3d > 0).float().mean().item()
         print(f"3D filter: scale {FILTER_3D_SCALE}, {100 * seen:.1f}% of gaussians observed", flush=True)
@@ -289,7 +295,7 @@ def main() -> None:
             )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
-            filter_3d = current_filter_3d()
+            filter_3d = carry_filter_3d(filter_3d, stats.parent_index)
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
                 f"(+{stats.n_split} split, +{stats.n_cloned} cloned, -{stats.n_pruned} pruned)",
@@ -308,7 +314,7 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
-                filter_3d = current_filter_3d()
+                filter_3d = carry_filter_3d(filter_3d, seed_stats.parent_index)
             print(
                 f"  seed @ step {step}: {seed_stats.n_before} -> {seed_stats.n_after} "
                 f"(+{seed_stats.n_seeded} seeded)",
@@ -329,8 +335,14 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
-                filter_3d = current_filter_3d()
+                # Pruning only removes; survivors keep their radius unchanged.
+                filter_3d = carry_filter_3d(filter_3d, prune_index)
                 print(f"  prune @ step {step}: -{n_pruned} (n={model.num_points})", flush=True)
+
+        if FILTER_3D_SCALE and FILTER_3D_REFRESH and step % FILTER_3D_REFRESH == 0:
+            # Means drift between refreshes, so inheritance is only an
+            # approximation; rebuild from the cameras periodically.
+            filter_3d = recompute_filter_3d()
 
         if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
             active = model.increase_sh_degree()

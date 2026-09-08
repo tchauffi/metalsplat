@@ -181,3 +181,62 @@ def test_filter_is_computed_over_many_cameras_efficiently():
     assert r.shape == (500,)
     assert (r >= 0).all()
     assert math.isfinite(float(r.max()))
+
+
+def test_carry_inherits_from_the_parent_and_zeroes_orphans():
+    from metalsplat.filter3d import carry_filter_3d
+
+    filter_3d = torch.tensor([0.1, 0.2, 0.3])
+    # survivors 0 and 2, a child of 2, and a parentless seeded gaussian
+    parent_index = torch.tensor([0, 2, 2, -1])
+
+    out = carry_filter_3d(filter_3d, parent_index)
+    assert torch.allclose(out, torch.tensor([0.1, 0.3, 0.3, 0.0]))
+
+
+def test_carry_is_a_no_op_when_the_filter_is_disabled():
+    from metalsplat.filter3d import carry_filter_3d
+
+    assert carry_filter_3d(None, torch.arange(4)) is None
+
+
+def test_densify_parent_index_points_children_at_their_parent():
+    # source_index marks new gaussians -1 (Adam starts them cold);
+    # parent_index instead names the gaussian they came from, which is what
+    # position-derived quantities like the filter radius inherit.
+    from metalsplat.densify import densify_and_prune
+    from metalsplat.optim import NEW_GAUSSIAN
+
+    n = 10
+    torch.manual_seed(0)
+    model = GaussianModel(
+        torch.randn(n, 3), scales=torch.full((n, 3), 0.5),
+        opacities=torch.full((n,), 0.5), colors=torch.rand(n, 3),
+    )
+    with torch.no_grad():
+        model.raw_scales[0] = torch.log(torch.tensor(2.0))  # split candidate
+
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+    grad_accum[0] = 10.0
+    grad_accum[1] = 9.0
+    _, stats = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=1.0, grad_percentile=0.8
+    )
+
+    assert stats.parent_index.shape == stats.source_index.shape
+    assert (stats.parent_index >= 0).all(), "every densified gaussian has a parent"
+    assert int((stats.source_index == NEW_GAUSSIAN).sum()) > 0, "test isn't exercising new gaussians"
+    # Where source_index names a survivor, the two agree.
+    survivors = stats.source_index >= 0
+    assert torch.equal(stats.parent_index[survivors], stats.source_index[survivors])
+
+
+def test_chunking_does_not_change_the_result():
+    means = torch.randn(300, 3)
+    means[:, 2] = means[:, 2].abs() + 3.0
+    cams = [_camera_at(float(d)) for d in range(1, 25)]
+
+    a = compute_3d_filter(means, cams, camera_chunk=1)
+    b = compute_3d_filter(means, cams, camera_chunk=64)
+    assert torch.allclose(a, b, atol=1e-7)

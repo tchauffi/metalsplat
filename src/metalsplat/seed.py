@@ -38,6 +38,9 @@ class SeedStats:
     # See DensifyStats.source_index -- seeded gaussians are new, so they get
     # NEW_GAUSSIAN and start with zeroed Adam state.
     source_index: torch.Tensor | None = None
+    # Seeded gaussians have no parent to inherit position-derived quantities
+    # from, so they get -1 here too; see DensifyStats.parent_index.
+    parent_index: torch.Tensor | None = None
 
 
 def seed_uncovered_regions(
@@ -57,7 +60,8 @@ def seed_uncovered_regions(
     device = model.means.device
     n_before = model.num_points
     if max_points is not None and n_before >= max_points:
-        return model, SeedStats(n_before, 0, n_before, torch.arange(n_before, device=model.means.device))
+        unchanged = torch.arange(n_before, device=model.means.device)
+        return model, SeedStats(n_before, 0, n_before, unchanged, unchanged)
 
     residual = (pred - target).abs().mean(dim=-1)  # (H, W)
     uncovered = final_T > coverage_thresh
@@ -65,7 +69,8 @@ def seed_uncovered_regions(
 
     ys, xs = needs_seed.nonzero(as_tuple=True)
     if ys.numel() == 0:
-        return model, SeedStats(n_before, 0, n_before, torch.arange(n_before, device=model.means.device))
+        unchanged = torch.arange(n_before, device=model.means.device)
+        return model, SeedStats(n_before, 0, n_before, unchanged, unchanged)
     if ys.numel() > max_seeds_per_call:
         perm = torch.randperm(ys.numel(), device=device)[:max_seeds_per_call]
         ys, xs = ys[perm], xs[perm]
@@ -73,7 +78,8 @@ def seed_uncovered_regions(
         ys, xs = ys[: max_points - n_before], xs[: max_points - n_before]
     k = ys.numel()
     if k == 0:
-        return model, SeedStats(n_before, 0, n_before, torch.arange(n_before, device=model.means.device))
+        unchanged = torch.arange(n_before, device=model.means.device)
+        return model, SeedStats(n_before, 0, n_before, unchanged, unchanged)
 
     # A purely uncovered pixel (e.g. true sky) has no real depth to
     # estimate from, so fall back to a representative "far" depth: a high
@@ -139,5 +145,6 @@ def seed_uncovered_regions(
         torch.full((k,), NEW_GAUSSIAN, dtype=torch.int64, device=device),
     ])
     return new_model, SeedStats(
-        n_before=n_before, n_seeded=k, n_after=n_after, source_index=source_index
+        n_before=n_before, n_seeded=k, n_after=n_after,
+        source_index=source_index, parent_index=source_index,
     )
