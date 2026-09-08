@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import torch
 
-from metalsplat.gaussians import GaussianModel
+from metalsplat.gaussians import GaussianModel, logit
 from metalsplat.utils.quaternion import quat_to_rotmat
 
 
@@ -118,6 +118,7 @@ def densify_and_prune(
         new_model = GaussianModel(
             final_means, scales=final_scales, quats=final_quats,
             opacities=final_opacities, sh_degree=model.sh_degree, sh_coeffs=final_color_like,
+            active_sh_degree=model.active_sh_degree,
         ).to(device)
 
     n_after = final_means.shape[0]
@@ -130,3 +131,55 @@ def densify_and_prune(
         n_after=n_after,
     )
     return new_model, stats
+
+
+@torch.no_grad()
+def reset_opacity(model: GaussianModel, value: float = 0.01) -> None:
+    """Caps every gaussian's opacity at `value`, in place. Standard 3DGS
+    trick: periodically forces all gaussians back to near-transparent, so
+    ones that only got high opacity by occluding/compensating for a
+    neighbor (rather than genuinely representing something) have to
+    re-earn it through training or fall below the prune threshold and get
+    removed by the next prune_low_opacity() call. Modifies
+    `model.raw_opacities.data` in place (same Parameter object, same
+    Adam momentum buffers) rather than rebuilding the model, since no
+    gaussian is added or removed.
+    """
+    new_opacities = torch.clamp(model.opacities, max=value)
+    model.raw_opacities.data = logit(new_opacities)
+
+
+def prune_low_opacity(model: GaussianModel, prune_opacity_thresh: float = 0.005) -> tuple[GaussianModel, int]:
+    """Removes gaussians with opacity below the threshold. Standalone (no
+    split/clone candidate computation) so it can run on its own, more
+    frequent schedule, and -- unlike densify_and_prune -- keep running
+    after adaptive density control's split/clone window has ended (e.g.
+    to clean up after reset_opacity(), which can otherwise leave a lot of
+    now-useless near-transparent gaussians sitting around for the rest of
+    training).
+    """
+    device = model.means.device
+    n_before = model.num_points
+    keep_mask = model.opacities.detach() > prune_opacity_thresh
+    n_pruned = int((~keep_mask).sum().item())
+    if n_pruned == 0:
+        return model, 0
+
+    means = model.means.detach()[keep_mask]
+    scales = model.scales.detach()[keep_mask]
+    quats = model.quats.detach()[keep_mask]
+    opacities = model.opacities.detach()[keep_mask]
+
+    if model.sh_degree == 0:
+        new_model = GaussianModel(
+            means, scales=scales, quats=quats, opacities=opacities,
+            colors=model.colors.detach()[keep_mask],
+        ).to(device)
+    else:
+        new_model = GaussianModel(
+            means, scales=scales, quats=quats, opacities=opacities,
+            sh_degree=model.sh_degree, sh_coeffs=model.raw_sh.detach()[keep_mask],
+            active_sh_degree=model.active_sh_degree,
+        ).to(device)
+
+    return new_model, n_pruned

@@ -125,6 +125,7 @@ def seed_uncovered_regions(
         new_model = GaussianModel(
             final_means, scales=final_scales, quats=final_quats,
             opacities=final_opacities, sh_degree=model.sh_degree, sh_coeffs=final_color_like,
+            active_sh_degree=model.active_sh_degree,
         ).to(device)
 
     n_after = final_means.shape[0]

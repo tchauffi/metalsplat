@@ -98,3 +98,21 @@ def test_sh_model_seeds_preserve_dc_color():
     assert stats.n_seeded == 1
     assert new_model.sh_degree == 2
     assert new_model.raw_sh.shape == (2, 9, 3)
+
+
+def test_seeding_preserves_active_sh_degree():
+    means = torch.tensor([[0.0, 0.0, 5.0]])
+    model = GaussianModel(means, colors=torch.tensor([[0.5, 0.5, 0.5]]), sh_degree=2)
+    model.active_sh_degree = 1
+    camera = Camera.identity(fx=32.0, fy=32.0, cx=W / 2, cy=H / 2, img_width=W, img_height=H)
+
+    pred = torch.zeros(H, W, 3)
+    target = torch.zeros(H, W, 3)
+    target[5, 5] = torch.tensor([0.9, 0.1, 0.2])
+
+    seeded, stats = seed_uncovered_regions(
+        model, camera, pred, target, torch.ones(H, W), init_scale=0.05, residual_thresh=0.1
+    )
+
+    assert stats.n_seeded == 1
+    assert seeded.active_sh_degree == 1
