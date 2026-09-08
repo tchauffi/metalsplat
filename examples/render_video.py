@@ -154,9 +154,21 @@ def build_camera_path(
     return path, radius
 
 
+DEPTH_COVERAGE_THRESH = 0.1
+"""Alpha below which a pixel is treated as empty in the depth pass.
+
+Not 0.5: on this scene 69% of pixels reach alpha 0.5 but 99.4% reach 0.1
+(median alpha is 0.58), so a half-coverage cut punches speckled black holes
+through solid ground and foliage. The scene is genuinely semi-transparent
+in places -- plenty of surfaces are built from stacked low-opacity
+gaussians -- so the threshold has to sit near "any coverage at all" rather
+than "mostly opaque" to visualise depth honestly.
+"""
+
+
 def depth_to_rgb(depth: torch.Tensor, alpha: torch.Tensor) -> np.ndarray:
     """Normalised inverse-depth, turned into a viridis-ish false-colour map."""
-    covered = alpha > 0.5
+    covered = alpha > DEPTH_COVERAGE_THRESH
     normalised = torch.where(covered, depth / alpha.clamp_min(1e-6), torch.zeros_like(depth))
     if covered.any():
         near = torch.quantile(normalised[covered], 0.02)

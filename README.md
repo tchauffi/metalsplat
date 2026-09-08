@@ -5,6 +5,20 @@ Apple Silicon via Metal instead of CUDA -- a `gsplat`-equivalent that runs
 entirely on the MPS backend, with real hand-written Metal compute kernels
 for the performance-critical stages.
 
+[![RGB and depth renders of the garden scene](docs/garden_orbit.png)](https://github.com/tchauffi/metalsplat/raw/main/docs/garden_orbit.mp4)
+
+*(click for the 24s orbit video --* `docs/garden_orbit.mp4` *)*
+
+The *mip-NeRF 360* garden scene, reconstructed from 185 COLMAP-posed photos
+(161 train / 24 held out) and rendered on a circular orbit none of the
+training cameras took. Left: RGB. Right: the depth pass -- expected depth
+per pixel, produced by the same forward rasterizer in the same pass.
+
+Trained by `examples/train_garden.py` and rendered by
+`examples/render_video.py`: 5000 iterations in 9.6 minutes on an M-series
+GPU, reaching **23.4 dB PSNR / 0.702 SSIM** on the 24 held-out views with
+435k gaussians.
+
 ## Requirements
 
 - macOS on Apple Silicon (uses the `mps` PyTorch backend).
