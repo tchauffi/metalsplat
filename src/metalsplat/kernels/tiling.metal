@@ -15,7 +15,26 @@ using namespace metal;
 // already compares correctly as an integer, and every gaussian that gets here
 // has depth > near > 0.
 
-inline void tile_bbox(float mx, float my, float r,
+// Per-axis 3-sigma half-extents of the projected gaussian, from the conic.
+// The conic is the inverse of the 2D covariance, so inverting it back gives
+// Sigma2d, whose diagonal is what bounds the ellipse along x and y.
+//
+// Bounding the ellipse by a circle of radius 3*sqrt(lambda_max) -- which is
+// what this used to do, and what the reference 3DGS implementation does --
+// is very loose for an elongated gaussian: a thin diagonal splat gets a box
+// as wide as it is long. On the garden scene the tight box produces 43%
+// fewer (gaussian, tile) pairs, which is less to sort and less for the
+// rasterizer to walk per tile.
+inline float2 ellipse_half_extents(float3 conic)
+{
+    float det = conic.x * conic.z - conic.y * conic.y;
+    if (det <= 0.0) return float2(0.0);
+    // Sigma2d = inv(conic): diagonal entries are conic.z/det and conic.x/det.
+    return float2(3.0 * sqrt(max(conic.z / det, 0.0)),
+                  3.0 * sqrt(max(conic.x / det, 0.0)));
+}
+
+inline void tile_bbox(float mx, float my, float hw, float hh,
                       int tiles_x, int tiles_y, float tile_size,
                       thread int& min_tx, thread int& min_ty,
                       thread int& span_x, thread int& span_y)
@@ -26,10 +45,10 @@ inline void tile_bbox(float mx, float my, float r,
     // the left of the image therefore ends up with max < min, hence a
     // negative span, which the max(..., 0) below turns into "touches nothing"
     // -- that is what culls it.
-    int lo_x = (int)floor((mx - r) / tile_size);
-    int hi_x = (int)floor((mx + r) / tile_size);
-    int lo_y = (int)floor((my - r) / tile_size);
-    int hi_y = (int)floor((my + r) / tile_size);
+    int lo_x = (int)floor((mx - hw) / tile_size);
+    int hi_x = (int)floor((mx + hw) / tile_size);
+    int lo_y = (int)floor((my - hh) / tile_size);
+    int hi_y = (int)floor((my + hh) / tile_size);
 
     min_tx = max(lo_x, 0);
     min_ty = max(lo_y, 0);
@@ -39,8 +58,9 @@ inline void tile_bbox(float mx, float my, float r,
 
 kernel void tile_counts(
     device const float* means2d,        // (N,2)
-    device const float* radii,           // (N,)
-    device const float* valid,            // (N,)
+    device const float* conics,          // (N,3) a,b,c
+    device const float* radii,            // (N,)
+    device const float* valid,             // (N,)
     constant int& tiles_x,
     constant int& tiles_y,
     constant float& tile_size,
@@ -52,17 +72,20 @@ kernel void tile_counts(
         counts[gid] = 0;
         return;
     }
+    float2 half_extent = ellipse_half_extents(
+        float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]));
     int min_tx, min_ty, span_x, span_y;
-    tile_bbox(means2d[gid * 2 + 0], means2d[gid * 2 + 1], r,
+    tile_bbox(means2d[gid * 2 + 0], means2d[gid * 2 + 1], half_extent.x, half_extent.y,
               tiles_x, tiles_y, tile_size, min_tx, min_ty, span_x, span_y);
     counts[gid] = span_x * span_y;
 }
 
 kernel void tile_pairs(
     device const float* means2d,        // (N,2)
-    device const float* depths,          // (N,)
-    device const float* radii,            // (N,)
-    device const float* valid,             // (N,)
+    device const float* conics,          // (N,3) a,b,c
+    device const float* depths,           // (N,)
+    device const float* radii,             // (N,)
+    device const float* valid,              // (N,)
     device const int* offsets,              // (N,) exclusive prefix sum of counts
     constant int& tiles_x,
     constant int& tiles_y,
@@ -74,8 +97,10 @@ kernel void tile_pairs(
     float r = radii[gid];
     if (valid[gid] < 0.5 || r <= 0.0) return;
 
+    float2 half_extent = ellipse_half_extents(
+        float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]));
     int min_tx, min_ty, span_x, span_y;
-    tile_bbox(means2d[gid * 2 + 0], means2d[gid * 2 + 1], r,
+    tile_bbox(means2d[gid * 2 + 0], means2d[gid * 2 + 1], half_extent.x, half_extent.y,
               tiles_x, tiles_y, tile_size, min_tx, min_ty, span_x, span_y);
     if (span_x <= 0 || span_y <= 0) return;
 

@@ -191,7 +191,8 @@ def rasterize_gaussians(
     many steps to accumulate; it's mutated in place, not returned.
     """
     binning = bin_and_sort_gaussians(
-        means2d.detach(), depths.detach(), radii.detach(), valid, img_width, img_height, tile_size
+        means2d.detach(), depths.detach(), conics.detach(), radii.detach(), valid,
+        img_width, img_height, tile_size,
     )
     device = means2d.device
     if background is None:

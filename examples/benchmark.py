@@ -99,7 +99,7 @@ def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
         torch.mps.synchronize()
 
     def binning():
-        bin_and_sort_gaussians(means2d, depths, radii, valid, cam.img_width, cam.img_height)
+        bin_and_sort_gaussians(means2d, depths, conics, radii, valid, cam.img_width, cam.img_height)
 
     b_ms, _ = timeit(binning, repeats)
 
@@ -139,7 +139,7 @@ def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
     f_ms, _ = timeit(full_fwd, repeats)
 
     n_pairs = (bin_and_sort_gaussians(
-        means2d, depths, radii, valid, cam.img_width, cam.img_height
+        means2d, depths, conics, radii, valid, cam.img_width, cam.img_height
     ).sorted_gaussian_ids.numel())
     torch.mps.synchronize()
 
@@ -246,12 +246,12 @@ def memory_report(model: GaussianModel, cam: Camera, images: list | None = None)
     driver = torch.mps.driver_allocated_memory()
 
     with torch.no_grad():
-        means2d, depths, _, radii, valid, _ = project_gaussians(
+        means2d, depths, conics, radii, valid, _ = project_gaussians(
             model.means, model.scales, model.quats, cam.R_wc, cam.t_wc,
             cam.fx, cam.fy, cam.cx, cam.cy, cam.img_width, cam.img_height,
         )
         n_pairs = bin_and_sort_gaussians(
-            means2d, depths, radii, valid, cam.img_width, cam.img_height
+            means2d, depths, conics, radii, valid, cam.img_width, cam.img_height
         ).sorted_gaussian_ids.numel()
         n_visible = int((valid > 0).sum())
         torch.mps.synchronize()

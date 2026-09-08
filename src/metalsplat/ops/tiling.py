@@ -45,6 +45,7 @@ def _empty(tile_size: int, tiles_x: int, tiles_y: int, device) -> TileBinningRes
 def bin_and_sort_gaussians(
     means2d: torch.Tensor,  # (N, 2)
     depths: torch.Tensor,  # (N,)
+    conics: torch.Tensor,  # (N, 3) a, b, c -- inverse 2D covariance
     radii: torch.Tensor,  # (N,)
     valid: torch.Tensor,  # (N,) bool-ish
     img_width: int,
@@ -59,12 +60,13 @@ def bin_and_sort_gaussians(
     if device.type != "mps":  # CPU/other: fall back to the reference
         from metalsplat.reference.tiling_ref import bin_and_sort_gaussians as ref
 
-        return ref(means2d, depths, radii, valid, img_width, img_height, tile_size)
+        return ref(means2d, depths, conics, radii, valid, img_width, img_height, tile_size)
 
     if n == 0:
         return _empty(tile_size, tiles_x, tiles_y, device)
 
     means2d_c = means2d.contiguous().float()
+    conics_c = conics.contiguous().float()
     depths_c = depths.contiguous().float()
     radii_c = radii.contiguous().float()
     valid_c = (valid > 0.5).to(torch.float32).contiguous() if valid.dtype == torch.bool else valid.contiguous().float()
@@ -73,7 +75,8 @@ def bin_and_sort_gaussians(
 
     counts = torch.empty(n, dtype=torch.int32, device=device)
     lib.tile_counts(
-        means2d_c, radii_c, valid_c, tiles_x, tiles_y, float(tile_size), counts, threads=n
+        means2d_c, conics_c, radii_c, valid_c, tiles_x, tiles_y, float(tile_size), counts,
+        threads=n,
     )
 
     # Exclusive prefix sum gives each gaussian the slot its pairs start at.
@@ -88,7 +91,7 @@ def bin_and_sort_gaussians(
     keys = torch.empty(total_pairs, dtype=torch.int64, device=device)
     gaussian_ids = torch.empty(total_pairs, dtype=torch.int32, device=device)
     lib.tile_pairs(
-        means2d_c, depths_c, radii_c, valid_c, offsets,
+        means2d_c, conics_c, depths_c, radii_c, valid_c, offsets,
         tiles_x, tiles_y, float(tile_size),
         keys, gaussian_ids, threads=n,
     )
