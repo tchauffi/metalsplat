@@ -12,3 +12,9 @@ data/garden/
 
 # Example script outputs
 examples/*.png
+examples/*.ply
+examples/video_frames/
+examples/*.mp4
+
+# macOS
+.DS_Store
