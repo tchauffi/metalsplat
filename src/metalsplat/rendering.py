@@ -33,6 +33,7 @@ def render(
     return_aux: bool = False,
     abs_grad_accum: torch.Tensor | None = None,
     near_fade: tuple[float, float] | None = None,
+    antialias: bool = True,
 ):
     """Renders `model` from `camera`'s viewpoint. Returns an (H, W, 3) image.
 
@@ -65,8 +66,14 @@ def render(
     `r1` must be comfortably below the distance to the nearest real geometry
     (for an orbit, the camera's height above the ground) or this punches a
     hole in the scene instead.
+
+    `antialias` (default True) scales each gaussian's opacity by the
+    Mip-Splatting compensation factor, correcting for the energy the eps2d
+    low-pass filter would otherwise add to sub-pixel gaussians. Set False to
+    reproduce renders from before this existed, or to match a model trained
+    without it.
     """
-    means2d, depths, conics, radii, valid = project_gaussians(
+    means2d, depths, conics, radii, valid, compensation = project_gaussians(
         model.means,
         model.scales,
         model.quats,
@@ -87,6 +94,15 @@ def render(
         means2d.retain_grad()
 
     opacities = model.opacities
+    if antialias:
+        # Mip-Splatting's anti-aliasing factor. project_gaussians dilates the
+        # 2D covariance by eps2d as a low-pass filter; that also inflates the
+        # integral of the gaussian's density, so a sub-pixel gaussian renders
+        # stronger than it should and flickers as it crosses pixel
+        # boundaries. `compensation` is the factor that takes that extra
+        # energy back out of the peak opacity. ~1 for anything comfortably
+        # larger than a pixel, falling to 0 for the smallest gaussians.
+        opacities = opacities * compensation
     if near_fade is not None:
         r0, r1 = near_fade
         dist = (model.means - camera.position).norm(dim=-1)

@@ -45,6 +45,7 @@ kernel void project_forward(
     device float* out_conics,             // (N,3) a,b,c
     device float* out_radii,               // (N,)
     device float* out_valid,                // (N,) 1.0 / 0.0
+    device float* out_compensations,         // (N,) anti-aliasing opacity scale
     uint gid [[thread_position_in_grid]])
 {
     float3 mean = float3(means[gid * 3 + 0], means[gid * 3 + 1], means[gid * 3 + 2]);
@@ -97,6 +98,15 @@ kernel void project_forward(
     out_conics[gid * 3 + 1] = -b / det_safe;
     out_conics[gid * 3 + 2] = a / det_safe;
 
+    // Anti-aliasing compensation: the eps2d dilation above low-passes the
+    // gaussian, but it also inflates the integral of its density, so a
+    // sub-pixel gaussian renders stronger than it should and shimmers as it
+    // crosses pixel boundaries. Scaling opacity by the ratio of the
+    // undilated to dilated determinant takes that energy back out. See
+    // reference/project_ref.py for the full derivation.
+    float det_orig = max(a_raw * c_raw - b_raw * b_raw, 0.0);
+    out_compensations[gid] = sqrt(clamp(det_orig / det_safe, 0.0, 1.0));
+
     float mid = 0.5 * (a + c);
     float disc = max(mid * mid - det, 0.0);
     float lambda_max = mid + sqrt(disc);
@@ -134,6 +144,7 @@ kernel void project_backward(
     device const float* valid_in,       // (N,) from forward
     device const float* d_means2d,       // (N,2)
     device const float* d_conics,         // (N,3) a,b,c
+    device const float* d_compensations,   // (N,)
     device float* d_means,                 // (N,3)
     device float* d_scales,                 // (N,3)
     device float* d_quats,                   // (N,4)
@@ -209,6 +220,23 @@ kernel void project_backward(
     float d_a_raw = d_a;
     float d_c_raw = d_c;
     float d_b_raw = d_b;
+
+    // ---- compensation = sqrt(det_orig / det) backward ----
+    // det_orig = a_raw*c_raw - b_raw^2 (undilated), det = a*c - b^2 (dilated),
+    // so both determinants depend on the same three raw entries and each
+    // contributes a term. Skipped when the compensation has collapsed to
+    // zero, where sqrt's derivative is unbounded and the forward clamp has
+    // already flattened the output anyway.
+    float det_orig = max(a_raw * c_raw - b_raw * b_raw, 0.0);
+    float comp = sqrt(clamp(det_orig / max(det, 1e-12), 0.0, 1.0));
+    if (comp > 1e-9) {
+        float d_comp = d_compensations[gid];
+        float d_det_orig = d_comp / (2.0 * comp * det);
+        float d_det_blur = -d_comp * comp / (2.0 * det);
+        d_a_raw += d_det_orig * c_raw + d_det_blur * c;
+        d_c_raw += d_det_orig * a_raw + d_det_blur * a;
+        d_b_raw += d_det_orig * (-2.0 * b_raw) + d_det_blur * (-2.0 * b);
+    }
 
     // ---- a_raw/b_raw/c_raw = J Sigma_cam J^T backward ----
     float d_S00 = j0 * j0 * d_a_raw;

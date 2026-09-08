@@ -42,6 +42,7 @@ class ProjectGaussians(torch.autograd.Function):
         conics = torch.empty(n, 3, device=device, dtype=torch.float32)
         radii = torch.empty(n, device=device, dtype=torch.float32)
         valid = torch.empty(n, device=device, dtype=torch.float32)
+        compensations = torch.empty(n, device=device, dtype=torch.float32)
 
         if n > 0:
             lib = load_kernel("project")
@@ -64,6 +65,7 @@ class ProjectGaussians(torch.autograd.Function):
                 conics,
                 radii,
                 valid,
+                compensations,
                 threads=n,
             )
 
@@ -72,10 +74,10 @@ class ProjectGaussians(torch.autograd.Function):
         ctx.img_width, ctx.img_height = img_width, img_height
         ctx.near, ctx.eps2d = near, eps2d
         ctx.n = n
-        return means2d, depths, conics, radii, valid
+        return means2d, depths, conics, radii, valid, compensations
 
     @staticmethod
-    def backward(ctx, grad_means2d, grad_depths, grad_conics, grad_radii, grad_valid):
+    def backward(ctx, grad_means2d, grad_depths, grad_conics, grad_radii, grad_valid, grad_compensations):
         means, scales, quats, rwc_flat, twc, valid = ctx.saved_tensors
         n = ctx.n
         device = means.device
@@ -103,6 +105,7 @@ class ProjectGaussians(torch.autograd.Function):
                 valid,
                 grad_means2d.contiguous(),
                 grad_conics.contiguous(),
+                grad_compensations.contiguous(),
                 d_means,
                 d_scales,
                 d_quats,
@@ -129,7 +132,7 @@ def project_gaussians(
 ):
     """Project 3D gaussians to 2D screen space using the Metal kernels.
 
-    Returns (means2d, depths, conics, radii, valid) -- see
+    Returns (means2d, depths, conics, radii, valid, compensation) -- see
     metalsplat.reference.project_ref.ProjectionResult for field semantics.
     """
     return ProjectGaussians.apply(

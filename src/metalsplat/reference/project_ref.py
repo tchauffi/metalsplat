@@ -17,6 +17,8 @@ Conventions (matching the original 3D Gaussian Splatting paper / gsplat):
 - ``conic`` stores the inverse of the (eps-regularized) 2D covariance as its
   three independent entries ``(a, b, c)`` for the symmetric matrix
   ``[[a, b], [b, c]]``.
+- ``compensation`` is the anti-aliasing factor that opacity is scaled by;
+  see ``ProjectionResult.compensation``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class ProjectionResult:
     conics: torch.Tensor  # (N, 3) inverse-2D-covariance entries (a, b, c)
     radii: torch.Tensor  # (N,) integer pixel radius (3-sigma extent), 0 if culled
     valid: torch.Tensor  # (N,) bool, False for culled gaussians
+    compensation: torch.Tensor  # (N,) anti-aliasing opacity scale in [0, 1]
 
 
 def project_gaussians(
@@ -103,6 +106,23 @@ def project_gaussians(
     conic_c = a / det_safe
     conics = torch.stack([conic_a, conic_b, conic_c], dim=-1)
 
+    # Anti-aliasing compensation (Mip-Splatting, Yu et al. 2024; gsplat's
+    # `antialiased` mode). The eps2d term above is a low-pass filter that
+    # keeps sub-pixel gaussians from falling between sample points, but
+    # dilating a gaussian also inflates the integral of its density -- a
+    # gaussian smaller than a pixel gets blurred out to pixel size while
+    # keeping its peak opacity, so it renders *stronger* than it should and
+    # shimmers as it moves between pixels.
+    #
+    # Scaling opacity by sqrt(det(Sigma2d) / det(Sigma2d + eps2d*I)) restores
+    # the original integrated density: the blur spreads the energy, and this
+    # takes the same factor back out of the peak. For a gaussian much larger
+    # than eps2d the ratio is ~1 and nothing happens; for a sub-pixel one it
+    # falls towards 0, which is exactly the "shrink to nothing rather than
+    # flicker" behaviour wanted at high frequencies.
+    det_orig = (sigma2d[:, 0, 0] * sigma2d[:, 1, 1] - sigma2d[:, 0, 1] * sigma2d[:, 1, 0]).clamp_min(0.0)
+    compensation = (det_orig / det_safe).clamp(0.0, 1.0).sqrt()
+
     mid = 0.5 * (a + c)
     disc = (mid * mid - det).clamp_min(0.0)
     lambda_max = mid + disc.sqrt()
@@ -131,4 +151,5 @@ def project_gaussians(
         conics=conics,
         radii=radii,
         valid=valid,
+        compensation=compensation,
     )
