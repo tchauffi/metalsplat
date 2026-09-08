@@ -69,6 +69,7 @@ class ProjectGaussians(torch.autograd.Function):
 
         ctx.save_for_backward(means_c, scales_c, quats_c, rwc_flat, twc, valid)
         ctx.fx, ctx.fy, ctx.cx, ctx.cy = fx, fy, cx, cy
+        ctx.img_width, ctx.img_height = img_width, img_height
         ctx.near, ctx.eps2d = near, eps2d
         ctx.n = n
         return means2d, depths, conics, radii, valid
@@ -95,6 +96,8 @@ class ProjectGaussians(torch.autograd.Function):
                 float(ctx.fy),
                 float(ctx.cx),
                 float(ctx.cy),
+                float(ctx.img_width),
+                float(ctx.img_height),
                 float(ctx.near),
                 float(ctx.eps2d),
                 valid,

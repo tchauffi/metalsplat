@@ -69,10 +69,19 @@ kernel void project_forward(
     float S00 = SigmaCam[0][0], S11 = SigmaCam[1][1], S22 = SigmaCam[2][2];
     float S01 = SigmaCam[1][0], S02 = SigmaCam[2][0], S12 = SigmaCam[2][1];
 
+    // Clamp the ray direction to 1.3x the half-FOV before building J: its
+    // third column is -f*x/z^2, which explodes for gaussians far off-axis
+    // and produces vast bogus 2D covariances that cover every tile. See
+    // reference/project_ref.py for the full rationale and the measurements.
+    float lim_x = 1.3 * (0.5 * img_width) / fx;
+    float lim_y = 1.3 * (0.5 * img_height) / fy;
+    float tx = clamp(x / z_safe, -lim_x, lim_x) * z_safe;
+    float ty = clamp(y / z_safe, -lim_y, lim_y) * z_safe;
+
     float j0 = fx / z_safe;
     float j1 = fy / z_safe;
-    float j2 = -fx * x / (z_safe * z_safe);
-    float j3 = -fy * y / (z_safe * z_safe);
+    float j2 = -fx * tx / (z_safe * z_safe);
+    float j3 = -fy * ty / (z_safe * z_safe);
 
     float a_raw = j0 * j0 * S00 + 2.0 * j0 * j2 * S02 + j2 * j2 * S22;
     float c_raw = j1 * j1 * S11 + 2.0 * j1 * j3 * S12 + j3 * j3 * S22;
@@ -118,6 +127,8 @@ kernel void project_backward(
     constant float& fy,
     constant float& cx,
     constant float& cy,
+    constant float& img_width,
+    constant float& img_height,
     constant float& near,
     constant float& eps2d,
     device const float* valid_in,       // (N,) from forward
@@ -157,10 +168,20 @@ kernel void project_backward(
     float S00 = SigmaCam[0][0], S11 = SigmaCam[1][1], S22 = SigmaCam[2][2];
     float S01 = SigmaCam[1][0], S02 = SigmaCam[2][0], S12 = SigmaCam[2][1];
 
+    // Same FOV clamp as the forward pass (see there). rx/ry are the clamped
+    // ray directions; when a component is clamped it no longer depends on x
+    // (or y), which the gradients below have to respect.
+    float lim_x = 1.3 * (0.5 * img_width) / fx;
+    float lim_y = 1.3 * (0.5 * img_height) / fy;
+    float rx = clamp(x / z_safe, -lim_x, lim_x);
+    float ry = clamp(y / z_safe, -lim_y, lim_y);
+    float free_x = (fabs(x / z_safe) < lim_x) ? 1.0 : 0.0;
+    float free_y = (fabs(y / z_safe) < lim_y) ? 1.0 : 0.0;
+
     float j0 = fx / z_safe;
     float j1 = fy / z_safe;
-    float j2 = -fx * x / (z_safe * z_safe);
-    float j3 = -fy * y / (z_safe * z_safe);
+    float j2 = -fx * rx / z_safe;
+    float j3 = -fy * ry / z_safe;
 
     float a_raw = j0 * j0 * S00 + 2.0 * j0 * j2 * S02 + j2 * j2 * S22;
     float c_raw = j1 * j1 * S11 + 2.0 * j1 * j3 * S12 + j3 * j3 * S22;
@@ -203,11 +224,15 @@ kernel void project_backward(
     float d_j3 = (2.0 * j1 * S12 + 2.0 * j3 * S22) * d_c_raw + (j0 * S02 + j2 * S22) * d_b_raw;
 
     // ---- Jacobian entries -> d_x, d_y, d_z (partial) ----
-    float d_x = (-fx / (z_safe * z_safe)) * d_j2;
-    float d_y = (-fy / (z_safe * z_safe)) * d_j3;
-    float d_z = (-fx / (z_safe * z_safe)) * d_j0 + (-fy / (z_safe * z_safe)) * d_j1 +
-                (2.0 * fx * x / (z_safe * z_safe * z_safe)) * d_j2 +
-                (2.0 * fy * y / (z_safe * z_safe * z_safe)) * d_j3;
+    // j2 = -fx * rx / z with rx = clamp(x/z): d(rx)/dx = 1/z and
+    // d(rx)/dz = -x/z^2 while free, both 0 once clamped, plus the explicit
+    // 1/z. Unclamped this collapses to the plain -fx/z^2 and 2*fx*x/z^3.
+    float inv_z2 = 1.0 / (z_safe * z_safe);
+    float d_x = (-fx * inv_z2 * free_x) * d_j2;
+    float d_y = (-fy * inv_z2 * free_y) * d_j3;
+    float d_z = (-fx * inv_z2) * d_j0 + (-fy * inv_z2) * d_j1 +
+                ((fx * x * inv_z2 / z_safe) * free_x + fx * rx * inv_z2) * d_j2 +
+                ((fy * y * inv_z2 / z_safe) * free_y + fy * ry * inv_z2) * d_j3;
 
     // ---- means2d = (fx*x/z + cx, fy*y/z + cy) backward ----
     d_x += (fx / z_safe) * d_u;

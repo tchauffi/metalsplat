@@ -62,9 +62,33 @@ def project_gaussians(
     sigma_world = m @ m.transpose(-1, -2)  # (N, 3, 3)
     sigma_cam = R_wc @ sigma_world @ R_wc.T  # (N, 3, 3), broadcasts R_wc over N
 
+    # EWA affine approximation, with the ray direction clamped to slightly
+    # outside the frustum before building the Jacobian.
+    #
+    # J's third column is -f*x/z^2, which grows without bound as a gaussian
+    # moves off-axis. For a point far to the side of the camera the affine
+    # approximation is meaningless anyway, but it still yields a finite --
+    # and enormous -- 2D covariance: measured on the garden scene, ~150
+    # gaussians per orbit frame projected to radii over 500px, peaking at
+    # 171,000px on a 972x630 image. Their 2D centres are far off-screen, so
+    # nothing culls them, yet their bounding box covers every tile and each
+    # one smears a huge blob across the whole frame. That is the "isolated
+    # splats in front of the camera" artifact, and it flickers because which
+    # gaussians are affected changes as the camera turns.
+    #
+    # Clamping x/z and y/z to 1.3x the half-FOV bounds the Jacobian while
+    # leaving anything actually on screen untouched (1.3 > 1 by design, so
+    # the frustum edge is unaffected). From the original 3DGS computeCov2D.
+    # Note the *centre* (means2d) still uses the unclamped x, y -- only the
+    # covariance approximation is clamped.
+    lim_x = 1.3 * (0.5 * img_width) / fx
+    lim_y = 1.3 * (0.5 * img_height) / fy
+    tx = (x / z_safe).clamp(-lim_x, lim_x) * z_safe
+    ty = (y / z_safe).clamp(-lim_y, lim_y) * z_safe
+
     zeros = torch.zeros_like(x)
-    j_row0 = torch.stack([fx / z_safe, zeros, -fx * x / (z_safe * z_safe)], dim=-1)
-    j_row1 = torch.stack([zeros, fy / z_safe, -fy * y / (z_safe * z_safe)], dim=-1)
+    j_row0 = torch.stack([fx / z_safe, zeros, -fx * tx / (z_safe * z_safe)], dim=-1)
+    j_row1 = torch.stack([zeros, fy / z_safe, -fy * ty / (z_safe * z_safe)], dim=-1)
     jac = torch.stack([j_row0, j_row1], dim=-2)  # (N, 2, 3)
 
     sigma2d = jac @ sigma_cam @ jac.transpose(-1, -2)  # (N, 2, 2)
