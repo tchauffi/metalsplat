@@ -5,9 +5,9 @@ Apple Silicon via Metal instead of CUDA -- a `gsplat`-equivalent that runs
 entirely on the MPS backend, with real hand-written Metal compute kernels
 for the performance-critical stages.
 
-[![RGB and depth renders of the garden scene](docs/garden_orbit.png)](https://github.com/tchauffi/metalsplat/raw/main/docs/garden_orbit.mp4)
-
-*(click for the 24s orbit video --* `docs/garden_orbit.mp4` *)*
+<video src="https://github.com/tchauffi/metalsplat/raw/main/docs/garden_orbit.mp4" controls muted loop playsinline width="100%">
+  <a href="https://github.com/tchauffi/metalsplat/raw/main/docs/garden_orbit.mp4"><img src="docs/garden_orbit.png" alt="RGB and depth renders of the garden scene" width="100%"></a>
+</video>
 
 The *mip-NeRF 360* garden scene, reconstructed from 185 COLMAP-posed photos
 (161 train / 24 held out) and rendered on a circular orbit none of the
