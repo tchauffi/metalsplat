@@ -28,30 +28,8 @@ NUM_ITERS = 5000
 EVAL_EVERY = 500
 LR_OTHER_INIT = 0.01
 LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # color/scale/rotation are decayed, like means
-# Opacity gets its own *undecayed* group. It must stay able to climb fast:
-# opacity reset caps every gaussian at OPACITY_RESET_VALUE, and anything
-# that genuinely represents geometry has to re-grow from there. With a
-# decayed opacity LR the two features fight each other -- observed
-# directly: thin structures (the table legs) never recovered their opacity
-# after the last reset and rendered semi-transparent, scoring worse than a
-# run with no opacity reset at all. Real 3DGS likewise keeps opacity LR
-# constant.
 LR_OPACITY = 0.05
 SH_DEGREE = 2  # 0 = plain RGB, 2 = view-dependent spherical harmonics
-# Activate one more SH band every N steps, starting from degree 0, to force
-# the scene to be explained diffusely before the higher bands can memorise
-# per-photo exposure/white-balance drift.
-#
-# Off by default because it *lost* the A/B on this scene, both runs scored on
-# the same 24 held-out views:
-#
-#   all bands from step 1 : held-out 22.01 dB / SSIM 0.691  (peak 22.57 @ 3500)
-#   +1 band every 1000    : held-out 21.24 dB / SSIM 0.668  (peak 22.19 @ 3500)
-#
-# It does do what it claims -- the train/held-out gap falls from -0.38 to
-# +0.18 dB, i.e. less memorisation -- but the diffuse-only warmup costs more
-# in fitting capacity than it wins back. Worth retrying on a scene with
-# stronger exposure drift between photos; set to 1000 to enable.
 SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
 LAMBDA_DSSIM = 0.2  # 3DGS default: loss = (1-lambda)*L1 + lambda*D-SSIM
 EVAL_HOLDOUT_STRIDE = 8  # every 8th image is held out for eval, matching common NeRF/gsplat convention
@@ -74,21 +52,6 @@ SEED_RESIDUAL_THRESH = 0.15
 SEED_COVERAGE_THRESH = 0.8
 SEED_MAX_PER_CALL = 300
 
-# Opacity reset + standalone pruning: periodically caps every gaussian's
-# opacity low, forcing ones that only got high opacity by occluding/
-# compensating for a neighbor (rather than genuinely representing
-# something) to re-earn it through training or fall below the prune
-# threshold. Pruning runs on its own, more frequent schedule that keeps
-# going after DENSIFY_STOP so gaussians reset late in training still get
-# cleaned up.
-#
-# OPACITY_RESET_STOP must leave enough steps after the *last* reset for
-# training to fully recover (empirically ~1000-1500 steps here) -- a reset
-# too close to NUM_ITERS leaves the model in its just-reset, still-hazy/
-# semi-transparent state with no time to refine, which is worse than never
-# resetting at all. Observed directly: with resets at 1500/3000/4500 (every
-# 1500, no stop) the final (step 5000) render was visibly blurrier/hazier
-# than a run without a reset in that last 500-step window.
 OPACITY_RESET_INTERVAL = 1500  # 0/None disables
 OPACITY_RESET_STOP = 3000
 OPACITY_RESET_VALUE = 0.01
