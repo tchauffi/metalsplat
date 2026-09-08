@@ -15,9 +15,9 @@ from pathlib import Path
 
 import torch
 
-from metalsplat import GaussianModel, render
+from metalsplat import GaussianModel, render, save_ply
 from metalsplat.data.colmap import load_colmap_scene
-from metalsplat.densify import densify_and_prune
+from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
 from metalsplat.losses import gaussian_splatting_loss
 from metalsplat.seed import seed_uncovered_regions
 
@@ -27,12 +27,35 @@ OUT_DIR = Path(__file__).parent
 NUM_ITERS = 5000
 EVAL_EVERY = 500
 LR_OTHER_INIT = 0.01
-LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # decayed too: a constant LR on color/opacity/scale/quat
-# was a plausible extra source of the training-time instability alongside
-# the (already-fixed) undecayed means LR.
+LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # color/scale/rotation are decayed, like means
+# Opacity gets its own *undecayed* group. It must stay able to climb fast:
+# opacity reset caps every gaussian at OPACITY_RESET_VALUE, and anything
+# that genuinely represents geometry has to re-grow from there. With a
+# decayed opacity LR the two features fight each other -- observed
+# directly: thin structures (the table legs) never recovered their opacity
+# after the last reset and rendered semi-transparent, scoring worse than a
+# run with no opacity reset at all. Real 3DGS likewise keeps opacity LR
+# constant.
+LR_OPACITY = 0.05
 SH_DEGREE = 2  # 0 = plain RGB, 2 = view-dependent spherical harmonics
+# Activate one more SH band every N steps, starting from degree 0, to force
+# the scene to be explained diffusely before the higher bands can memorise
+# per-photo exposure/white-balance drift.
+#
+# Off by default because it *lost* the A/B on this scene, both runs scored on
+# the same 24 held-out views:
+#
+#   all bands from step 1 : held-out 22.01 dB / SSIM 0.691  (peak 22.57 @ 3500)
+#   +1 band every 1000    : held-out 21.24 dB / SSIM 0.668  (peak 22.19 @ 3500)
+#
+# It does do what it claims -- the train/held-out gap falls from -0.38 to
+# +0.18 dB, i.e. less memorisation -- but the diffuse-only warmup costs more
+# in fitting capacity than it wins back. Worth retrying on a scene with
+# stronger exposure drift between photos; set to 1000 to enable.
+SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
 LAMBDA_DSSIM = 0.2  # 3DGS default: loss = (1-lambda)*L1 + lambda*D-SSIM
 EVAL_HOLDOUT_STRIDE = 8  # every 8th image is held out for eval, matching common NeRF/gsplat convention
+EVAL_IMAGES_SAVED = 3  # how many held-out renders to write to disk (all are scored)
 INIT_OPACITY = 0.1
 
 # Adaptive density control schedule
@@ -50,6 +73,29 @@ SEED_INTERVAL = 250
 SEED_RESIDUAL_THRESH = 0.15
 SEED_COVERAGE_THRESH = 0.8
 SEED_MAX_PER_CALL = 300
+
+# Opacity reset + standalone pruning: periodically caps every gaussian's
+# opacity low, forcing ones that only got high opacity by occluding/
+# compensating for a neighbor (rather than genuinely representing
+# something) to re-earn it through training or fall below the prune
+# threshold. Pruning runs on its own, more frequent schedule that keeps
+# going after DENSIFY_STOP so gaussians reset late in training still get
+# cleaned up.
+#
+# OPACITY_RESET_STOP must leave enough steps after the *last* reset for
+# training to fully recover (empirically ~1000-1500 steps here) -- a reset
+# too close to NUM_ITERS leaves the model in its just-reset, still-hazy/
+# semi-transparent state with no time to refine, which is worse than never
+# resetting at all. Observed directly: with resets at 1500/3000/4500 (every
+# 1500, no stop) the final (step 5000) render was visibly blurrier/hazier
+# than a run without a reset in that last 500-step window.
+OPACITY_RESET_INTERVAL = 1500  # 0/None disables
+OPACITY_RESET_STOP = 3000
+OPACITY_RESET_VALUE = 0.01
+PRUNE_START = 100
+PRUNE_STOP = NUM_ITERS
+PRUNE_INTERVAL = 100
+PRUNE_OPACITY_THRESH = 0.005
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
@@ -141,6 +187,9 @@ def main() -> None:
     model = GaussianModel(
         scene.points, scales=scales, colors=scene.colors, opacities=opacities, sh_degree=SH_DEGREE
     ).to(DEVICE)
+    if SH_DEGREE_INTERVAL:
+        model.active_sh_degree = 0
+        print(f"SH degree starts at 0, +1 every {SH_DEGREE_INTERVAL} steps", flush=True)
 
     # Means live in the scene's (COLMAP-arbitrary) coordinate units, so their
     # learning rate is calibrated to the scene's own spacing unit rather
@@ -155,13 +204,17 @@ def main() -> None:
     lr_means_final = lr_means_init * 0.01
     print(f"means lr: {lr_means_init:.5f} -> {lr_means_final:.5f} (exponential decay)", flush=True)
     print(f"other lr: {LR_OTHER_INIT:.5f} -> {LR_OTHER_FINAL:.5f} (exponential decay)", flush=True)
+    print(f"opacity lr: {LR_OPACITY:.5f} (constant, see LR_OPACITY)", flush=True)
 
+    # Param group order matters: the training loop updates groups 0 and 1's
+    # LR each step and deliberately leaves group 2 (opacity) alone.
     def make_optimizer(m: GaussianModel, lr_means: float, lr_other: float) -> torch.optim.Optimizer:
         color_param = m.raw_colors if m.sh_degree == 0 else m.raw_sh
         return torch.optim.Adam(
             [
                 {"params": [m.means], "lr": lr_means},
-                {"params": [m.raw_scales, m.raw_quats, m.raw_opacities, color_param], "lr": lr_other},
+                {"params": [m.raw_scales, m.raw_quats, color_param], "lr": lr_other},
+                {"params": [m.raw_opacities], "lr": LR_OPACITY},
             ]
         )
 
@@ -169,16 +222,31 @@ def main() -> None:
     background = torch.zeros(3, device=DEVICE)
 
     def eval_and_save(step: int) -> None:
+        # Score on *every* held-out view: a 3-view average swings by a
+        # couple of dB run to run, which is enough to mistake noise for a
+        # real regression (and vice versa) when tuning. Only the first few
+        # are written out as images.
         with torch.no_grad():
             psnrs = []
-            for k, idx in enumerate(eval_idx[:3]):
-                cam = scene.cameras[idx]
-                target = scene.images[idx]
-                pred = render(model, cam, background=background)
+            for k, idx in enumerate(eval_idx):
+                pred = render(model, scene.cameras[idx], background=background)
                 torch.mps.synchronize()
-                psnrs.append(psnr(pred, target))
-                save_image(pred, OUT_DIR / f"garden_eval_{k}_step{step}.png")
-            print(f"  eval PSNR (first {len(psnrs)} held-out views): {sum(psnrs) / len(psnrs):.2f} dB", flush=True)
+                psnrs.append(psnr(pred, scene.images[idx]))
+                if k < EVAL_IMAGES_SAVED:
+                    save_image(pred, OUT_DIR / f"garden_eval_{k}_step{step}.png")
+            mean_psnr = sum(psnrs) / len(psnrs)
+            print(f"  eval PSNR ({len(psnrs)} held-out views): {mean_psnr:.2f} dB", flush=True)
+
+        # Held-out PSNR peaks before the last step on this scene (22.19 at
+        # 3500 vs 21.24 at 5000), so keep the best checkpoint rather than
+        # trusting the final one. Only trustworthy because every held-out
+        # view is scored -- a 3-view average swings by more than this.
+        nonlocal best
+        if mean_psnr > best[0]:
+            best = (mean_psnr, step)
+            save_ply(model, OUT_DIR / "garden_best.ply")
+
+    best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
 
     print("Saving target/initial renders for eval view 0...", flush=True)
     save_image(scene.images[eval_idx[0]], OUT_DIR / "garden_target_0.png")
@@ -186,6 +254,7 @@ def main() -> None:
 
     grad_accum = torch.zeros(model.num_points, device=DEVICE)
     grad_count = torch.zeros(model.num_points, device=DEVICE)
+    previous_sh_degree = model.active_sh_degree
 
     start = time.time()
     for step in range(1, NUM_ITERS + 1):
@@ -200,14 +269,16 @@ def main() -> None:
         target = scene.images[idx]
 
         optimizer.zero_grad()
-        pred, means2d, valid, final_T = render(model, cam, background=background, return_aux=True)
+        aux = render(
+            model, cam, background=background, return_aux=True, abs_grad_accum=grad_accum
+        )
+        pred, valid, final_T = aux.image, aux.valid, aux.final_T
         loss = gaussian_splatting_loss(pred, target, lambda_dssim=LAMBDA_DSSIM)
-        loss.backward()
+        loss.backward()  # accumulates into grad_accum in place (AbsGS-style, see rendering.render)
         optimizer.step()
 
         with torch.no_grad():
             visible = valid > 0.5
-            grad_accum[visible] += means2d.grad[visible].norm(dim=-1)
             grad_count[visible] += 1.0
 
         if step % 25 == 0 or step == 1:
@@ -249,11 +320,32 @@ def main() -> None:
                 flush=True,
             )
 
+        if OPACITY_RESET_INTERVAL and step <= OPACITY_RESET_STOP and step % OPACITY_RESET_INTERVAL == 0:
+            reset_opacity(model, value=OPACITY_RESET_VALUE)
+            print(f"  opacity reset @ step {step} (cap {OPACITY_RESET_VALUE})", flush=True)
+
+        if PRUNE_START <= step <= PRUNE_STOP and step % PRUNE_INTERVAL == 0:
+            model, n_pruned = prune_low_opacity(model, prune_opacity_thresh=PRUNE_OPACITY_THRESH)
+            if n_pruned > 0:
+                optimizer = make_optimizer(model, lr_means, lr_other)
+                grad_accum = torch.zeros(model.num_points, device=DEVICE)
+                grad_count = torch.zeros(model.num_points, device=DEVICE)
+                print(f"  prune @ step {step}: -{n_pruned} (n={model.num_points})", flush=True)
+
+        if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
+            active = model.increase_sh_degree()
+            if active != previous_sh_degree:
+                print(f"  SH degree -> {active} @ step {step}", flush=True)
+                previous_sh_degree = active
+
         if step % EVAL_EVERY == 0:
             eval_and_save(step)
 
     eval_and_save(NUM_ITERS)
-    print(f"Done. Renders saved to {OUT_DIR}", flush=True)
+    ply_path = OUT_DIR / "garden.ply"
+    save_ply(model, ply_path)
+    print(f"Done. Renders saved to {OUT_DIR}, final scene saved to {ply_path}", flush=True)
+    print(f"Best held-out PSNR {best[0]:.2f} dB @ step {best[1]} -> {OUT_DIR / 'garden_best.ply'}", flush=True)
 
 
 if __name__ == "__main__":

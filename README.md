@@ -64,16 +64,40 @@ uv run python examples/train_garden.py
 Training uses adaptive density control (`metalsplat/densify.py`): every
 `DENSIFY_INTERVAL` steps, gaussians with high accumulated screen-space
 gradient are split (if already large -- over-reconstruction) or cloned (if
-still small -- under-reconstruction), and low-opacity gaussians are
-pruned. Without this, a fixed gaussian count can't add detail where
-reconstruction is poor or drop gaussians that have become useless;
-overloaded gaussians compensate by growing/recoloring in unstable ways
-instead, which shows up as training-time color drift and falling held-out
-PSNR (observed empirically on this scene before densification was added).
-The means learning rate is also decayed exponentially over training
-(`lr_means_init -> lr_means_final`), matching standard 3DGS practice, for
-the same reason -- positions should make large exploratory moves early and
-settle down for fine detail late, not keep taking large steps throughout.
+still small -- under-reconstruction). The gradient signal used for this
+is AbsGS-style (gsplat calls it `absgrad`): the rasterizer's backward
+kernel atomically accumulates the *absolute value* of each pixel's
+contribution to a gaussian's screen-space position, rather than relying on
+`means2d.grad` (the gradient of the *summed* loss), since contributions
+from different pixels can have opposite signs and cancel out there --
+hiding exactly the over-reconstructed/blurry gaussians densification is
+supposed to catch. Without densification, a fixed gaussian count can't add
+detail where reconstruction is poor; overloaded gaussians instead
+compensate by growing/recoloring in unstable ways, which shows up as
+training-time color drift and falling held-out PSNR (observed empirically
+on this scene before densification was added).
+
+Loss-driven seeding (`metalsplat/seed.py`) covers what densification
+alone can't: a region that starts with ~no gaussians at all (e.g. sky, or
+a distant background COLMAP's sparse point cloud barely covers) has
+nothing for split/clone to work with. Every `SEED_INTERVAL` steps, pixels
+with high training residual and near-zero coverage (`final_T` close to 1)
+get a brand-new gaussian, unprojected using a plausible borrowed depth and
+bootstrapped from the ground-truth pixel color.
+
+Opacity reset + standalone pruning (also `metalsplat/densify.py`):
+`OPACITY_RESET_INTERVAL` steps, every gaussian's opacity is capped low, so
+ones that only got high opacity by occluding/compensating for a neighbor
+have to re-earn it through training or get removed. Pruning runs on its
+own, more frequent schedule (`PRUNE_INTERVAL`) that -- unlike
+densify_and_prune's split/clone -- keeps going after `DENSIFY_STOP`, so
+gaussians reset late in training still get cleaned up.
+
+The means learning rate (and, separately, the color/opacity/scale/rotation
+learning rate) is decayed exponentially over training, matching standard
+3DGS practice: positions (and, empirically on this scene, colors too)
+should make large exploratory moves early and settle down for fine detail
+late, not keep taking large steps throughout.
 
 Set `SH_DEGREE = 2` at the top of `examples/train_garden.py` to train
 view-dependent color (see below) instead of the default plain RGB.
@@ -83,6 +107,12 @@ The training loss (`metalsplat/losses.py`) is the standard 3DGS objective:
 paper's default `lambda = 0.2` (`LAMBDA_DSSIM` in the script). SSIM is a
 local-window statistic computed via `conv2d` -- no custom Metal kernel
 needed for it, plain torch ops already run fine on MPS here.
+
+The trained scene is saved to a standard 3D Gaussian Splatting `.ply` file
+at the end (`metalsplat.save_ply`, `metalsplat/export.py`) -- the de facto
+interchange format most existing 3DGS viewers (SuperSplat, the
+antimatter15/playcanvas web viewers, etc.) read directly, so a trained
+scene can be viewed and reused without this package at all.
 
 ## Architecture
 
@@ -122,6 +152,11 @@ oracle the kernels are tested against (`tests/test_project.py`,
 via `torch.autograd` on the reference vs. the kernel's hand-written
 backward. It also works as a CPU-compatible fallback.
 
+Training-loop logic (no Metal kernels -- runs between steps, not inside
+the differentiable render): `metalsplat/densify.py` (split/clone/prune,
+opacity reset), `metalsplat/seed.py` (loss-driven gaussian seeding),
+`metalsplat/losses.py` (L1+D-SSIM), `metalsplat/export.py` (`.ply` export).
+
 ## Roadmap
 
 Deliberately out of scope for this pass:
@@ -130,9 +165,9 @@ Deliberately out of scope for this pass:
   kernel pattern extends directly, just more basis-function terms).
 - Exact anti-aliasing compensation factor (currently a small `eps * I`
   regularizer on the 2D covariance for numerical stability instead).
-- Opacity reset (3DGS periodically resets opacity during training to clear
-  out stale/occluding gaussians; not implemented here).
 - Multi-camera batching.
 - Depth/alpha auxiliary render outputs and depth supervision.
 - Camera lens distortion (only undistorted PINHOLE/SIMPLE_PINHOLE COLMAP
   cameras are supported).
+- `.ply` import (`metalsplat.export.save_ply` only exports; loading a
+  `.ply` back into a `GaussianModel` isn't implemented).
