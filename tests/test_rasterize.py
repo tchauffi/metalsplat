@@ -173,3 +173,57 @@ def test_abs_grad_accum_avoids_sign_cancellation():
     signed_grad_norm = means2d_mps.grad.norm().item()
     abs_accum_value = abs_accum.item()
     assert abs_accum_value > signed_grad_norm * 2  # abs-sum meaningfully exceeds the cancelled signed sum
+
+
+@pytest.mark.parametrize("n", [300, 800])
+def test_backward_matches_reference_with_many_gaussians_per_tile(n):
+    """More gaussians in one tile than the backward kernel's batch size.
+
+    The backward stages the tile's gaussians into threadgroup memory 256 at
+    a time, so a tile holding more than that runs the batch loop more than
+    once. Every other test here puts at most a few dozen gaussians on a
+    32x32 image, so the multi-batch path never ran -- while a real scene
+    averages several hundred per tile.
+    """
+    g = torch.Generator().manual_seed(n)
+    # All centres inside one 16x16 tile, so they pile into the same bin.
+    means2d = torch.rand(n, 2, generator=g) * 12.0 + 2.0
+    depths = torch.rand(n, generator=g) * 10.0 + 0.5
+    raw = torch.rand(n, generator=g) * 4.0 + 2.0
+    conics = torch.stack([1.0 / raw, torch.zeros(n), 1.0 / raw], dim=-1)
+    # Low opacities so transmittance survives deep into the list rather than
+    # saturating after the first few gaussians.
+    opacities = torch.rand(n, generator=g) * 0.05 + 0.01
+    colors = torch.rand(n, 3, generator=g)
+    radii = torch.full((n,), 8.0)
+    valid = torch.ones(n)
+
+    means2d_ref = means2d.clone().requires_grad_()
+    conics_ref = conics.clone().requires_grad_()
+    opacities_ref = opacities.clone().requires_grad_()
+    colors_ref = colors.clone().requires_grad_()
+    img_ref = rasterize_gaussians_ref(
+        means2d_ref, depths, conics_ref, opacities_ref, colors_ref, valid, W, H
+    )
+    grad_out = torch.rand(*img_ref.shape, generator=g)
+    (img_ref * grad_out).sum().backward()
+
+    means2d_mps = means2d.to("mps").requires_grad_()
+    conics_mps = conics.to("mps").requires_grad_()
+    opacities_mps = opacities.to("mps").requires_grad_()
+    colors_mps = colors.to("mps").requires_grad_()
+    img = rasterize_gaussians(
+        means2d_mps, depths.to("mps"), conics_mps, opacities_mps, colors_mps,
+        radii.to("mps"), valid.to("mps"), W, H,
+    )
+    (img * grad_out.to("mps")).sum().backward()
+    torch.mps.synchronize()
+
+    assert torch.allclose(img.cpu(), img_ref, atol=1e-4), "forward disagrees"
+    for name, got, want in (
+        ("colors", colors_mps.grad, colors_ref.grad),
+        ("opacities", opacities_mps.grad, opacities_ref.grad),
+        ("conics", conics_mps.grad, conics_ref.grad),
+        ("means2d", means2d_mps.grad, means2d_ref.grad),
+    ):
+        assert torch.allclose(got.cpu(), want, atol=2e-3, rtol=2e-2), f"{name} gradient disagrees"
