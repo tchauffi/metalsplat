@@ -27,8 +27,8 @@ import torch
 from PIL import Image
 
 from metalsplat import Camera, render
-from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.cleanup import damp_view_dependence, prune_isolated
+from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.export import load_ply
 
 DEVICE = "mps"
