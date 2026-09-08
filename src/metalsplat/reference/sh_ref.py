@@ -24,13 +24,22 @@ SH_C2 = (
 )
 
 
-def eval_sh(sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
-    """sh_coeffs: (N, 9, 3), dirs: (N, 3) unit vectors -> (N, 3) color."""
+def eval_sh(sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int = SH_DEGREE) -> torch.Tensor:
+    """sh_coeffs: (N, 9, 3), dirs: (N, 3) unit vectors -> (N, 3) color.
+
+    `active_degree` evaluates only up to that degree, leaving higher
+    coefficients out of the graph entirely (so they get no gradient) --
+    used for progressive SH growth during training.
+    """
     x, y, z = dirs.unbind(-1)
     x, y, z = x[:, None], y[:, None], z[:, None]
 
     result = SH_C0 * sh_coeffs[:, 0, :]
+    if active_degree < 1:
+        return result
     result = result - SH_C1 * y * sh_coeffs[:, 1, :] + SH_C1 * z * sh_coeffs[:, 2, :] - SH_C1 * x * sh_coeffs[:, 3, :]
+    if active_degree < 2:
+        return result
 
     xx, yy, zz = x * x, y * y, z * z
     xy, yz, xz = x * y, y * z, x * z

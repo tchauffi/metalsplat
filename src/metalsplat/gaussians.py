@@ -32,6 +32,7 @@ class GaussianModel(nn.Module):
         colors: torch.Tensor | None = None,  # (N, 3), in [0, 1]; defaults to 0.5 gray
         sh_degree: int = 0,  # 0 = plain RGB, 2 = view-dependent spherical harmonics
         sh_coeffs: torch.Tensor | None = None,  # (N, 9, 3) raw SH; overrides `colors`-derived DC init if given
+        active_sh_degree: int | None = None,  # defaults to sh_degree; preserved across rebuilds
     ):
         super().__init__()
         n = means.shape[0]
@@ -40,6 +41,12 @@ class GaussianModel(nn.Module):
         if sh_degree not in (0, 2):
             raise ValueError(f"sh_degree must be 0 or 2, got {sh_degree}")
         self.sh_degree = sh_degree
+        # Degrees actually evaluated right now. Training can start this
+        # at 0 and grow it (see increase_sh_degree): fitting all bands
+        # from step 1 lets the higher ones absorb per-photo exposure and
+        # white-balance drift before the diffuse base has settled, which
+        # is overfitting that shows up as shimmer when the camera moves.
+        self.active_sh_degree = sh_degree if active_sh_degree is None else active_sh_degree
 
         if scales is None:
             scales = torch.full((n, 3), 0.02, device=device)
@@ -54,10 +61,10 @@ class GaussianModel(nn.Module):
         self.means = nn.Parameter(means.clone())
         self.raw_scales = nn.Parameter(scales.clone().log())
         self.raw_quats = nn.Parameter(quats.clone())
-        self.raw_opacities = nn.Parameter(_logit(opacities.clone()))
+        self.raw_opacities = nn.Parameter(logit(opacities.clone()))
 
         if sh_degree == 0:
-            self.raw_colors = nn.Parameter(_logit(colors.clone()))
+            self.raw_colors = nn.Parameter(logit(colors.clone()))
         elif sh_coeffs is not None:
             self.raw_sh = nn.Parameter(sh_coeffs.clone())
         else:
@@ -90,7 +97,13 @@ class GaussianModel(nn.Module):
         """view_dirs: (N, 3) unit vectors from each gaussian to the camera."""
         if self.sh_degree == 0:
             raise AttributeError("This model has sh_degree=0; use the `colors` property instead.")
-        return eval_sh(self.raw_sh, view_dirs) + 0.5
+        return eval_sh(self.raw_sh, view_dirs, self.active_sh_degree) + 0.5
+
+    def increase_sh_degree(self) -> int:
+        """Activates one more SH band, up to this model's sh_degree."""
+        if self.active_sh_degree < self.sh_degree:
+            self.active_sh_degree += 1
+        return self.active_sh_degree
 
     @property
     def num_points(self) -> int:
@@ -103,6 +116,6 @@ class GaussianModel(nn.Module):
         return cls(means, colors=colors)
 
 
-def _logit(p: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+def logit(p: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     p = p.clamp(eps, 1 - eps)
     return torch.log(p / (1 - p))

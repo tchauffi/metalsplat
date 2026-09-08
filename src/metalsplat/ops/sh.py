@@ -14,7 +14,7 @@ from metalsplat.reference.sh_ref import NUM_SH_COEFFS
 
 class EvalSH(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sh_coeffs: torch.Tensor, dirs: torch.Tensor):
+    def forward(ctx, sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int):
         n = sh_coeffs.shape[0]
         device = sh_coeffs.device
         sh_c = sh_coeffs.contiguous()
@@ -23,10 +23,11 @@ class EvalSH(torch.autograd.Function):
 
         if n > 0:
             lib = load_kernel("sh")
-            lib.sh_forward(sh_c, dirs_c, out_color, threads=n)
+            lib.sh_forward(sh_c, dirs_c, int(active_degree), out_color, threads=n)
 
         ctx.save_for_backward(sh_c, dirs_c)
         ctx.n = n
+        ctx.active_degree = active_degree
         return out_color
 
     @staticmethod
@@ -40,14 +41,19 @@ class EvalSH(torch.autograd.Function):
 
         if n > 0:
             lib = load_kernel("sh")
-            lib.sh_backward(sh_coeffs, dirs, grad_color.contiguous(), d_sh, d_dirs, threads=n)
+            lib.sh_backward(
+                sh_coeffs, dirs, grad_color.contiguous(), int(ctx.active_degree),
+                d_sh, d_dirs, threads=n,
+            )
 
-        return d_sh, d_dirs
+        return d_sh, d_dirs, None  # active_degree is not differentiable
 
 
-def eval_sh(sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
+def eval_sh(sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int = 2) -> torch.Tensor:
     """Evaluates degree<=2 spherical harmonics color using the Metal kernel.
 
     sh_coeffs: (N, 9, 3), dirs: (N, 3) unit view directions -> (N, 3) color.
+    `active_degree` restricts evaluation to that degree; coefficients
+    above it are skipped in both passes, so they receive zero gradient.
     """
-    return EvalSH.apply(sh_coeffs, dirs)
+    return EvalSH.apply(sh_coeffs, dirs, active_degree)
