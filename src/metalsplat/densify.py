@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from metalsplat.gaussians import GaussianModel, logit
+from metalsplat.optim import NEW_GAUSSIAN
 from metalsplat.utils.quaternion import quat_to_rotmat
 
 
@@ -28,6 +29,11 @@ class DensifyStats:
     n_cloned: int  # gaussians duplicated in place
     n_pruned: int  # gaussians removed (low opacity)
     n_after: int
+    # (n_after,) int64: where each surviving gaussian came from in the old
+    # model, or NEW_GAUSSIAN (-1) if it was just created. Feed this to
+    # metalsplat.optim.migrate_optimizer_state -- rebuilding the optimizer
+    # without it discards Adam's moments for every gaussian.
+    source_index: torch.Tensor | None = None
 
 
 def densify_and_prune(
@@ -46,7 +52,8 @@ def densify_and_prune(
     visible = grad_count > 0
     n_before = n
     if not bool(visible.any()) or (max_points is not None and n >= max_points):
-        return model, DensifyStats(n_before, 0, 0, 0, n_before)
+        unchanged = torch.arange(n, device=device)
+        return model, DensifyStats(n_before, 0, 0, 0, n_before, unchanged)
 
     avg_grad = torch.zeros(n, device=device)
     avg_grad[visible] = grad_accum[visible] / grad_count[visible]
@@ -121,6 +128,14 @@ def densify_and_prune(
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 
+    # Split children and clones start with zeroed Adam state, and a split
+    # parent's state dies with it -- matching the reference implementation,
+    # which appends zeros for every gaussian it creates.
+    keep_idx = keep_mask.nonzero(as_tuple=True)[0]
+    fresh = torch.full((2 * split_idx.numel() + clone_idx.numel(),), NEW_GAUSSIAN,
+                       dtype=torch.int64, device=device)
+    source_index = torch.cat([keep_idx, fresh])
+
     n_after = final_means.shape[0]
     n_pruned = int((~keep_mask & ~is_large).sum().item())  # low-opacity prunes among non-split gaussians
     stats = DensifyStats(
@@ -129,6 +144,7 @@ def densify_and_prune(
         n_cloned=int(clone_idx.numel()),
         n_pruned=n_pruned,
         n_after=n_after,
+        source_index=source_index,
     )
     return new_model, stats
 
@@ -149,7 +165,9 @@ def reset_opacity(model: GaussianModel, value: float = 0.01) -> None:
     model.raw_opacities.data = logit(new_opacities)
 
 
-def prune_low_opacity(model: GaussianModel, prune_opacity_thresh: float = 0.005) -> tuple[GaussianModel, int]:
+def prune_low_opacity(
+    model: GaussianModel, prune_opacity_thresh: float = 0.005
+) -> tuple[GaussianModel, int, torch.Tensor]:
     """Removes gaussians with opacity below the threshold. Standalone (no
     split/clone candidate computation) so it can run on its own, more
     frequent schedule, and -- unlike densify_and_prune -- keep running
@@ -157,13 +175,17 @@ def prune_low_opacity(model: GaussianModel, prune_opacity_thresh: float = 0.005)
     to clean up after reset_opacity(), which can otherwise leave a lot of
     now-useless near-transparent gaussians sitting around for the rest of
     training).
+
+    Returns (model, n_pruned, source_index); pass source_index to
+    metalsplat.optim.migrate_optimizer_state when rebuilding the optimizer,
+    or Adam's moments for every surviving gaussian are lost too.
     """
     device = model.means.device
     n_before = model.num_points
     keep_mask = model.opacities.detach() > prune_opacity_thresh
     n_pruned = int((~keep_mask).sum().item())
     if n_pruned == 0:
-        return model, 0
+        return model, 0, torch.arange(n_before, device=device)
 
     means = model.means.detach()[keep_mask]
     scales = model.scales.detach()[keep_mask]
@@ -182,4 +204,4 @@ def prune_low_opacity(model: GaussianModel, prune_opacity_thresh: float = 0.005)
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 
-    return new_model, n_pruned
+    return new_model, n_pruned, keep_mask.nonzero(as_tuple=True)[0]

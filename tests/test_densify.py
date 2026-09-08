@@ -116,7 +116,7 @@ def test_prune_low_opacity_removes_only_below_threshold():
     with torch.no_grad():
         model.raw_opacities[2] = -10.0  # opacity ~0, should be pruned
 
-    new_model, n_pruned = prune_low_opacity(model, prune_opacity_thresh=0.005)
+    new_model, n_pruned, _ = prune_low_opacity(model, prune_opacity_thresh=0.005)
 
     assert n_pruned == 1
     assert new_model.num_points == n - 1
@@ -126,7 +126,7 @@ def test_prune_low_opacity_no_op_when_nothing_below_threshold():
     n = 5
     model = _model(n)
 
-    new_model, n_pruned = prune_low_opacity(model, prune_opacity_thresh=0.005)
+    new_model, n_pruned, _ = prune_low_opacity(model, prune_opacity_thresh=0.005)
 
     assert n_pruned == 0
     assert new_model is model  # returned unchanged, no rebuild needed
@@ -155,6 +155,6 @@ def test_rebuilds_preserve_active_sh_degree():
 
     with torch.no_grad():
         densified.raw_opacities[0] = -10.0
-    pruned, n_pruned = prune_low_opacity(densified)
+    pruned, n_pruned, _ = prune_low_opacity(densified)
     assert n_pruned > 0
     assert pruned.active_sh_degree == 1

@@ -19,6 +19,7 @@ from metalsplat import GaussianModel, render, save_ply
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
 from metalsplat.losses import gaussian_splatting_loss
+from metalsplat.optim import migrate_optimizer_state
 from metalsplat.seed import seed_uncovered_regions
 
 DEVICE = "mps"
@@ -38,7 +39,7 @@ INIT_OPACITY = 0.1
 
 # Adaptive density control schedule
 DENSIFY_START = 1000
-DENSIFY_STOP = 7000
+DENSIFY_STOP = 15_000
 DENSIFY_INTERVAL = 250
 DENSIFY_GRAD_PERCENTILE = 0.9  # top 10% by screen-space gradient each round
 DENSIFY_MAX_POINTS = 5_000_000
@@ -258,7 +259,9 @@ def main() -> None:
                 model, grad_accum, grad_count, scene_scale=scene_scale,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE, max_points=DENSIFY_MAX_POINTS,
             )
-            optimizer = make_optimizer(model, lr_means, lr_other)
+            optimizer = migrate_optimizer_state(
+                optimizer, make_optimizer(model, lr_means, lr_other), stats.source_index
+            )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
             print(
@@ -274,7 +277,9 @@ def main() -> None:
                 max_seeds_per_call=SEED_MAX_PER_CALL, near=0.2, max_points=DENSIFY_MAX_POINTS,
             )
             if seed_stats.n_seeded > 0:
-                optimizer = make_optimizer(model, lr_means, lr_other)
+                optimizer = migrate_optimizer_state(
+                    optimizer, make_optimizer(model, lr_means, lr_other), seed_stats.source_index
+                )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
             print(
@@ -288,9 +293,13 @@ def main() -> None:
             print(f"  opacity reset @ step {step} (cap {OPACITY_RESET_VALUE})", flush=True)
 
         if PRUNE_START <= step <= PRUNE_STOP and step % PRUNE_INTERVAL == 0:
-            model, n_pruned = prune_low_opacity(model, prune_opacity_thresh=PRUNE_OPACITY_THRESH)
+            model, n_pruned, prune_index = prune_low_opacity(
+                model, prune_opacity_thresh=PRUNE_OPACITY_THRESH
+            )
             if n_pruned > 0:
-                optimizer = make_optimizer(model, lr_means, lr_other)
+                optimizer = migrate_optimizer_state(
+                    optimizer, make_optimizer(model, lr_means, lr_other), prune_index
+                )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
                 print(f"  prune @ step {step}: -{n_pruned} (n={model.num_points})", flush=True)
