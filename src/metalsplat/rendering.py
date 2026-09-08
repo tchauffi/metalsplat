@@ -7,6 +7,7 @@ from typing import NamedTuple
 import torch
 
 from metalsplat.camera import Camera
+from metalsplat.filter3d import apply_3d_filter
 from metalsplat.gaussians import GaussianModel
 from metalsplat.ops.project import project_gaussians
 from metalsplat.ops.rasterize import rasterize_gaussians
@@ -34,6 +35,7 @@ def render(
     abs_grad_accum: torch.Tensor | None = None,
     near_fade: tuple[float, float] | None = None,
     antialias: bool = True,
+    filter_3d: torch.Tensor | None = None,
 ):
     """Renders `model` from `camera`'s viewpoint. Returns an (H, W, 3) image.
 
@@ -72,10 +74,22 @@ def render(
     low-pass filter would otherwise add to sub-pixel gaussians. Set False to
     reproduce renders from before this existed, or to match a model trained
     without it.
+
+    `filter_3d`, if given, is the (N,) per-gaussian filter radius from
+    metalsplat.filter3d.compute_3d_filter: the *world-space* half of
+    Mip-Splatting, band-limiting each gaussian to the finest detail any
+    training camera resolved it at. Recompute it when the gaussian count
+    changes, and keep it consistent between training and rendering -- a
+    model trained with it expects to be rendered with it.
     """
+    scales = model.scales
+    opacities = model.opacities
+    if filter_3d is not None:
+        scales, opacities = apply_3d_filter(scales, opacities, filter_3d)
+
     means2d, depths, conics, radii, valid, compensation = project_gaussians(
         model.means,
-        model.scales,
+        scales,
         model.quats,
         camera.R_wc,
         camera.t_wc,
@@ -93,7 +107,6 @@ def render(
         # for depth and coverage but there's no graph to retain a grad on.
         means2d.retain_grad()
 
-    opacities = model.opacities
     if antialias:
         # Mip-Splatting's anti-aliasing factor. project_gaussians dilates the
         # 2D covariance by eps2d as a low-pass filter; that also inflates the

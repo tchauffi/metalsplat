@@ -18,6 +18,7 @@ import torch
 from metalsplat import GaussianModel, render, save_ply
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
+from metalsplat.filter3d import compute_3d_filter
 from metalsplat.losses import gaussian_splatting_loss
 from metalsplat.optim import migrate_optimizer_state
 from metalsplat.seed import seed_uncovered_regions
@@ -32,6 +33,11 @@ LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # color/scale/rotation are decayed, like m
 LR_OPACITY = 0.05
 SH_DEGREE = 3  # 0 = plain RGB; 1..3 = spherical harmonics (3 = the 3DGS default)
 SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
+# Mip-Splatting's 3D smoothing filter: band-limits each gaussian to the
+# finest detail any training camera resolved it at, so reconstruction
+# cannot invent sub-sampling-rate structure that shows up as speckle when
+# the camera moves closer than any training view. 0 disables.
+FILTER_3D_SCALE = 0.2  # the Mip-Splatting paper's value
 LAMBDA_DSSIM = 0.2  # 3DGS default: loss = (1-lambda)*L1 + lambda*D-SSIM
 EVAL_HOLDOUT_STRIDE = 8  # every 8th image is held out for eval, matching common NeRF/gsplat convention
 EVAL_IMAGES_SAVED = 3  # how many held-out renders to write to disk (all are scored)
@@ -193,7 +199,9 @@ def main() -> None:
         with torch.no_grad():
             psnrs = []
             for k, idx in enumerate(eval_idx):
-                pred = render(model, scene.cameras[idx], background=background)
+                pred = render(
+                    model, scene.cameras[idx], background=background, filter_3d=filter_3d
+                )
                 torch.mps.synchronize()
                 psnrs.append(psnr(pred, scene.images[idx]))
                 if k < EVAL_IMAGES_SAVED:
@@ -212,6 +220,21 @@ def main() -> None:
 
     best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
 
+    # The 3D filter is per-gaussian, so it has to be recomputed every time
+    # the gaussian set changes -- a stale one is indexed by the old ordering
+    # and would silently band-limit the wrong gaussians.
+    def current_filter_3d():
+        if not FILTER_3D_SCALE:
+            return None
+        return compute_3d_filter(
+            model.means.detach(), scene.cameras, sampling_scale=FILTER_3D_SCALE
+        )
+
+    filter_3d = current_filter_3d()
+    if filter_3d is not None:
+        seen = (filter_3d > 0).float().mean().item()
+        print(f"3D filter: scale {FILTER_3D_SCALE}, {100 * seen:.1f}% of gaussians observed", flush=True)
+
     print("Saving target/initial renders for eval view 0...", flush=True)
     save_image(scene.images[eval_idx[0]], OUT_DIR / "garden_target_0.png")
     eval_and_save(0)
@@ -219,6 +242,7 @@ def main() -> None:
     grad_accum = torch.zeros(model.num_points, device=DEVICE)
     grad_count = torch.zeros(model.num_points, device=DEVICE)
     previous_sh_degree = model.active_sh_degree
+
 
     start = time.time()
     for step in range(1, NUM_ITERS + 1):
@@ -234,7 +258,8 @@ def main() -> None:
 
         optimizer.zero_grad()
         aux = render(
-            model, cam, background=background, return_aux=True, abs_grad_accum=grad_accum
+            model, cam, background=background, return_aux=True,
+            abs_grad_accum=grad_accum, filter_3d=filter_3d,
         )
         pred, valid, final_T = aux.image, aux.valid, aux.final_T
         loss = gaussian_splatting_loss(pred, target, lambda_dssim=LAMBDA_DSSIM)
@@ -264,6 +289,7 @@ def main() -> None:
             )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
+            filter_3d = current_filter_3d()
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
                 f"(+{stats.n_split} split, +{stats.n_cloned} cloned, -{stats.n_pruned} pruned)",
@@ -282,6 +308,7 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
+                filter_3d = current_filter_3d()
             print(
                 f"  seed @ step {step}: {seed_stats.n_before} -> {seed_stats.n_after} "
                 f"(+{seed_stats.n_seeded} seeded)",
@@ -302,6 +329,7 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
+                filter_3d = current_filter_3d()
                 print(f"  prune @ step {step}: -{n_pruned} (n={model.num_points})", flush=True)
 
         if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
