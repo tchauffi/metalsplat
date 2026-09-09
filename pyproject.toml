@@ -3,8 +3,29 @@ name = "metalsplat"
 version = "0.1.0"
 description = "Differentiable 3D Gaussian Splatting for PyTorch on Apple Metal/MPS"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Thibaut CHAUFFIER", email = "tchauffi@gmail.com" }
+]
+keywords = [
+    "gaussian-splatting",
+    "pytorch",
+    "metal",
+    "mps",
+    "apple-silicon",
+    "3d-reconstruction",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +34,11 @@ dependencies = [
     "pycolmap>=4.2.0",
     "torch>=2.14.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/tchauffi/metalsplat"
+Repository = "https://github.com/tchauffi/metalsplat"
+Issues = "https://github.com/tchauffi/metalsplat/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]
