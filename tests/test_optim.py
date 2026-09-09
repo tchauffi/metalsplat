@@ -1,10 +1,10 @@
-"""Adam state surviving a change in gaussian count."""
+"""Adam state surviving a change in gaussian count, and SparseAdam."""
 
 import torch
 
 from metalsplat.densify import densify_and_prune, prune_low_opacity
 from metalsplat.gaussians import GaussianModel
-from metalsplat.optim import NEW_GAUSSIAN, migrate_optimizer_state
+from metalsplat.optim import NEW_GAUSSIAN, SparseAdam, migrate_optimizer_state
 
 
 def _model(n=10):
@@ -161,3 +161,101 @@ def test_a_no_op_prune_still_yields_a_usable_identity_mapping():
     assert torch.allclose(
         new_opt.state[model.means]["exp_avg"], opt.state[model.means]["exp_avg"]
     )
+
+
+def _sparse_optimizer(m):
+    return SparseAdam(
+        [
+            {"params": [m.means], "lr": 1e-3},
+            {"params": [m.raw_scales, m.raw_quats, m.raw_colors], "lr": 1e-2},
+            {"params": [m.raw_opacities], "lr": 5e-2},
+        ]
+    )
+
+
+def test_sparse_adam_matches_dense_adam_when_everything_is_visible():
+    # With every row visible, SparseAdam's update is exactly dense Adam's --
+    # this pins down the per-row math independent of the sparsity behavior.
+    torch.manual_seed(0)
+    dense_param = torch.randn(6, 3, requires_grad=True)
+    sparse_param = dense_param.detach().clone().requires_grad_(True)
+
+    dense_opt = torch.optim.Adam([dense_param], lr=1e-2)
+    sparse_opt = SparseAdam([sparse_param], lr=1e-2)
+    visible = torch.ones(6, dtype=torch.bool)
+
+    for _ in range(5):
+        dense_opt.zero_grad()
+        sparse_opt.zero_grad()
+        dense_param.pow(2).sum().backward()
+        sparse_param.pow(2).sum().backward()
+        dense_opt.step()
+        sparse_opt.step(visible)
+
+    assert torch.allclose(dense_param, sparse_param, atol=1e-6)
+
+
+def test_sparse_adam_leaves_invisible_rows_completely_untouched():
+    model = _model(6)
+    opt = _sparse_optimizer(model)
+
+    visible = torch.tensor([True, False, True, False, True, False])
+    for _ in range(5):
+        opt.zero_grad(set_to_none=True)
+        loss = model.means.pow(2).sum() + model.raw_opacities.pow(2).sum()
+        loss.backward()
+        before = model.means.detach().clone()
+        opt.step(visible)
+
+        assert torch.equal(model.means[~visible], before[~visible])
+        assert torch.equal(
+            opt.state[model.means]["exp_avg"][~visible],
+            torch.zeros_like(before[~visible]),
+        )
+    assert model.means[visible].detach().ne(before[visible]).any()
+
+
+def test_sparse_adam_step_counter_advances_even_when_nothing_is_visible():
+    # Bias correction should track elapsed training steps, not how many
+    # times a row happened to be visible -- otherwise a gaussian that
+    # reappears after a long absence would get an inflated effective LR.
+    model = _model(4)
+    opt = _sparse_optimizer(model)
+    never_visible = torch.zeros(4, dtype=torch.bool)
+
+    for _ in range(3):
+        opt.zero_grad(set_to_none=True)
+        model.means.pow(2).sum().backward()
+        opt.step(never_visible)
+
+    assert float(opt.state[model.means]["step"]) == 3.0
+
+
+def test_sparse_adam_state_migrates_like_dense_adam():
+    model = _model(10)
+    opt = _sparse_optimizer(model)
+    visible = torch.ones(10, dtype=torch.bool)
+    for _ in range(5):
+        opt.zero_grad(set_to_none=True)
+        loss = (
+            model.means.pow(2).sum()
+            + model.raw_scales.pow(2).sum()
+            + model.raw_quats.pow(2).sum()
+            + model.raw_colors.pow(2).sum()
+            + model.raw_opacities.pow(2).sum()
+        )
+        loss.backward()
+        opt.step(visible)
+    before = opt.state[model.means]["exp_avg"].clone()
+    assert before.abs().sum() > 0
+
+    with torch.no_grad():
+        model.raw_opacities[3] = -10.0
+    pruned, n_pruned, source_index = prune_low_opacity(model)
+    assert n_pruned == 1
+
+    new_opt = migrate_optimizer_state(opt, _sparse_optimizer(pruned), source_index)
+    after = new_opt.state[pruned.means]["exp_avg"]
+
+    keep = [i for i in range(10) if i != 3]
+    assert torch.allclose(after, before[keep])
