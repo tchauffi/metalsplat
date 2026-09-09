@@ -27,8 +27,12 @@ class Camera:
         return Camera(
             R_wc=self.R_wc.to(device),
             t_wc=self.t_wc.to(device),
-            fx=self.fx, fy=self.fy, cx=self.cx, cy=self.cy,
-            img_width=self.img_width, img_height=self.img_height,
+            fx=self.fx,
+            fy=self.fy,
+            cx=self.cx,
+            cy=self.cy,
+            img_width=self.img_width,
+            img_height=self.img_height,
         )
 
     @staticmethod
@@ -63,13 +67,28 @@ class Camera:
         # (world -> camera) is exactly this stacked matrix.
         R_wc = torch.stack([right, down, forward], dim=0)
         t_wc = -R_wc @ eye
-        return Camera(R_wc=R_wc, t_wc=t_wc, fx=fx, fy=fy, cx=cx, cy=cy, img_width=img_width, img_height=img_height)
+        return Camera(
+            R_wc=R_wc,
+            t_wc=t_wc,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            img_width=img_width,
+            img_height=img_height,
+        )
 
     @staticmethod
     def identity(
         fx: float, fy: float, cx: float, cy: float, img_width: int, img_height: int
     ) -> Camera:
         return Camera(
-            R_wc=torch.eye(3), t_wc=torch.zeros(3),
-            fx=fx, fy=fy, cx=cx, cy=cy, img_width=img_width, img_height=img_height,
+            R_wc=torch.eye(3),
+            t_wc=torch.zeros(3),
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            img_width=img_width,
+            img_height=img_height,
         )

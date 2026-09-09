@@ -132,7 +132,9 @@ def test_model_supports_every_degree(degree):
 
     n = 12
     means = torch.randn(n, 3, device="mps")
-    model = GaussianModel(means, colors=torch.rand(n, 3, device="mps"), sh_degree=degree).to("mps")
+    model = GaussianModel(
+        means, colors=torch.rand(n, 3, device="mps"), sh_degree=degree
+    ).to("mps")
 
     if degree == 0:
         assert model.colors.shape == (n, 3)
@@ -160,4 +162,6 @@ def test_degree_3_uses_all_sixteen_coefficients():
 
     per_coeff = sh_mps.grad.abs().sum(dim=(0, 2))
     assert per_coeff.shape == (16,)
-    assert (per_coeff > 0).all(), f"coefficients with no gradient: {(per_coeff == 0).nonzero().flatten().tolist()}"
+    assert (per_coeff > 0).all(), (
+        f"coefficients with no gradient: {(per_coeff == 0).nonzero().flatten().tolist()}"
+    )

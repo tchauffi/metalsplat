@@ -40,9 +40,9 @@ def test_save_ply_flat_rgb_roundtrip(tmp_path):
     assert names.count("f_dc_0") == 1 and "f_rest_23" in names
     assert "opacity" in names and names[-4:] == ["rot_0", "rot_1", "rot_2", "rot_3"]
 
-    xi, yi, zi = names.index("x"), names.index("y"), names.index("z")
-    assert rows[0][xi:zi + 1] == (1.0, 2.0, 3.0)
-    assert rows[1][xi:zi + 1] == (-1.0, 0.5, 0.0)
+    xi, _yi, zi = names.index("x"), names.index("y"), names.index("z")
+    assert rows[0][xi : zi + 1] == (1.0, 2.0, 3.0)
+    assert rows[1][xi : zi + 1] == (-1.0, 0.5, 0.0)
 
     # opacity stored raw (pre-sigmoid) -- sigmoid(raw) should recover the input
     oi = names.index("opacity")
@@ -66,7 +66,9 @@ def test_save_ply_sh_model_preserves_non_dc_coefficients(tmp_path):
     means = torch.tensor([[0.0, 0.0, 0.0]])
     model = GaussianModel(means, colors=torch.tensor([[0.5, 0.5, 0.5]]), sh_degree=2)
     with torch.no_grad():
-        model.raw_sh[0, 3, 1] = 0.42  # a specific non-DC coefficient (index 3, channel 1)
+        model.raw_sh[0, 3, 1] = (
+            0.42  # a specific non-DC coefficient (index 3, channel 1)
+        )
 
     out_path = tmp_path / "model_sh.ply"
     save_ply(model, out_path)

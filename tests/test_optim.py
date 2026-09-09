@@ -13,8 +13,10 @@ def _model(n=10):
     # accumulate nothing, making these tests pass on empty state.
     torch.manual_seed(n)
     return GaussianModel(
-        torch.randn(n, 3), scales=torch.full((n, 3), 0.5),
-        opacities=torch.full((n,), 0.5), colors=torch.rand(n, 3),
+        torch.randn(n, 3),
+        scales=torch.full((n, 3), 0.5),
+        opacities=torch.full((n,), 0.5),
+        colors=torch.rand(n, 3),
     )
 
 
@@ -31,9 +33,13 @@ def _optimizer(m):
 def _take_steps(model, opt, steps=5):
     for _ in range(steps):
         opt.zero_grad(set_to_none=True)
-        loss = (model.means.pow(2).sum() + model.raw_scales.pow(2).sum()
-                + model.raw_quats.pow(2).sum() + model.raw_colors.pow(2).sum()
-                + model.raw_opacities.pow(2).sum())
+        loss = (
+            model.means.pow(2).sum()
+            + model.raw_scales.pow(2).sum()
+            + model.raw_quats.pow(2).sum()
+            + model.raw_colors.pow(2).sum()
+            + model.raw_opacities.pow(2).sum()
+        )
         loss.backward()
         opt.step()
 
@@ -96,8 +102,13 @@ def test_every_parameter_group_is_migrated():
     source_index = torch.arange(8)
     new_opt = migrate_optimizer_state(opt, _optimizer(model), source_index)
 
-    for param in (model.means, model.raw_scales, model.raw_quats,
-                  model.raw_colors, model.raw_opacities):
+    for param in (
+        model.means,
+        model.raw_scales,
+        model.raw_quats,
+        model.raw_colors,
+        model.raw_opacities,
+    ):
         old_state = opt.state[param]
         new_state = new_opt.state[param]
         assert torch.allclose(new_state["exp_avg"], old_state["exp_avg"])
@@ -122,7 +133,10 @@ def test_densify_source_index_maps_survivors_correctly():
 
     assert stats.source_index.shape[0] == densified.num_points
     # Survivors point at real old rows; split children and clones are new.
-    assert int((stats.source_index == NEW_GAUSSIAN).sum()) == 2 * stats.n_split + stats.n_cloned
+    assert (
+        int((stats.source_index == NEW_GAUSSIAN).sum())
+        == 2 * stats.n_split + stats.n_cloned
+    )
     existing = stats.source_index[stats.source_index >= 0]
     assert existing.max() < n
     assert existing.unique().numel() == existing.numel()  # no old gaussian reused twice
@@ -131,7 +145,7 @@ def test_densify_source_index_maps_survivors_correctly():
     before = opt.state[model.means]["exp_avg"]
     after = new_opt.state[densified.means]["exp_avg"]
     assert torch.allclose(after[: existing.numel()], before[existing])
-    assert after[existing.numel():].abs().sum() == 0
+    assert after[existing.numel() :].abs().sum() == 0
 
 
 def test_a_no_op_prune_still_yields_a_usable_identity_mapping():

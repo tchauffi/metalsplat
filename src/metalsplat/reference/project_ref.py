@@ -120,7 +120,9 @@ def project_gaussians(
     # than eps2d the ratio is ~1 and nothing happens; for a sub-pixel one it
     # falls towards 0, which is exactly the "shrink to nothing rather than
     # flicker" behaviour wanted at high frequencies.
-    det_orig = (sigma2d[:, 0, 0] * sigma2d[:, 1, 1] - sigma2d[:, 0, 1] * sigma2d[:, 1, 0]).clamp_min(0.0)
+    det_orig = (
+        sigma2d[:, 0, 0] * sigma2d[:, 1, 1] - sigma2d[:, 0, 1] * sigma2d[:, 1, 0]
+    ).clamp_min(0.0)
     compensation = (det_orig / det_safe).clamp(0.0, 1.0).sqrt()
 
     mid = 0.5 * (a + c)

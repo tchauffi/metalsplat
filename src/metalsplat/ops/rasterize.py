@@ -28,7 +28,8 @@ class _RasterizeGaussiansImpl(torch.autograd.Function):
         img_height: int,
         tile_size: int,
         background: torch.Tensor,  # (3,) float32
-        abs_grad_accum: torch.Tensor | None,  # (N,), mutated in place by backward -- see below
+        abs_grad_accum: torch.Tensor
+        | None,  # (N,), mutated in place by backward -- see below
     ):
         device = means2d.device
         n = means2d.shape[0]
@@ -44,9 +45,15 @@ class _RasterizeGaussiansImpl(torch.autograd.Function):
             sorted_ids_i32 = torch.zeros(1, dtype=torch.int32, device=device)
         tile_bins_i32 = tile_bins.to(torch.int32).contiguous()
 
-        out_image = torch.zeros(img_height, img_width, 3, device=device, dtype=torch.float32)
-        out_depth = torch.zeros(img_height, img_width, device=device, dtype=torch.float32)
-        out_final_T = torch.ones(img_height, img_width, device=device, dtype=torch.float32)
+        out_image = torch.zeros(
+            img_height, img_width, 3, device=device, dtype=torch.float32
+        )
+        out_depth = torch.zeros(
+            img_height, img_width, device=device, dtype=torch.float32
+        )
+        out_final_T = torch.ones(
+            img_height, img_width, device=device, dtype=torch.float32
+        )
         out_last_contributor = torch.full(
             (img_height, img_width), -1, device=device, dtype=torch.int32
         )
@@ -78,8 +85,15 @@ class _RasterizeGaussiansImpl(torch.autograd.Function):
             )
 
         ctx.save_for_backward(
-            means2d_c, conics_c, opacities_c, colors_c, sorted_ids_i32, tile_bins_i32,
-            out_final_T, out_last_contributor, background,
+            means2d_c,
+            conics_c,
+            opacities_c,
+            colors_c,
+            sorted_ids_i32,
+            tile_bins_i32,
+            out_final_T,
+            out_last_contributor,
+            background,
         )
         ctx.tiles_x = tiles_x
         ctx.tiles_y = tiles_y
@@ -97,8 +111,15 @@ class _RasterizeGaussiansImpl(torch.autograd.Function):
         # for coverage detection), never part of the differentiable loss.
         # Depth supervision would need a real backward through out_depth.
         (
-            means2d, conics, opacities, colors, sorted_ids, tile_bins,
-            final_T, last_contributor, background,
+            means2d,
+            conics,
+            opacities,
+            colors,
+            sorted_ids,
+            tile_bins,
+            final_T,
+            last_contributor,
+            background,
         ) = ctx.saved_tensors
         device = means2d.device
         n = ctx.n
@@ -150,8 +171,19 @@ class _RasterizeGaussiansImpl(torch.autograd.Function):
         # colors get real gradients; depths, sorted_ids, tile_bins, tiles_x,
         # img_width, img_height, tile_size, background, abs_grad_accum don't.
         return (
-            d_means2d, d_conics, d_opacities, d_colors,
-            None, None, None, None, None, None, None, None, None,
+            d_means2d,
+            d_conics,
+            d_opacities,
+            d_colors,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -191,8 +223,14 @@ def rasterize_gaussians(
     many steps to accumulate; it's mutated in place, not returned.
     """
     binning = bin_and_sort_gaussians(
-        means2d.detach(), depths.detach(), conics.detach(), radii.detach(), valid,
-        img_width, img_height, tile_size,
+        means2d.detach(),
+        depths.detach(),
+        conics.detach(),
+        radii.detach(),
+        valid,
+        img_width,
+        img_height,
+        tile_size,
     )
     device = means2d.device
     if background is None:

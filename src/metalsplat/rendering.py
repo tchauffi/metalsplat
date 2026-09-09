@@ -149,5 +149,7 @@ def render(
     )
     if return_aux:
         image, depth, final_T = result
-        return RenderAux(image=image, means2d=means2d, valid=valid, final_T=final_T, depth=depth)
+        return RenderAux(
+            image=image, means2d=means2d, valid=valid, final_T=final_T, depth=depth
+        )
     return result

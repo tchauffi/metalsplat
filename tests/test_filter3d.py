@@ -18,8 +18,14 @@ def _camera_at(z_offset: float) -> Camera:
     # origin sits `z_offset` away.
     cam = Camera.identity(fx=FX, fy=FY, cx=W / 2, cy=H / 2, img_width=W, img_height=H)
     return Camera(
-        R_wc=cam.R_wc, t_wc=torch.tensor([0.0, 0.0, z_offset]),
-        fx=FX, fy=FY, cx=W / 2, cy=H / 2, img_width=W, img_height=H,
+        R_wc=cam.R_wc,
+        t_wc=torch.tensor([0.0, 0.0, z_offset]),
+        fx=FX,
+        fy=FY,
+        cx=W / 2,
+        cy=H / 2,
+        img_width=W,
+        img_height=H,
     )
 
 
@@ -102,7 +108,9 @@ def test_render_accepts_the_filter_and_keeps_gradients():
     means = torch.rand(n, 3, device="mps") * 2 - 1
     means[:, 2] = means[:, 2].abs() + 2.0
     model = GaussianModel(means, colors=torch.rand(n, 3, device="mps")).to("mps")
-    camera = Camera.identity(fx=FX, fy=FY, cx=W / 2, cy=H / 2, img_width=W, img_height=H).to("mps")
+    camera = Camera.identity(
+        fx=FX, fy=FY, cx=W / 2, cy=H / 2, img_width=W, img_height=H
+    ).to("mps")
 
     filter_3d = compute_3d_filter(model.means.detach(), [camera])
     image = render(model, camera, filter_3d=filter_3d)
@@ -110,7 +118,10 @@ def test_render_accepts_the_filter_and_keeps_gradients():
     torch.mps.synchronize()
 
     assert torch.isfinite(image).all()
-    assert model.raw_scales.grad is not None and torch.isfinite(model.raw_scales.grad).all()
+    assert (
+        model.raw_scales.grad is not None
+        and torch.isfinite(model.raw_scales.grad).all()
+    )
     assert model.means.grad is not None and torch.isfinite(model.means.grad).all()
 
 
@@ -121,12 +132,15 @@ def test_filter_suppresses_subpixel_detail_and_leaves_resolved_detail_alone():
     # comparison says nothing about the 3D filter. This isolates the 3D half.
     from metalsplat import render
 
-    camera = Camera.identity(fx=FX, fy=FY, cx=W / 2, cy=H / 2, img_width=W, img_height=H).to("mps")
+    camera = Camera.identity(
+        fx=FX, fy=FY, cx=W / 2, cy=H / 2, img_width=W, img_height=H
+    ).to("mps")
     means = torch.tensor([[0.0, 0.0, 3.0]], device="mps")
 
     def energy(scale, use_filter):
         model = GaussianModel(
-            means, scales=torch.full((1, 3), scale, device="mps"),
+            means,
+            scales=torch.full((1, 3), scale, device="mps"),
             colors=torch.ones(1, 3, device="mps"),
         ).to("mps")
         f = compute_3d_filter(model.means.detach(), [camera]) if use_filter else None
@@ -210,8 +224,10 @@ def test_densify_parent_index_points_children_at_their_parent():
     n = 10
     torch.manual_seed(0)
     model = GaussianModel(
-        torch.randn(n, 3), scales=torch.full((n, 3), 0.5),
-        opacities=torch.full((n,), 0.5), colors=torch.rand(n, 3),
+        torch.randn(n, 3),
+        scales=torch.full((n, 3), 0.5),
+        opacities=torch.full((n,), 0.5),
+        colors=torch.rand(n, 3),
     )
     with torch.no_grad():
         model.raw_scales[0] = torch.log(torch.tensor(2.0))  # split candidate
@@ -226,7 +242,9 @@ def test_densify_parent_index_points_children_at_their_parent():
 
     assert stats.parent_index.shape == stats.source_index.shape
     assert (stats.parent_index >= 0).all(), "every densified gaussian has a parent"
-    assert int((stats.source_index == NEW_GAUSSIAN).sum()) > 0, "test isn't exercising new gaussians"
+    assert int((stats.source_index == NEW_GAUSSIAN).sum()) > 0, (
+        "test isn't exercising new gaussians"
+    )
     # Where source_index names a survivor, the two agree.
     survivors = stats.source_index >= 0
     assert torch.equal(stats.parent_index[survivors], stats.source_index[survivors])

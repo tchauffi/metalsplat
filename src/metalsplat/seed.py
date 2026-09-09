@@ -125,8 +125,11 @@ def seed_uncovered_regions(
     if model.sh_degree == 0:
         final_color_like = torch.cat([color_like, new_colors], dim=0)
         new_model = GaussianModel(
-            final_means, scales=final_scales, quats=final_quats,
-            opacities=final_opacities, colors=final_color_like,
+            final_means,
+            scales=final_scales,
+            quats=final_quats,
+            opacities=final_opacities,
+            colors=final_color_like,
         ).to(device)
     else:
         # Match the model's own coefficient count, which depends on its degree.
@@ -134,17 +137,26 @@ def seed_uncovered_regions(
         new_sh[:, 0, :] = (new_colors - 0.5) / SH_C0
         final_color_like = torch.cat([color_like, new_sh], dim=0)
         new_model = GaussianModel(
-            final_means, scales=final_scales, quats=final_quats,
-            opacities=final_opacities, sh_degree=model.sh_degree, sh_coeffs=final_color_like,
+            final_means,
+            scales=final_scales,
+            quats=final_quats,
+            opacities=final_opacities,
+            sh_degree=model.sh_degree,
+            sh_coeffs=final_color_like,
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 
     n_after = final_means.shape[0]
-    source_index = torch.cat([
-        torch.arange(n_before, device=device),
-        torch.full((k,), NEW_GAUSSIAN, dtype=torch.int64, device=device),
-    ])
+    source_index = torch.cat(
+        [
+            torch.arange(n_before, device=device),
+            torch.full((k,), NEW_GAUSSIAN, dtype=torch.int64, device=device),
+        ]
+    )
     return new_model, SeedStats(
-        n_before=n_before, n_seeded=k, n_after=n_after,
-        source_index=source_index, parent_index=source_index,
+        n_before=n_before,
+        n_seeded=k,
+        n_after=n_after,
+        source_index=source_index,
+        parent_index=source_index,
     )

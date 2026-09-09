@@ -60,7 +60,9 @@ def bin_and_sort_gaussians(
     if device.type != "mps":  # CPU/other: fall back to the reference
         from metalsplat.reference.tiling_ref import bin_and_sort_gaussians as ref
 
-        return ref(means2d, depths, conics, radii, valid, img_width, img_height, tile_size)
+        return ref(
+            means2d, depths, conics, radii, valid, img_width, img_height, tile_size
+        )
 
     if n == 0:
         return _empty(tile_size, tiles_x, tiles_y, device)
@@ -69,13 +71,24 @@ def bin_and_sort_gaussians(
     conics_c = conics.contiguous().float()
     depths_c = depths.contiguous().float()
     radii_c = radii.contiguous().float()
-    valid_c = (valid > 0.5).to(torch.float32).contiguous() if valid.dtype == torch.bool else valid.contiguous().float()
+    valid_c = (
+        (valid > 0.5).to(torch.float32).contiguous()
+        if valid.dtype == torch.bool
+        else valid.contiguous().float()
+    )
 
     lib = _loader.load("tiling")
 
     counts = torch.empty(n, dtype=torch.int32, device=device)
     lib.tile_counts(
-        means2d_c, conics_c, radii_c, valid_c, tiles_x, tiles_y, float(tile_size), counts,
+        means2d_c,
+        conics_c,
+        radii_c,
+        valid_c,
+        tiles_x,
+        tiles_y,
+        float(tile_size),
+        counts,
         threads=n,
     )
 
@@ -91,9 +104,18 @@ def bin_and_sort_gaussians(
     keys = torch.empty(total_pairs, dtype=torch.int64, device=device)
     gaussian_ids = torch.empty(total_pairs, dtype=torch.int32, device=device)
     lib.tile_pairs(
-        means2d_c, conics_c, depths_c, radii_c, valid_c, offsets,
-        tiles_x, tiles_y, float(tile_size),
-        keys, gaussian_ids, threads=n,
+        means2d_c,
+        conics_c,
+        depths_c,
+        radii_c,
+        valid_c,
+        offsets,
+        tiles_x,
+        tiles_y,
+        float(tile_size),
+        keys,
+        gaussian_ids,
+        threads=n,
     )
 
     # Stable so that pairs tying on both tile and depth stay in ascending
@@ -107,7 +129,9 @@ def bin_and_sort_gaussians(
 
     boundaries = torch.arange(tiles_x * tiles_y + 1, device=device)
     tile_starts_ends = torch.searchsorted(sorted_tile_ids, boundaries)
-    tile_bins = torch.stack([tile_starts_ends[:-1], tile_starts_ends[1:]], dim=-1).to(torch.int32)
+    tile_bins = torch.stack([tile_starts_ends[:-1], tile_starts_ends[1:]], dim=-1).to(
+        torch.int32
+    )
 
     return TileBinningResult(
         tile_size=tile_size,

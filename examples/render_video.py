@@ -84,7 +84,9 @@ BOB_AMPLITUDE = 0.06  # gentle vertical drift over the orbit, as a fraction of r
 NEAR_FADE = None  # e.g. (0.15, 0.30) to fade everything within 0.15*radius
 
 
-def fit_orbit_frame(cameras: list[Camera]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+def fit_orbit_frame(
+    cameras: list[Camera],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
     """Fits the plane the capture rig moved in.
 
     Returns (centre, up, right, radius, height): an orthonormal in-plane
@@ -141,14 +143,22 @@ def build_camera_path(
         theta = 2 * math.pi * i / n
         # one slow sine over the full revolution keeps the loop seamless
         bob = BOB_AMPLITUDE * radius * math.sin(theta)
-        eye = centre + up * (height + bob) + radius * (
-            math.cos(theta) * right + math.sin(theta) * forward
+        eye = (
+            centre
+            + up * (height + bob)
+            + radius * (math.cos(theta) * right + math.sin(theta) * forward)
         )
         path.append(
             Camera.look_at(
-                eye=eye, target=target, up=up,
-                fx=fx, fy=fy, cx=cx, cy=cy,
-                img_width=width, img_height=img_height,
+                eye=eye,
+                target=target,
+                up=up,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                img_width=width,
+                img_height=img_height,
             )
         )
     return path, radius
@@ -169,7 +179,9 @@ than "mostly opaque" to visualise depth honestly.
 def depth_to_rgb(depth: torch.Tensor, alpha: torch.Tensor) -> np.ndarray:
     """Normalised inverse-depth, turned into a viridis-ish false-colour map."""
     covered = alpha > DEPTH_COVERAGE_THRESH
-    normalised = torch.where(covered, depth / alpha.clamp_min(1e-6), torch.zeros_like(depth))
+    normalised = torch.where(
+        covered, depth / alpha.clamp_min(1e-6), torch.zeros_like(depth)
+    )
     if covered.any():
         near = torch.quantile(normalised[covered], 0.02)
         far = torch.quantile(normalised[covered], 0.98)
@@ -189,9 +201,20 @@ def depth_to_rgb(depth: torch.Tensor, alpha: torch.Tensor) -> np.ndarray:
 def encode(pattern: str, out_path: Path) -> None:
     subprocess.run(
         [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-framerate", str(FPS), "-i", pattern,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(FPS),
+            "-i",
+            pattern,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
             str(out_path),
         ],
         check=True,
@@ -200,7 +223,9 @@ def encode(pattern: str, out_path: Path) -> None:
 
 def main() -> None:
     if not PLY_PATH.exists():
-        raise FileNotFoundError(f"No trained scene at {PLY_PATH}; run train_garden.py first.")
+        raise FileNotFoundError(
+            f"No trained scene at {PLY_PATH}; run train_garden.py first."
+        )
 
     print(f"Loading {PLY_PATH.name}...", flush=True)
     model = load_ply(PLY_PATH, device=DEVICE)
@@ -221,9 +246,14 @@ def main() -> None:
         f"fitted to {len(scene.cameras)} capture poses",
         flush=True,
     )
-    near_fade = None if NEAR_FADE is None else (NEAR_FADE[0] * radius, NEAR_FADE[1] * radius)
+    near_fade = (
+        None if NEAR_FADE is None else (NEAR_FADE[0] * radius, NEAR_FADE[1] * radius)
+    )
     if near_fade:
-        print(f"fading gaussians within {near_fade[0]:.2f}..{near_fade[1]:.2f} of the camera", flush=True)
+        print(
+            f"fading gaussians within {near_fade[0]:.2f}..{near_fade[1]:.2f} of the camera",
+            flush=True,
+        )
 
     OUT_DIR.mkdir(exist_ok=True)
     for old in OUT_DIR.glob("*.png"):
@@ -238,8 +268,11 @@ def main() -> None:
         with torch.no_grad():
             for s in range(shutter):
                 aux = render(
-                    model, path[i * shutter + s].to(DEVICE),
-                    background=background, return_aux=True, near_fade=near_fade,
+                    model,
+                    path[i * shutter + s].to(DEVICE),
+                    background=background,
+                    return_aux=True,
+                    near_fade=near_fade,
                 )
                 accum = aux.image if accum is None else accum + aux.image
                 if s == shutter // 2:
@@ -257,7 +290,10 @@ def main() -> None:
     encode(str(OUT_DIR / "rgb_%04d.png"), VIDEO_PATH)
     encode(str(OUT_DIR / "depth_%04d.png"), DEPTH_VIDEO_PATH)
     duration = NUM_FRAMES / FPS
-    print(f"Wrote {VIDEO_PATH} and {DEPTH_VIDEO_PATH} ({duration:.1f}s @ {FPS}fps)", flush=True)
+    print(
+        f"Wrote {VIDEO_PATH} and {DEPTH_VIDEO_PATH} ({duration:.1f}s @ {FPS}fps)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

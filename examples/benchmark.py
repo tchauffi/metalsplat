@@ -51,9 +51,14 @@ def timeit(fn, repeats: int, warmup: int = 3) -> tuple[float, float]:
 
 def scaled_camera(cam: Camera, s: float) -> Camera:
     return Camera(
-        R_wc=cam.R_wc, t_wc=cam.t_wc,
-        fx=cam.fx * s, fy=cam.fy * s, cx=cam.cx * s, cy=cam.cy * s,
-        img_width=int(round(cam.img_width * s)), img_height=int(round(cam.img_height * s)),
+        R_wc=cam.R_wc,
+        t_wc=cam.t_wc,
+        fx=cam.fx * s,
+        fy=cam.fy * s,
+        cx=cam.cx * s,
+        cy=cam.cy * s,
+        img_width=round(cam.img_width * s),
+        img_height=round(cam.img_height * s),
     ).to(DEVICE)
 
 
@@ -62,8 +67,9 @@ def subsample(model: GaussianModel, n: int) -> GaussianModel:
         return model
     idx = torch.randperm(model.num_points, device=model.means.device)[:n]
     kw = {
-        'scales': model.scales.detach()[idx], 'quats': model.quats.detach()[idx],
-        'opacities': model.opacities.detach()[idx],
+        "scales": model.scales.detach()[idx],
+        "quats": model.quats.detach()[idx],
+        "opacities": model.opacities.detach()[idx],
     }
     if model.sh_degree == 0:
         kw["colors"] = model.colors.detach()[idx]
@@ -76,7 +82,16 @@ def subsample(model: GaussianModel, n: int) -> GaussianModel:
 def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
     """Times each pipeline stage in isolation, forward and backward."""
     bg = torch.zeros(3, device=DEVICE)
-    args = (cam.R_wc, cam.t_wc, cam.fx, cam.fy, cam.cx, cam.cy, cam.img_width, cam.img_height)
+    args = (
+        cam.R_wc,
+        cam.t_wc,
+        cam.fx,
+        cam.fy,
+        cam.cx,
+        cam.cy,
+        cam.img_width,
+        cam.img_height,
+    )
 
     means = model.means.detach().clone().requires_grad_()
     scales = model.scales.detach().clone().requires_grad_()
@@ -95,25 +110,41 @@ def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
     p_both, _ = timeit(project_bwd, repeats)
 
     with torch.no_grad():
-        means2d, depths, conics, radii, valid, _ = project_gaussians(means, scales, quats, *args)
+        means2d, depths, conics, radii, valid, _ = project_gaussians(
+            means, scales, quats, *args
+        )
         torch.mps.synchronize()
 
     def binning():
-        bin_and_sort_gaussians(means2d, depths, conics, radii, valid, cam.img_width, cam.img_height)
+        bin_and_sort_gaussians(
+            means2d, depths, conics, radii, valid, cam.img_width, cam.img_height
+        )
 
     b_ms, _ = timeit(binning, repeats)
 
-    colors = model.colors_from_view(
-        torch.nn.functional.normalize(model.means - cam.position, dim=-1)
-    ) if model.sh_degree else model.colors
+    colors = (
+        model.colors_from_view(
+            torch.nn.functional.normalize(model.means - cam.position, dim=-1)
+        )
+        if model.sh_degree
+        else model.colors
+    )
     colors_d = colors.detach()
     opac_d = model.opacities.detach()
 
     def raster_fwd():
         with torch.no_grad():
             rasterize_gaussians(
-                means2d, depths, conics, opac_d, colors_d, radii, valid,
-                cam.img_width, cam.img_height, background=bg,
+                means2d,
+                depths,
+                conics,
+                opac_d,
+                colors_d,
+                radii,
+                valid,
+                cam.img_width,
+                cam.img_height,
+                background=bg,
             )
 
     r_fwd, _ = timeit(raster_fwd, repeats)
@@ -125,8 +156,16 @@ def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
 
     def raster_bwd():
         img = rasterize_gaussians(
-            m2d_g, depths, con_g, op_g, col_g, radii, valid,
-            cam.img_width, cam.img_height, background=bg,
+            m2d_g,
+            depths,
+            con_g,
+            op_g,
+            col_g,
+            radii,
+            valid,
+            cam.img_width,
+            cam.img_height,
+            background=bg,
         )
         img.sum().backward()
 
@@ -138,9 +177,9 @@ def stage_breakdown(model: GaussianModel, cam: Camera, repeats: int) -> None:
 
     f_ms, _ = timeit(full_fwd, repeats)
 
-    n_pairs = (bin_and_sort_gaussians(
+    n_pairs = bin_and_sort_gaussians(
         means2d, depths, conics, radii, valid, cam.img_width, cam.img_height
-    ).sorted_gaussian_ids.numel())
+    ).sorted_gaussian_ids.numel()
     torch.mps.synchronize()
 
     print(f"  visible gaussians   : {int((valid > 0).sum())} / {model.num_points}")
@@ -170,7 +209,9 @@ def sweep_points(model: GaussianModel, cam: Camera, repeats: int) -> None:
 
 def sweep_resolution(model: GaussianModel, cam: Camera, repeats: int) -> None:
     bg = torch.zeros(3, device=DEVICE)
-    print(f"  {'resolution':>14}{'pixels':>12}{'forward':>12}{'fps':>9}{'per Mpix':>11}")
+    print(
+        f"  {'resolution':>14}{'pixels':>12}{'forward':>12}{'fps':>9}{'per Mpix':>11}"
+    )
     print(f"  {'-' * 58}")
     for s in (0.25, 0.5, 0.75, 1.0):
         c = scaled_camera(cam, s)
@@ -182,7 +223,9 @@ def sweep_resolution(model: GaussianModel, cam: Camera, repeats: int) -> None:
         )
 
 
-def training_step(model: GaussianModel, cam: Camera, target: torch.Tensor, repeats: int) -> None:
+def training_step(
+    model: GaussianModel, cam: Camera, target: torch.Tensor, repeats: int
+) -> None:
     from metalsplat.losses import gaussian_splatting_loss
 
     bg = torch.zeros(3, device=DEVICE)
@@ -196,11 +239,15 @@ def training_step(model: GaussianModel, cam: Camera, target: torch.Tensor, repea
 
     ms, best = timeit(step, repeats)
     print("  full training step (render + L1/D-SSIM loss + backward + Adam)")
-    print(f"    median {ms:.1f}ms   best {best:.1f}ms   -> {1000 / ms:.1f} steps/s, "
-          f"{5000 * ms / 1000 / 60:.1f} min per 5000 iterations")
+    print(
+        f"    median {ms:.1f}ms   best {best:.1f}ms   -> {1000 / ms:.1f} steps/s, "
+        f"{5000 * ms / 1000 / 60:.1f} min per 5000 iterations"
+    )
 
 
-def memory_report(model: GaussianModel, cam: Camera, images: list | None = None) -> None:
+def memory_report(
+    model: GaussianModel, cam: Camera, images: list | None = None
+) -> None:
     """Measures what a render and a training step actually cost in memory.
 
     Apple Silicon has unified memory, so "VRAM" is just system RAM the GPU
@@ -229,7 +276,9 @@ def memory_report(model: GaussianModel, cam: Camera, images: list | None = None)
         b = t.numel() * t.element_size()
         print(f"  {name:<22}{b / n:>15.0f}B{b / 1e6:>11.1f}MB")
     print(f"  {'-' * 50}")
-    print(f"  {'model total':<22}{total_param_bytes / n:>15.0f}B{total_param_bytes / 1e6:>11.1f}MB")
+    print(
+        f"  {'model total':<22}{total_param_bytes / n:>15.0f}B{total_param_bytes / 1e6:>11.1f}MB"
+    )
 
     base = torch.mps.current_allocated_memory()
     with torch.no_grad():
@@ -247,8 +296,17 @@ def memory_report(model: GaussianModel, cam: Camera, images: list | None = None)
 
     with torch.no_grad():
         means2d, depths, conics, radii, valid, _ = project_gaussians(
-            model.means, model.scales, model.quats, cam.R_wc, cam.t_wc,
-            cam.fx, cam.fy, cam.cx, cam.cy, cam.img_width, cam.img_height,
+            model.means,
+            model.scales,
+            model.quats,
+            cam.R_wc,
+            cam.t_wc,
+            cam.fx,
+            cam.fy,
+            cam.cx,
+            cam.cy,
+            cam.img_width,
+            cam.img_height,
         )
         n_pairs = bin_and_sort_gaussians(
             means2d, depths, conics, radii, valid, cam.img_width, cam.img_height
@@ -263,18 +321,28 @@ def memory_report(model: GaussianModel, cam: Camera, images: list | None = None)
         img_bytes = getattr(images, "nbytes", None)
         if img_bytes is None:
             img_bytes = sum(t.numel() * t.element_size() for t in images)
-        print(f"  {f'training images ({len(images)}, uint8 on device)':<40}{img_bytes / 1e6:>9.1f}MB")
+        print(
+            f"  {f'training images ({len(images)}, uint8 on device)':<40}{img_bytes / 1e6:>9.1f}MB"
+        )
         print(f"  {'  ... had they been float32':<40}{img_bytes * 4 / 1e6:>9.1f}MB")
     print(f"  {'model parameters':<40}{total_param_bytes / 1e6:>9.1f}MB")
-    print(f"  {'+ Adam state (2 moments per param)':<40}{2 * total_param_bytes / 1e6:>9.1f}MB")
+    print(
+        f"  {'+ Adam state (2 moments per param)':<40}{2 * total_param_bytes / 1e6:>9.1f}MB"
+    )
     print(f"  {'live tensors, idle':<40}{base / 1e6:>9.1f}MB")
     print(f"  {'live tensors, after forward render':<40}{after_fwd / 1e6:>9.1f}MB")
     print(f"  {'live tensors, after a training step':<40}{after_train / 1e6:>9.1f}MB")
     print(f"  {'driver allocation (incl. cache)':<40}{driver / 1e6:>9.1f}MB")
     print()
-    print(f"  tile binning expands {n:,} gaussians to {n_pairs:,} (gaussian, tile) pairs")
-    print(f"  at {cam.img_width}x{cam.img_height}: {n_pairs * 8 * 2 / 1e6:.1f}MB for the sort keys and ids alone")
-    print(f"  ({n_pairs / max(n_visible, 1):.1f} tiles touched per visible gaussian on average)")
+    print(
+        f"  tile binning expands {n:,} gaussians to {n_pairs:,} (gaussian, tile) pairs"
+    )
+    print(
+        f"  at {cam.img_width}x{cam.img_height}: {n_pairs * 8 * 2 / 1e6:.1f}MB for the sort keys and ids alone"
+    )
+    print(
+        f"  ({n_pairs / max(n_visible, 1):.1f} tiles touched per visible gaussian on average)"
+    )
 
 
 def main() -> None:
@@ -286,13 +354,17 @@ def main() -> None:
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS is not available on this machine.")
     if not args.ply.exists():
-        raise FileNotFoundError(f"No trained scene at {args.ply}; run train_garden.py first.")
+        raise FileNotFoundError(
+            f"No trained scene at {args.ply}; run train_garden.py first."
+        )
 
     model = load_ply(args.ply, device=DEVICE)
     scene = load_colmap_scene(DATA_ROOT, device=DEVICE)
     cam = scene.cameras[0]
 
-    print(f"scene   : {args.ply.name}, {model.num_points:,} gaussians, sh_degree={model.sh_degree}")
+    print(
+        f"scene   : {args.ply.name}, {model.num_points:,} gaussians, sh_degree={model.sh_degree}"
+    )
     print(f"camera  : {cam.img_width}x{cam.img_height}")
     print(f"repeats : {args.repeats} (median reported, 3 warmup calls discarded)")
 

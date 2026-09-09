@@ -81,7 +81,14 @@ def densify_and_prune(
     if not bool(visible.any()) or (max_points is not None and n >= max_points):
         unchanged = torch.arange(n, device=device)
         return model, DensifyStats(
-            n_before, 0, 0, 0, n_before, float(grad_threshold or 0.0), unchanged, unchanged
+            n_before,
+            0,
+            0,
+            0,
+            n_before,
+            float(grad_threshold or 0.0),
+            unchanged,
+            unchanged,
         )
 
     avg_grad = torch.zeros(n, device=device)
@@ -123,7 +130,12 @@ def densify_and_prune(
         samples = torch.randn(2, split_idx.numel(), 3, device=device) * std
         offsets = torch.einsum("kij,skj->ski", rotmat, samples)  # (2, K, 3)
         split_means = (means[split_idx].unsqueeze(0) + offsets).reshape(-1, 3)
-        split_scales = (scales[split_idx] / split_scale_factor).unsqueeze(0).expand(2, -1, -1).reshape(-1, 3)
+        split_scales = (
+            (scales[split_idx] / split_scale_factor)
+            .unsqueeze(0)
+            .expand(2, -1, -1)
+            .reshape(-1, 3)
+        )
         split_quats = quats[split_idx].unsqueeze(0).expand(2, -1, -1).reshape(-1, 4)
         split_opacities = opacities[split_idx].unsqueeze(0).expand(2, -1).reshape(-1)
         split_color_like = _expand2(color_like[split_idx])
@@ -145,18 +157,29 @@ def densify_and_prune(
     final_means = torch.cat([means[keep_mask], split_means, clone_means], dim=0)
     final_scales = torch.cat([scales[keep_mask], split_scales, clone_scales], dim=0)
     final_quats = torch.cat([quats[keep_mask], split_quats, clone_quats], dim=0)
-    final_opacities = torch.cat([opacities[keep_mask], split_opacities, clone_opacities], dim=0)
-    final_color_like = torch.cat([color_like[keep_mask], split_color_like, clone_color_like], dim=0)
+    final_opacities = torch.cat(
+        [opacities[keep_mask], split_opacities, clone_opacities], dim=0
+    )
+    final_color_like = torch.cat(
+        [color_like[keep_mask], split_color_like, clone_color_like], dim=0
+    )
 
     if model.sh_degree == 0:
         new_model = GaussianModel(
-            final_means, scales=final_scales, quats=final_quats,
-            opacities=final_opacities, colors=final_color_like,
+            final_means,
+            scales=final_scales,
+            quats=final_quats,
+            opacities=final_opacities,
+            colors=final_color_like,
         ).to(device)
     else:
         new_model = GaussianModel(
-            final_means, scales=final_scales, quats=final_quats,
-            opacities=final_opacities, sh_degree=model.sh_degree, sh_coeffs=final_color_like,
+            final_means,
+            scales=final_scales,
+            quats=final_quats,
+            opacities=final_opacities,
+            sh_degree=model.sh_degree,
+            sh_coeffs=final_color_like,
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 
@@ -164,14 +187,20 @@ def densify_and_prune(
     # parent's state dies with it -- matching the reference implementation,
     # which appends zeros for every gaussian it creates.
     keep_idx = keep_mask.nonzero(as_tuple=True)[0]
-    fresh = torch.full((2 * split_idx.numel() + clone_idx.numel(),), NEW_GAUSSIAN,
-                       dtype=torch.int64, device=device)
+    fresh = torch.full(
+        (2 * split_idx.numel() + clone_idx.numel(),),
+        NEW_GAUSSIAN,
+        dtype=torch.int64,
+        device=device,
+    )
     source_index = torch.cat([keep_idx, fresh])
     # Split children and clones sit essentially where their parent did.
     parent_index = torch.cat([keep_idx, split_idx, split_idx, clone_idx])
 
     n_after = final_means.shape[0]
-    n_pruned = int((~keep_mask & ~is_large).sum().item())  # low-opacity prunes among non-split gaussians
+    n_pruned = int(
+        (~keep_mask & ~is_large).sum().item()
+    )  # low-opacity prunes among non-split gaussians
     stats = DensifyStats(
         n_before=n_before,
         n_split=int(split_idx.numel()),
@@ -230,13 +259,20 @@ def prune_low_opacity(
 
     if model.sh_degree == 0:
         new_model = GaussianModel(
-            means, scales=scales, quats=quats, opacities=opacities,
+            means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
             colors=model.colors.detach()[keep_mask],
         ).to(device)
     else:
         new_model = GaussianModel(
-            means, scales=scales, quats=quats, opacities=opacities,
-            sh_degree=model.sh_degree, sh_coeffs=model.raw_sh.detach()[keep_mask],
+            means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
+            sh_degree=model.sh_degree,
+            sh_coeffs=model.raw_sh.detach()[keep_mask],
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 

@@ -7,10 +7,15 @@ from metalsplat.gaussians import GaussianModel
 def _clustered_model_with_floaters(sh_degree=0):
     # A dense 4x4x4 cluster (64 gaussians in a tight grid) plus 3 lone
     # gaussians far away -- the floaters.
-    grid = torch.stack(
-        torch.meshgrid(torch.arange(4.0), torch.arange(4.0), torch.arange(4.0), indexing="ij"),
-        dim=-1,
-    ).reshape(-1, 3) * 0.05
+    grid = (
+        torch.stack(
+            torch.meshgrid(
+                torch.arange(4.0), torch.arange(4.0), torch.arange(4.0), indexing="ij"
+            ),
+            dim=-1,
+        ).reshape(-1, 3)
+        * 0.05
+    )
     floaters = torch.tensor([[10.0, 10.0, 10.0], [-8.0, 4.0, 9.0], [20.0, -5.0, 3.0]])
     means = torch.cat([grid, floaters])
     colors = torch.rand(means.shape[0], 3)
@@ -57,7 +62,9 @@ def test_damp_view_dependence_scales_only_non_dc():
 
     damped = damp_view_dependence(model, factor=0.5)
 
-    assert torch.allclose(damped.raw_sh[:, 0, :], original[:, 0, :], atol=1e-6)  # DC untouched
+    assert torch.allclose(
+        damped.raw_sh[:, 0, :], original[:, 0, :], atol=1e-6
+    )  # DC untouched
     assert torch.allclose(damped.raw_sh[:, 1:, :], original[:, 1:, :] * 0.5, atol=1e-6)
     assert damped.num_points == model.num_points
 

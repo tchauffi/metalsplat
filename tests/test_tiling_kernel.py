@@ -17,6 +17,7 @@ pytestmark = pytest.mark.skipif(
 
 W, H = 200, 130  # deliberately not a multiple of the tile size
 
+
 def _isotropic_conic(radii: torch.Tensor) -> torch.Tensor:
     """Conic for a circular gaussian whose 3-sigma extent equals `radii`.
 
@@ -29,14 +30,13 @@ def _isotropic_conic(radii: torch.Tensor) -> torch.Tensor:
     return torch.stack([inv_var, torch.zeros_like(inv_var), inv_var], dim=-1)
 
 
-
 def _scene(n, seed=0, max_radius=30.0):
     g = torch.Generator().manual_seed(seed)
     # Spread centres beyond the image on both sides so off-screen culling,
     # partial overlap and full coverage are all exercised.
-    means2d = torch.rand(n, 2, generator=g) * torch.tensor([W * 1.6, H * 1.6]) - torch.tensor(
-        [W * 0.3, H * 0.3]
-    )
+    means2d = torch.rand(n, 2, generator=g) * torch.tensor(
+        [W * 1.6, H * 1.6]
+    ) - torch.tensor([W * 0.3, H * 0.3])
     depths = torch.rand(n, generator=g) * 10.0 + 0.5
     radii = (torch.rand(n, generator=g) * max_radius).floor()
     valid = (torch.rand(n, generator=g) > 0.2).float()
@@ -47,8 +47,14 @@ def _compare(means2d, depths, radii, valid, tile_size=16):
     conics = _isotropic_conic(radii)
     ref = bin_ref(means2d, depths, conics, radii, valid, W, H, tile_size)
     got = bin_and_sort_gaussians(
-        means2d.to("mps"), depths.to("mps"), conics.to("mps"), radii.to("mps"),
-        valid.to("mps"), W, H, tile_size,
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
+        tile_size,
     )
     torch.mps.synchronize()
 
@@ -111,8 +117,13 @@ def test_depth_order_within_a_tile_is_front_to_back():
     valid = torch.ones(3)
 
     got = bin_and_sort_gaussians(
-        means2d.to("mps"), depths.to("mps"), _isotropic_conic(radii).to("mps"),
-        radii.to("mps"), valid.to("mps"), W, H
+        means2d.to("mps"),
+        depths.to("mps"),
+        _isotropic_conic(radii).to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
     )
     torch.mps.synchronize()
     start, end = got.tile_bins[0].tolist()
@@ -121,9 +132,13 @@ def test_depth_order_within_a_tile_is_front_to_back():
 
 def test_empty_input():
     got = bin_and_sort_gaussians(
-        torch.empty(0, 2, device="mps"), torch.empty(0, device="mps"),
-        torch.empty(0, 3, device="mps"), torch.empty(0, device="mps"),
-        torch.empty(0, device="mps"), W, H,
+        torch.empty(0, 2, device="mps"),
+        torch.empty(0, device="mps"),
+        torch.empty(0, 3, device="mps"),
+        torch.empty(0, device="mps"),
+        torch.empty(0, device="mps"),
+        W,
+        H,
     )
     assert got.sorted_gaussian_ids.numel() == 0
     assert got.tile_bins.shape == (got.tiles_x * got.tiles_y, 2)
@@ -133,9 +148,9 @@ def test_empty_input():
 def _anisotropic_scene(n, seed=0):
     """Elongated, arbitrarily-oriented gaussians -- the case the tight box exists for."""
     g = torch.Generator().manual_seed(seed)
-    means2d = torch.rand(n, 2, generator=g) * torch.tensor([W * 1.2, H * 1.2]) - torch.tensor(
-        [W * 0.1, H * 0.1]
-    )
+    means2d = torch.rand(n, 2, generator=g) * torch.tensor(
+        [W * 1.2, H * 1.2]
+    ) - torch.tensor([W * 0.1, H * 0.1])
     depths = torch.rand(n, generator=g) * 10.0 + 0.5
     # Random covariance: rotate a strongly anisotropic diagonal.
     sx = torch.rand(n, generator=g) * 20.0 + 1.0
@@ -146,7 +161,9 @@ def _anisotropic_scene(n, seed=0):
     vyy = st * st * sx**2 + ct * ct * sy**2
     vxy = ct * st * (sx**2 - sy**2)
     det = vxx * vyy - vxy * vxy
-    conics = torch.stack([vyy / det, -vxy / det, vxx / det], dim=-1)  # inverse covariance
+    conics = torch.stack(
+        [vyy / det, -vxy / det, vxx / det], dim=-1
+    )  # inverse covariance
     lam = 0.5 * (vxx + vyy) + (((vxx - vyy) * 0.5) ** 2 + vxy**2).sqrt()
     radii = torch.ceil(3.0 * lam.sqrt())  # circumscribed circle, as project computes it
     valid = torch.ones(n)
@@ -157,8 +174,14 @@ def test_anisotropic_gaussians_match_the_reference():
     means2d, depths, conics, radii, valid = _anisotropic_scene(400, seed=5)
     ref = bin_ref(means2d, depths, conics, radii, valid, W, H, 16)
     got = bin_and_sort_gaussians(
-        means2d.to("mps"), depths.to("mps"), conics.to("mps"), radii.to("mps"),
-        valid.to("mps"), W, H, 16,
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
+        16,
     )
     torch.mps.synchronize()
 
@@ -194,13 +217,14 @@ def test_tight_box_still_covers_every_tile_the_ellipse_reaches():
 
     res = bin_ref(means2d, depths, conics, radii, valid, W, H, 16)
     touched = {
-        i for i in range(res.tiles_x * res.tiles_y)
+        i
+        for i in range(res.tiles_x * res.tiles_y)
         if res.tile_bins[i, 1] > res.tile_bins[i, 0]
     }
     expected = {
         ty * res.tiles_x + tx
-        for tx in range(int((100 - 60) // 16), int((100 + 60) // 16) + 1)
-        for ty in range(int((65 - 6) // 16), int((65 + 6) // 16) + 1)
+        for tx in range((100 - 60) // 16, ((100 + 60) // 16) + 1)
+        for ty in range((65 - 6) // 16, ((65 + 6) // 16) + 1)
         if 0 <= tx < res.tiles_x and 0 <= ty < res.tiles_y
     }
     assert touched == expected

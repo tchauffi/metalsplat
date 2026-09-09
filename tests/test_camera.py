@@ -8,8 +8,12 @@ def _look_at(eye, target, up=(0.0, -1.0, 0.0)):
         eye=torch.tensor(eye),
         target=torch.tensor(target),
         up=torch.tensor(up),
-        fx=100.0, fy=100.0, cx=50.0, cy=50.0,
-        img_width=100, img_height=100,
+        fx=100.0,
+        fy=100.0,
+        cx=50.0,
+        cy=50.0,
+        img_width=100,
+        img_height=100,
     )
 
 

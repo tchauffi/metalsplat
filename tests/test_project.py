@@ -73,12 +73,30 @@ def _run_both(n, seed=0):
     t_wc_mps = t_wc.to("mps")
 
     means2d, depths, conics, radii, valid, comp = project_gaussians(
-        means_mps, scales_mps, quats_mps, R_wc_mps, t_wc_mps,
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+        means_mps,
+        scales_mps,
+        quats_mps,
+        R_wc_mps,
+        t_wc_mps,
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
     torch.mps.synchronize()
 
-    return ref, (means2d.cpu(), depths.cpu(), conics.cpu(), radii.cpu(), valid.cpu(), comp.cpu())
+    return ref, (
+        means2d.cpu(),
+        depths.cpu(),
+        conics.cpu(),
+        radii.cpu(),
+        valid.cpu(),
+        comp.cpu(),
+    )
 
 
 @pytest.mark.parametrize("n", [1, 8, 37])
@@ -105,7 +123,19 @@ def test_backward_matches_reference(n):
     quats_ref = quats.clone().requires_grad_()
 
     ref = project_gaussians_ref(
-        means_ref, scales_ref, quats_ref, R_wc, t_wc, FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D
+        means_ref,
+        scales_ref,
+        quats_ref,
+        R_wc,
+        t_wc,
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
 
     g = torch.Generator().manual_seed(42)
@@ -116,7 +146,9 @@ def test_backward_matches_reference(n):
     upstream_means2d = upstream_means2d * ref.valid[:, None]
     upstream_conics = upstream_conics * ref.valid[:, None]
 
-    loss_ref = (ref.means2d * upstream_means2d).sum() + (ref.conics * upstream_conics).sum()
+    loss_ref = (ref.means2d * upstream_means2d).sum() + (
+        ref.conics * upstream_conics
+    ).sum()
     loss_ref.backward()
 
     means_mps = means.to("mps").requires_grad_()
@@ -125,11 +157,24 @@ def test_backward_matches_reference(n):
     R_wc_mps = R_wc.to("mps")
     t_wc_mps = t_wc.to("mps")
 
-    means2d, depths, conics, radii, valid, comp = project_gaussians(
-        means_mps, scales_mps, quats_mps, R_wc_mps, t_wc_mps,
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+    means2d, _depths, conics, _radii, _valid, _comp = project_gaussians(
+        means_mps,
+        scales_mps,
+        quats_mps,
+        R_wc_mps,
+        t_wc_mps,
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
-    loss = (means2d * upstream_means2d.to("mps")).sum() + (conics * upstream_conics.to("mps")).sum()
+    loss = (means2d * upstream_means2d.to("mps")).sum() + (
+        conics * upstream_conics.to("mps")
+    ).sum()
     loss.backward()
     torch.mps.synchronize()
 
@@ -172,8 +217,19 @@ def test_off_axis_gaussians_get_bounded_radii():
     t_wc = torch.zeros(3)
 
     _, _, _, radii, _, _ = project_gaussians(
-        means.to("mps"), scales.to("mps"), quats.to("mps"), R_wc.to("mps"), t_wc.to("mps"),
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+        means.to("mps"),
+        scales.to("mps"),
+        quats.to("mps"),
+        R_wc.to("mps"),
+        t_wc.to("mps"),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
     torch.mps.synchronize()
 
@@ -183,7 +239,9 @@ def test_off_axis_gaussians_get_bounded_radii():
     # ones slightly *below* on-axis. Unclamped, these reach ~10x on-axis.
     on_axis = radii[0].item()
     assert on_axis > 0
-    assert radii.max().item() <= 2.5 * on_axis, f"radii {radii.tolist()} vs on-axis {on_axis}"
+    assert radii.max().item() <= 2.5 * on_axis, (
+        f"radii {radii.tolist()} vs on-axis {on_axis}"
+    )
 
 
 def test_off_axis_forward_matches_reference():
@@ -193,9 +251,20 @@ def test_off_axis_forward_matches_reference():
     ref = project_gaussians_ref(
         means, scales, quats, R_wc, t_wc, FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D
     )
-    means2d, _, conics, radii, valid, _ = project_gaussians(
-        means.to("mps"), scales.to("mps"), quats.to("mps"), R_wc.to("mps"), t_wc.to("mps"),
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+    _, _, conics, radii, valid, _ = project_gaussians(
+        means.to("mps"),
+        scales.to("mps"),
+        quats.to("mps"),
+        R_wc.to("mps"),
+        t_wc.to("mps"),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
     torch.mps.synchronize()
 
@@ -215,7 +284,19 @@ def test_off_axis_backward_matches_reference():
     means_ref = means.clone().requires_grad_()
     scales_ref = scales.clone().requires_grad_()
     ref = project_gaussians_ref(
-        means_ref, scales_ref, quats, R_wc, t_wc, FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D
+        means_ref,
+        scales_ref,
+        quats,
+        R_wc,
+        t_wc,
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
 
     g = torch.Generator().manual_seed(7)
@@ -226,10 +307,23 @@ def test_off_axis_backward_matches_reference():
     means_mps = means.to("mps").requires_grad_()
     scales_mps = scales.to("mps").requires_grad_()
     means2d, _, conics, _, _, _ = project_gaussians(
-        means_mps, scales_mps, quats.to("mps"), R_wc.to("mps"), t_wc.to("mps"),
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+        means_mps,
+        scales_mps,
+        quats.to("mps"),
+        R_wc.to("mps"),
+        t_wc.to("mps"),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
-    ((means2d * up_means2d.to("mps")).sum() + (conics * up_conics.to("mps")).sum()).backward()
+    (
+        (means2d * up_means2d.to("mps")).sum() + (conics * up_conics.to("mps")).sum()
+    ).backward()
     torch.mps.synchronize()
 
     assert torch.allclose(means_mps.grad.cpu(), means_ref.grad, atol=2e-3, rtol=2e-2)
@@ -247,9 +341,19 @@ def test_compensation_shrinks_subpixel_gaussians_only():
     scales = torch.tensor([[s, s, s] for s in (0.0005, 0.005, 0.05, 0.5)])
 
     _, _, _, _, _, comp = project_gaussians(
-        means.to("mps"), scales.to("mps"), quats.to("mps"),
-        torch.eye(3, device="mps"), torch.zeros(3, device="mps"),
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+        means.to("mps"),
+        scales.to("mps"),
+        quats.to("mps"),
+        torch.eye(3, device="mps"),
+        torch.zeros(3, device="mps"),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
     torch.mps.synchronize()
     comp = comp.cpu()
@@ -273,8 +377,19 @@ def test_compensation_backward_matches_reference(n):
     scales_ref = scales.clone().requires_grad_()
     quats_ref = quats.clone().requires_grad_()
     ref = project_gaussians_ref(
-        means_ref, scales_ref, quats_ref, R_wc, t_wc, FX, FY, CX, CY, W, H,
-        near=NEAR, eps2d=EPS2D,
+        means_ref,
+        scales_ref,
+        quats_ref,
+        R_wc,
+        t_wc,
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
 
     g = torch.Generator().manual_seed(9)
@@ -285,8 +400,19 @@ def test_compensation_backward_matches_reference(n):
     scales_mps = scales.to("mps").requires_grad_()
     quats_mps = quats.to("mps").requires_grad_()
     *_, comp = project_gaussians(
-        means_mps, scales_mps, quats_mps, R_wc.to("mps"), t_wc.to("mps"),
-        FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D,
+        means_mps,
+        scales_mps,
+        quats_mps,
+        R_wc.to("mps"),
+        t_wc.to("mps"),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
     )
     (comp * upstream.to("mps")).sum().backward()
     torch.mps.synchronize()

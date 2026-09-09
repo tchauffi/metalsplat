@@ -16,7 +16,7 @@ can't be a plain property; use `colors_from_view(view_dirs)`.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from metalsplat.ops.sh import eval_sh
 from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
@@ -31,22 +31,28 @@ class GaussianModel(nn.Module):
         opacities: torch.Tensor | None = None,  # (N,), in [0, 1]; defaults to 0.5
         colors: torch.Tensor | None = None,  # (N, 3), in [0, 1]; defaults to 0.5 gray
         sh_degree: int = 0,  # 0 = plain RGB; 1..3 = view-dependent spherical harmonics
-        sh_coeffs: torch.Tensor | None = None,  # (N, (deg+1)^2, 3) raw SH; overrides `colors`-derived DC init if given
-        active_sh_degree: int | None = None,  # defaults to sh_degree; preserved across rebuilds
+        sh_coeffs: torch.Tensor
+        | None = None,  # (N, (deg+1)^2, 3) raw SH; overrides `colors`-derived DC init if given
+        active_sh_degree: int
+        | None = None,  # defaults to sh_degree; preserved across rebuilds
     ):
         super().__init__()
         n = means.shape[0]
         device = means.device
 
         if not 0 <= sh_degree <= MAX_SH_DEGREE:
-            raise ValueError(f"sh_degree must be between 0 and {MAX_SH_DEGREE}, got {sh_degree}")
+            raise ValueError(
+                f"sh_degree must be between 0 and {MAX_SH_DEGREE}, got {sh_degree}"
+            )
         self.sh_degree = sh_degree
         # Degrees actually evaluated right now. Training can start this
         # at 0 and grow it (see increase_sh_degree): fitting all bands
         # from step 1 lets the higher ones absorb per-photo exposure and
         # white-balance drift before the diffuse base has settled, which
         # is overfitting that shows up as shimmer when the camera moves.
-        self.active_sh_degree = sh_degree if active_sh_degree is None else active_sh_degree
+        self.active_sh_degree = (
+            sh_degree if active_sh_degree is None else active_sh_degree
+        )
 
         if scales is None:
             scales = torch.full((n, 3), 0.02, device=device)
@@ -84,7 +90,9 @@ class GaussianModel(nn.Module):
 
     @property
     def quats(self) -> torch.Tensor:
-        return self.raw_quats / self.raw_quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        return self.raw_quats / self.raw_quats.norm(dim=-1, keepdim=True).clamp_min(
+            1e-8
+        )
 
     @property
     def opacities(self) -> torch.Tensor:
@@ -102,7 +110,9 @@ class GaussianModel(nn.Module):
     def colors_from_view(self, view_dirs: torch.Tensor) -> torch.Tensor:
         """view_dirs: (N, 3) unit vectors from each gaussian to the camera."""
         if self.sh_degree == 0:
-            raise AttributeError("This model has sh_degree=0; use the `colors` property instead.")
+            raise AttributeError(
+                "This model has sh_degree=0; use the `colors` property instead."
+            )
         return eval_sh(self.raw_sh, view_dirs, self.active_sh_degree) + 0.5
 
     def increase_sh_degree(self) -> int:
@@ -116,7 +126,9 @@ class GaussianModel(nn.Module):
         return self.means.shape[0]
 
     @classmethod
-    def random(cls, n: int, bound: float = 1.0, device: str | torch.device = "cpu") -> GaussianModel:
+    def random(
+        cls, n: int, bound: float = 1.0, device: str | torch.device = "cpu"
+    ) -> GaussianModel:
         means = (torch.rand(n, 3, device=device) * 2 - 1) * bound
         colors = torch.rand(n, 3, device=device)
         return cls(means, colors=colors)

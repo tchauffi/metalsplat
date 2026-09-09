@@ -29,9 +29,15 @@ LR = 0.01
 def make_target_image(size: int) -> torch.Tensor:
     img = Image.new("RGB", (size, size), (20, 20, 40))
     draw = ImageDraw.Draw(img)
-    draw.ellipse([size * 0.15, size * 0.15, size * 0.65, size * 0.65], fill=(220, 80, 60))
-    draw.rectangle([size * 0.45, size * 0.35, size * 0.9, size * 0.8], fill=(60, 160, 200))
-    draw.ellipse([size * 0.3, size * 0.55, size * 0.75, size * 0.95], fill=(240, 210, 60))
+    draw.ellipse(
+        [size * 0.15, size * 0.15, size * 0.65, size * 0.65], fill=(220, 80, 60)
+    )
+    draw.rectangle(
+        [size * 0.45, size * 0.35, size * 0.9, size * 0.8], fill=(60, 160, 200)
+    )
+    draw.ellipse(
+        [size * 0.3, size * 0.55, size * 0.75, size * 0.95], fill=(240, 210, 60)
+    )
     arr = torch.from_numpy(np.array(img)).float() / 255.0
     return arr  # (H, W, 3)
 
@@ -64,8 +70,12 @@ def main() -> None:
     model = GaussianModel(means, scales=scales, colors=colors).to(DEVICE)
 
     camera = Camera.identity(
-        fx=fx, fy=fy, cx=IMG_SIZE / 2, cy=IMG_SIZE / 2,
-        img_width=IMG_SIZE, img_height=IMG_SIZE,
+        fx=fx,
+        fy=fy,
+        cx=IMG_SIZE / 2,
+        cy=IMG_SIZE / 2,
+        img_width=IMG_SIZE,
+        img_height=IMG_SIZE,
     ).to(DEVICE)
 
     out_dir = Path(__file__).parent

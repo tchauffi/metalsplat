@@ -35,7 +35,9 @@ def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return float("inf") if mse <= 0 else -10.0 * torch.log10(torch.tensor(mse)).item()
 
 
-def score(model, scene, indices: list[int], background: torch.Tensor) -> tuple[float, float]:
+def score(
+    model, scene, indices: list[int], background: torch.Tensor
+) -> tuple[float, float]:
     psnrs, ssims = [], []
     with torch.no_grad():
         for i in indices:
@@ -50,13 +52,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ply", type=Path, default=DEFAULT_PLY)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    parser.add_argument("--train", action="store_true", help="also score training views")
-    parser.add_argument("--prune", action="store_true", help="apply isolation pruning first")
-    parser.add_argument("--sh-damp", type=float, default=1.0, help="scale non-DC SH before scoring")
+    parser.add_argument(
+        "--train", action="store_true", help="also score training views"
+    )
+    parser.add_argument(
+        "--prune", action="store_true", help="apply isolation pruning first"
+    )
+    parser.add_argument(
+        "--sh-damp", type=float, default=1.0, help="scale non-DC SH before scoring"
+    )
     args = parser.parse_args()
 
     model = load_ply(args.ply, device=DEVICE)
-    print(f"{args.ply.name}: {model.num_points} gaussians, sh_degree={model.sh_degree}", flush=True)
+    print(
+        f"{args.ply.name}: {model.num_points} gaussians, sh_degree={model.sh_degree}",
+        flush=True,
+    )
 
     if args.prune:
         model, n_pruned = prune_isolated(model)

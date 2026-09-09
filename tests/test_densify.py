@@ -18,7 +18,9 @@ def test_split_clone_and_prune():
     n = 10
     model = _model(n)
     with torch.no_grad():
-        model.raw_scales[0] = torch.log(torch.tensor(2.0))  # gaussian 0: large -> split candidate
+        model.raw_scales[0] = torch.log(
+            torch.tensor(2.0)
+        )  # gaussian 0: large -> split candidate
         model.raw_opacities[5] = -10.0  # gaussian 5: opacity ~0 -> pruned
 
     grad_count = torch.ones(n)
@@ -28,7 +30,11 @@ def test_split_clone_and_prune():
     grad_accum[1] = 9.0  # second-highest grad, small scale -> clone
 
     new_model, stats = densify_and_prune(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.8,
+        model,
+        grad_accum,
+        grad_count,
+        scene_scale=SCENE_SCALE,
+        grad_percentile=0.8,
     )
 
     assert stats.n_before == n
@@ -46,7 +52,9 @@ def test_no_visible_gaussians_is_a_no_op():
     grad_count = torch.zeros(n)
     grad_accum = torch.zeros(n)
 
-    new_model, stats = densify_and_prune(model, grad_accum, grad_count, scene_scale=SCENE_SCALE)
+    new_model, stats = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=SCENE_SCALE
+    )
 
     assert stats.n_split == 0 and stats.n_cloned == 0 and stats.n_pruned == 0
     assert new_model.num_points == n
@@ -60,7 +68,11 @@ def test_max_points_stops_densification():
     grad_accum[0] = 10.0
 
     new_model, stats = densify_and_prune(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, max_points=n,
+        model,
+        grad_accum,
+        grad_count,
+        scene_scale=SCENE_SCALE,
+        max_points=n,
     )
 
     assert new_model.num_points == n
@@ -73,7 +85,9 @@ def test_split_clone_and_prune_preserves_sh_coefficients():
     scales = torch.full((n, 3), 0.5)
     opacities = torch.full((n,), 0.5)
     colors = torch.rand(n, 3)
-    model = GaussianModel(means, scales=scales, opacities=opacities, colors=colors, sh_degree=2)
+    model = GaussianModel(
+        means, scales=scales, opacities=opacities, colors=colors, sh_degree=2
+    )
     with torch.no_grad():
         model.raw_sh[:, 1, :] = 0.7  # a non-DC coefficient, should survive densify
         model.raw_scales[0] = torch.log(torch.tensor(2.0))  # split candidate
@@ -85,12 +99,18 @@ def test_split_clone_and_prune_preserves_sh_coefficients():
     grad_accum[1] = 9.0
 
     new_model, stats = densify_and_prune(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.8,
+        model,
+        grad_accum,
+        grad_count,
+        scene_scale=SCENE_SCALE,
+        grad_percentile=0.8,
     )
 
     assert new_model.sh_degree == 2
     assert new_model.raw_sh.shape == (stats.n_after, 9, 3)
-    assert torch.allclose(new_model.raw_sh[:, 1, :], torch.full((stats.n_after, 3), 0.7))
+    assert torch.allclose(
+        new_model.raw_sh[:, 1, :], torch.full((stats.n_after, 3), 0.7)
+    )
 
 
 def test_reset_opacity_caps_high_opacities_in_place():
@@ -101,13 +121,21 @@ def test_reset_opacity_caps_high_opacities_in_place():
         model.raw_opacities[1] = -5.0  # opacity ~0.0067, already below the reset value
     already_low_opacity = model.opacities[1].item()
 
-    param_before = model.raw_opacities  # same nn.Parameter object, to check in-place semantics
+    param_before = (
+        model.raw_opacities
+    )  # same nn.Parameter object, to check in-place semantics
     reset_opacity(model, value=0.01)
 
-    assert model.raw_opacities is param_before  # in-place: no new Parameter, optimizer state stays valid
+    assert (
+        model.raw_opacities is param_before
+    )  # in-place: no new Parameter, optimizer state stays valid
     assert model.opacities[0].item() <= 0.01 + 1e-6
-    assert abs(model.opacities[1].item() - already_low_opacity) < 1e-6  # already below value, untouched
-    assert model.opacities[2].item() <= 0.01 + 1e-6  # baseline 0.5 is above the reset value too
+    assert (
+        abs(model.opacities[1].item() - already_low_opacity) < 1e-6
+    )  # already below value, untouched
+    assert (
+        model.opacities[2].item() <= 0.01 + 1e-6
+    )  # baseline 0.5 is above the reset value too
 
 
 def test_prune_low_opacity_removes_only_below_threshold():
@@ -140,8 +168,11 @@ def test_rebuilds_preserve_active_sh_degree():
     n = 10
     means = torch.zeros(n, 3)
     model = GaussianModel(
-        means, scales=torch.full((n, 3), 0.5), opacities=torch.full((n,), 0.5),
-        colors=torch.rand(n, 3), sh_degree=2,
+        means,
+        scales=torch.full((n, 3), 0.5),
+        opacities=torch.full((n,), 0.5),
+        colors=torch.rand(n, 3),
+        sh_degree=2,
     )
     model.active_sh_degree = 1
 
@@ -197,8 +228,11 @@ def test_percentile_promotes_a_fixed_fraction_however_well_fit():
 
     for magnitude in (10.0, 1e-6):  # large gradients, then essentially converged
         _, stats = densify_and_prune(
-            model, torch.full((n,), magnitude), grad_count,
-            scene_scale=SCENE_SCALE, grad_percentile=0.9,
+            model,
+            torch.full((n,), magnitude),
+            grad_count,
+            scene_scale=SCENE_SCALE,
+            grad_percentile=0.9,
         )
         assert stats.n_split + stats.n_cloned > 0, (
             "percentile densified nothing; the test no longer shows the problem"
@@ -221,7 +255,11 @@ def test_calibrated_threshold_makes_densification_decay():
     for decay in (1.0, 0.5, 0.1):
         m = _model(n)
         _, stats = densify_and_prune(
-            m, grad_accum * decay, grad_count, scene_scale=SCENE_SCALE, grad_threshold=bar
+            m,
+            grad_accum * decay,
+            grad_count,
+            scene_scale=SCENE_SCALE,
+            grad_threshold=bar,
         )
         promoted.append(stats.n_split + stats.n_cloned)
 
@@ -239,6 +277,10 @@ def test_reported_threshold_round_trips():
     # Feeding the reported bar back in reproduces the same selection.
     m2 = _model(n)
     _, again = densify_and_prune(
-        m2, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_threshold=stats.grad_threshold
+        m2,
+        grad_accum,
+        grad_count,
+        scene_scale=SCENE_SCALE,
+        grad_threshold=stats.grad_threshold,
     )
     assert again.n_split + again.n_cloned == stats.n_split + stats.n_cloned

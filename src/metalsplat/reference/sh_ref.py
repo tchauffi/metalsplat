@@ -42,7 +42,9 @@ SH_C3 = (
 )
 
 
-def eval_sh(sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int = MAX_SH_DEGREE) -> torch.Tensor:
+def eval_sh(
+    sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int = MAX_SH_DEGREE
+) -> torch.Tensor:
     """sh_coeffs: (N, K, 3) with K >= (active_degree+1)^2, dirs: (N, 3) unit
     vectors -> (N, 3) color.
 
@@ -56,7 +58,12 @@ def eval_sh(sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int = MA
     result = SH_C0 * sh_coeffs[:, 0, :]
     if active_degree < 1:
         return result
-    result = result - SH_C1 * y * sh_coeffs[:, 1, :] + SH_C1 * z * sh_coeffs[:, 2, :] - SH_C1 * x * sh_coeffs[:, 3, :]
+    result = (
+        result
+        - SH_C1 * y * sh_coeffs[:, 1, :]
+        + SH_C1 * z * sh_coeffs[:, 2, :]
+        - SH_C1 * x * sh_coeffs[:, 3, :]
+    )
     if active_degree < 2:
         return result
 

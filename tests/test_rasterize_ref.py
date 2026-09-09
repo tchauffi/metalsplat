@@ -11,7 +11,9 @@ def test_single_opaque_gaussian_at_center_is_close_to_its_color():
     colors = torch.tensor([[1.0, 0.0, 0.0]])
     valid = torch.tensor([1.0])
 
-    image = rasterize_gaussians(means2d, depths, conics, opacities, colors, valid, 16, 16)
+    image = rasterize_gaussians(
+        means2d, depths, conics, opacities, colors, valid, 16, 16
+    )
 
     center = image[8, 8]
     assert torch.allclose(center, torch.tensor([0.99, 0.0, 0.0]), atol=1e-3)
@@ -43,7 +45,9 @@ def test_farther_gaussian_occluded_by_closer_opaque_one():
     colors = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     valid = torch.tensor([1.0, 1.0])
 
-    image = rasterize_gaussians(means2d, depths, conics, opacities, colors, valid, 16, 16)
+    image = rasterize_gaussians(
+        means2d, depths, conics, opacities, colors, valid, 16, 16
+    )
 
     center = image[8, 8]
     assert center[1] > center[0]  # closer green gaussian dominates

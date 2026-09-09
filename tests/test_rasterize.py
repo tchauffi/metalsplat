@@ -2,7 +2,9 @@ import pytest
 import torch
 
 from metalsplat.ops.rasterize import rasterize_gaussians
-from metalsplat.reference.rasterize_ref import rasterize_gaussians as rasterize_gaussians_ref
+from metalsplat.reference.rasterize_ref import (
+    rasterize_gaussians as rasterize_gaussians_ref,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS not available"
@@ -34,8 +36,15 @@ def test_forward_matches_reference(n):
     )
 
     kernel_image = rasterize_gaussians(
-        means2d.to("mps"), depths.to("mps"), conics.to("mps"), opacities.to("mps"),
-        colors.to("mps"), radii.to("mps"), valid.to("mps"), W, H,
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
     )
     torch.mps.synchronize()
 
@@ -66,16 +75,27 @@ def test_backward_matches_reference(n):
     colors_mps = colors.to("mps").requires_grad_()
 
     kernel_image = rasterize_gaussians(
-        means2d_mps, depths.to("mps"), conics_mps, opacities_mps, colors_mps,
-        radii.to("mps"), valid.to("mps"), W, H,
+        means2d_mps,
+        depths.to("mps"),
+        conics_mps,
+        opacities_mps,
+        colors_mps,
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
     )
     loss = (kernel_image * upstream.to("mps")).sum()
     loss.backward()
     torch.mps.synchronize()
 
-    assert torch.allclose(means2d_mps.grad.cpu(), means2d_ref.grad, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(
+        means2d_mps.grad.cpu(), means2d_ref.grad, atol=2e-2, rtol=2e-2
+    )
     assert torch.allclose(conics_mps.grad.cpu(), conics_ref.grad, atol=2e-2, rtol=2e-2)
-    assert torch.allclose(opacities_mps.grad.cpu(), opacities_ref.grad, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(
+        opacities_mps.grad.cpu(), opacities_ref.grad, atol=2e-2, rtol=2e-2
+    )
     assert torch.allclose(colors_mps.grad.cpu(), colors_ref.grad, atol=2e-2, rtol=2e-2)
 
 
@@ -88,8 +108,16 @@ def test_depth_matches_reference(n):
     )
 
     _, kernel_depth, _ = rasterize_gaussians(
-        means2d.to("mps"), depths.to("mps"), conics.to("mps"), opacities.to("mps"),
-        colors.to("mps"), radii.to("mps"), valid.to("mps"), W, H, return_aux=True,
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
+        return_aux=True,
     )
     torch.mps.synchronize()
 
@@ -111,8 +139,16 @@ def test_depth_picks_the_nearer_of_two_opaque_gaussians():
     valid = torch.tensor([1.0, 1.0])
 
     _, depth, final_T = rasterize_gaussians(
-        means2d.to("mps"), depths.to("mps"), conics.to("mps"), opacities.to("mps"),
-        colors.to("mps"), radii.to("mps"), valid.to("mps"), W, H, return_aux=True,
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
+        return_aux=True,
     )
     torch.mps.synchronize()
 
@@ -130,8 +166,15 @@ def test_abs_grad_accum_mutates_in_place():
     accum_before = abs_accum  # same object, to check in-place semantics
 
     image = rasterize_gaussians(
-        means2d_mps, depths.to("mps"), conics.to("mps"), opacities.to("mps"),
-        colors.to("mps"), radii.to("mps"), valid.to("mps"), W, H,
+        means2d_mps,
+        depths.to("mps"),
+        conics.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
         abs_grad_accum=abs_accum,
     )
     image.sum().backward()
@@ -163,8 +206,15 @@ def test_abs_grad_accum_avoids_sign_cancellation():
     abs_accum = torch.zeros(1, device="mps")
 
     image = rasterize_gaussians(
-        means2d_mps, depths.to("mps"), conics.to("mps"), opacities.to("mps"),
-        colors.to("mps"), radii.to("mps"), valid.to("mps"), W, H,
+        means2d_mps,
+        depths.to("mps"),
+        conics.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
         abs_grad_accum=abs_accum,
     )
     (image * upstream.to("mps")).sum().backward()
@@ -172,7 +222,9 @@ def test_abs_grad_accum_avoids_sign_cancellation():
 
     signed_grad_norm = means2d_mps.grad.norm().item()
     abs_accum_value = abs_accum.item()
-    assert abs_accum_value > signed_grad_norm * 2  # abs-sum meaningfully exceeds the cancelled signed sum
+    assert (
+        abs_accum_value > signed_grad_norm * 2
+    )  # abs-sum meaningfully exceeds the cancelled signed sum
 
 
 @pytest.mark.parametrize("n", [300, 800])
@@ -213,8 +265,15 @@ def test_backward_matches_reference_with_many_gaussians_per_tile(n):
     opacities_mps = opacities.to("mps").requires_grad_()
     colors_mps = colors.to("mps").requires_grad_()
     img = rasterize_gaussians(
-        means2d_mps, depths.to("mps"), conics_mps, opacities_mps, colors_mps,
-        radii.to("mps"), valid.to("mps"), W, H,
+        means2d_mps,
+        depths.to("mps"),
+        conics_mps,
+        opacities_mps,
+        colors_mps,
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
     )
     (img * grad_out.to("mps")).sum().backward()
     torch.mps.synchronize()
@@ -226,4 +285,6 @@ def test_backward_matches_reference_with_many_gaussians_per_tile(n):
         ("conics", conics_mps.grad, conics_ref.grad),
         ("means2d", means2d_mps.grad, means2d_ref.grad),
     ):
-        assert torch.allclose(got.cpu(), want, atol=2e-3, rtol=2e-2), f"{name} gradient disagrees"
+        assert torch.allclose(got.cpu(), want, atol=2e-3, rtol=2e-2), (
+            f"{name} gradient disagrees"
+        )

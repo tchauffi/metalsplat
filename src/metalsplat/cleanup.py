@@ -17,7 +17,9 @@ import torch
 from metalsplat.gaussians import GaussianModel
 
 
-def _rebuild(model: GaussianModel, keep: torch.Tensor, sh: torch.Tensor | None = None) -> GaussianModel:
+def _rebuild(
+    model: GaussianModel, keep: torch.Tensor, sh: torch.Tensor | None = None
+) -> GaussianModel:
     device = model.means.device
     means = model.means.detach()[keep]
     scales = model.scales.detach()[keep]
@@ -25,13 +27,20 @@ def _rebuild(model: GaussianModel, keep: torch.Tensor, sh: torch.Tensor | None =
     opacities = model.opacities.detach()[keep]
     if model.sh_degree == 0:
         return GaussianModel(
-            means, scales=scales, quats=quats, opacities=opacities,
+            means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
             colors=model.colors.detach()[keep],
         ).to(device)
     coeffs = (model.raw_sh.detach() if sh is None else sh)[keep]
     return GaussianModel(
-        means, scales=scales, quats=quats, opacities=opacities,
-        sh_degree=model.sh_degree, sh_coeffs=coeffs,
+        means,
+        scales=scales,
+        quats=quats,
+        opacities=opacities,
+        sh_degree=model.sh_degree,
+        sh_coeffs=coeffs,
         active_sh_degree=model.active_sh_degree,
     ).to(device)
 
@@ -85,4 +94,6 @@ def damp_view_dependence(model: GaussianModel, factor: float = 0.75) -> Gaussian
         return model  # nothing view-dependent to damp
     sh = model.raw_sh.detach().clone()
     sh[:, 1:, :] *= factor
-    return _rebuild(model, torch.ones(model.num_points, dtype=torch.bool, device=sh.device), sh)
+    return _rebuild(
+        model, torch.ones(model.num_points, dtype=torch.bool, device=sh.device), sh
+    )

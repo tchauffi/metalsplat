@@ -31,9 +31,9 @@ import numpy as np
 # between the two libraries in this codebase.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-import pycolmap  # noqa: E402
-import torch  # noqa: E402
-from PIL import Image  # noqa: E402
+import pycolmap
+import torch
+from PIL import Image
 
 from metalsplat.camera import Camera
 
@@ -88,7 +88,7 @@ class ColmapScene:
     colors: torch.Tensor  # (P, 3) float32 in [0, 1]
 
 
-def _camera_intrinsics(cam: "pycolmap.Camera") -> tuple[float, float, float, float]:
+def _camera_intrinsics(cam: pycolmap.Camera) -> tuple[float, float, float, float]:
     model = cam.model.name
     if model not in _SUPPORTED_MODELS:
         raise ValueError(
@@ -129,13 +129,21 @@ def load_colmap_scene(
         fx, fy, cx, cy = fx * scale, fy * scale, cx * scale, cy * scale
 
         cam_from_world = colmap_image.cam_from_world()
-        R_wc = torch.from_numpy(np.array(cam_from_world.rotation.matrix(), dtype=np.float32))
+        R_wc = torch.from_numpy(
+            np.array(cam_from_world.rotation.matrix(), dtype=np.float32)
+        )
         t_wc = torch.from_numpy(np.array(cam_from_world.translation, dtype=np.float32))
 
         cameras.append(
             Camera(
-                R_wc=R_wc, t_wc=t_wc, fx=fx, fy=fy, cx=cx, cy=cy,
-                img_width=actual_width, img_height=actual_height,
+                R_wc=R_wc,
+                t_wc=t_wc,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                img_width=actual_width,
+                img_height=actual_height,
             ).to(device)
         )
         # Kept as uint8; ImageStore converts on access. See its docstring.
@@ -152,6 +160,9 @@ def load_colmap_scene(
     ).to(device)
 
     return ColmapScene(
-        cameras=cameras, images=ImageStore(images), image_names=image_names,
-        points=points, colors=colors
+        cameras=cameras,
+        images=ImageStore(images),
+        image_names=image_names,
+        points=points,
+        colors=colors,
     )

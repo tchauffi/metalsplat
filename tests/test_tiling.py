@@ -18,7 +18,6 @@ def _isotropic_conic(radii: torch.Tensor) -> torch.Tensor:
     return torch.stack([inv_var, torch.zeros_like(inv_var), inv_var], dim=-1)
 
 
-
 @pytest.mark.parametrize("device", DEVICES)
 def test_single_gaussian_single_tile(device):
     means2d = torch.tensor([[8.0, 8.0]], device=device)
@@ -27,7 +26,15 @@ def test_single_gaussian_single_tile(device):
     valid = torch.tensor([1.0], device=device)
 
     result = bin_and_sort_gaussians(
-        means2d, depths, _isotropic_conic(radii), radii, valid, img_width=32, img_height=32, tile_size=16)
+        means2d,
+        depths,
+        _isotropic_conic(radii),
+        radii,
+        valid,
+        img_width=32,
+        img_height=32,
+        tile_size=16,
+    )
 
     assert result.tiles_x == 2 and result.tiles_y == 2
     assert result.sorted_gaussian_ids.tolist() == [0]
@@ -46,10 +53,20 @@ def test_gaussian_spanning_multiple_tiles(device):
     valid = torch.tensor([1.0], device=device)
 
     result = bin_and_sort_gaussians(
-        means2d, depths, _isotropic_conic(radii), radii, valid, img_width=32, img_height=32, tile_size=16)
+        means2d,
+        depths,
+        _isotropic_conic(radii),
+        radii,
+        valid,
+        img_width=32,
+        img_height=32,
+        tile_size=16,
+    )
 
     assert result.sorted_gaussian_ids.numel() == 4  # one entry per touched tile
-    touched_tiles = (result.tile_bins[:, 1] - result.tile_bins[:, 0] > 0).nonzero().squeeze(-1)
+    touched_tiles = (
+        (result.tile_bins[:, 1] - result.tile_bins[:, 0] > 0).nonzero().squeeze(-1)
+    )
     assert touched_tiles.tolist() == [0, 1, 2, 3]
 
 
@@ -61,7 +78,15 @@ def test_depth_ordering_within_tile(device):
     valid = torch.tensor([1.0, 1.0], device=device)
 
     result = bin_and_sort_gaussians(
-        means2d, depths, _isotropic_conic(radii), radii, valid, img_width=16, img_height=16, tile_size=16)
+        means2d,
+        depths,
+        _isotropic_conic(radii),
+        radii,
+        valid,
+        img_width=16,
+        img_height=16,
+        tile_size=16,
+    )
 
     assert result.sorted_gaussian_ids.tolist() == [1, 0]  # closer gaussian first
     assert result.tile_bins[0].tolist() == [0, 2]
@@ -75,7 +100,15 @@ def test_invalid_gaussians_excluded(device):
     valid = torch.tensor([1.0, 0.0], device=device)
 
     result = bin_and_sort_gaussians(
-        means2d, depths, _isotropic_conic(radii), radii, valid, img_width=16, img_height=16, tile_size=16)
+        means2d,
+        depths,
+        _isotropic_conic(radii),
+        radii,
+        valid,
+        img_width=16,
+        img_height=16,
+        tile_size=16,
+    )
 
     assert result.sorted_gaussian_ids.tolist() == [0]
 
@@ -88,7 +121,15 @@ def test_no_valid_gaussians_returns_empty(device):
     valid = torch.zeros(3, device=device)
 
     result = bin_and_sort_gaussians(
-        means2d, depths, _isotropic_conic(radii), radii, valid, img_width=16, img_height=16, tile_size=16)
+        means2d,
+        depths,
+        _isotropic_conic(radii),
+        radii,
+        valid,
+        img_width=16,
+        img_height=16,
+        tile_size=16,
+    )
 
     assert result.sorted_gaussian_ids.numel() == 0
     assert torch.equal(result.tile_bins, torch.zeros_like(result.tile_bins))

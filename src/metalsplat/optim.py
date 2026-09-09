@@ -67,7 +67,9 @@ def migrate_optimizer_state(
     n_before_expected = None
     for g_old, g_new in zip(old_optimizer.param_groups, new_optimizer.param_groups):
         if len(g_old["params"]) != len(g_new["params"]):
-            raise ValueError("optimizer group layout changed: differing parameter counts")
+            raise ValueError(
+                "optimizer group layout changed: differing parameter counts"
+            )
 
         for p_old, p_new in zip(g_old["params"], g_new["params"]):
             state = old_optimizer.state.get(p_old)
@@ -80,7 +82,10 @@ def migrate_optimizer_state(
             migrated = {}
             for key in ("exp_avg", "exp_avg_sq"):
                 tensor = state[key]
-                if tensor.shape[0] == n_before_expected and p_new.shape[0] == source_index.shape[0]:
+                if (
+                    tensor.shape[0] == n_before_expected
+                    and p_new.shape[0] == source_index.shape[0]
+                ):
                     migrated[key] = _select(tensor, source_index)
                 else:
                     migrated[key] = tensor.clone()

@@ -30,7 +30,9 @@ class TileBinningResult:
     tiles_x: int
     tiles_y: int
     sorted_gaussian_ids: torch.Tensor  # (M,) int32, M = total (gaussian, tile) pairs
-    tile_bins: torch.Tensor  # (tiles_x * tiles_y, 2) int32, [start, end) into sorted_gaussian_ids
+    tile_bins: (
+        torch.Tensor
+    )  # (tiles_x * tiles_y, 2) int32, [start, end) into sorted_gaussian_ids
 
 
 @torch.no_grad()
@@ -65,7 +67,6 @@ def bin_and_sort_gaussians(
     idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)  # (K,)
     means2d_v = means2d[idx]
     depths_v = depths[idx]
-    radii_v = radii[idx]
 
     # Per-axis 3-sigma half-extents from the conic (the inverse 2D
     # covariance), not a circle of radius 3*sqrt(lambda_max). Bounding an
@@ -82,9 +83,13 @@ def bin_and_sort_gaussians(
     half_h = torch.where(degenerate, torch.zeros_like(half_h), half_h)
 
     min_tx = torch.clamp(((means2d_v[:, 0] - half_w) / tile_size).floor().long(), min=0)
-    max_tx = torch.clamp(((means2d_v[:, 0] + half_w) / tile_size).floor().long(), max=tiles_x - 1)
+    max_tx = torch.clamp(
+        ((means2d_v[:, 0] + half_w) / tile_size).floor().long(), max=tiles_x - 1
+    )
     min_ty = torch.clamp(((means2d_v[:, 1] - half_h) / tile_size).floor().long(), min=0)
-    max_ty = torch.clamp(((means2d_v[:, 1] + half_h) / tile_size).floor().long(), max=tiles_y - 1)
+    max_ty = torch.clamp(
+        ((means2d_v[:, 1] + half_h) / tile_size).floor().long(), max=tiles_y - 1
+    )
 
     tiles_touched_x = (max_tx - min_tx + 1).clamp(min=0)
     tiles_touched_y = (max_ty - min_ty + 1).clamp(min=0)
@@ -142,7 +147,9 @@ def bin_and_sort_gaussians(
 
     boundaries = torch.arange(num_tiles + 1, device=device)
     tile_starts_ends = torch.searchsorted(sorted_tile_ids, boundaries)
-    tile_bins = torch.stack([tile_starts_ends[:-1], tile_starts_ends[1:]], dim=-1).to(torch.int32)
+    tile_bins = torch.stack([tile_starts_ends[:-1], tile_starts_ends[1:]], dim=-1).to(
+        torch.int32
+    )
 
     return TileBinningResult(
         tile_size=tile_size,

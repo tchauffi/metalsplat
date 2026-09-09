@@ -37,7 +37,9 @@ def rasterize_gaussians(
         background = torch.zeros(3, device=device, dtype=dtype)
 
     valid_mask = valid > 0.5 if valid.dtype != torch.bool else valid
-    order = torch.argsort(torch.where(valid_mask, depths, torch.full_like(depths, float("inf"))))
+    order = torch.argsort(
+        torch.where(valid_mask, depths, torch.full_like(depths, float("inf")))
+    )
 
     ys, xs = torch.meshgrid(
         torch.arange(img_height, device=device, dtype=dtype) + 0.5,
@@ -55,7 +57,9 @@ def rasterize_gaussians(
             continue
         d = pixels - means2d[i]  # (H, W, 2)
         a, b, c = conics[i]
-        power = -0.5 * (a * d[..., 0] ** 2 + 2 * b * d[..., 0] * d[..., 1] + c * d[..., 1] ** 2)
+        power = -0.5 * (
+            a * d[..., 0] ** 2 + 2 * b * d[..., 0] * d[..., 1] + c * d[..., 1] ** 2
+        )
         alpha = (opacities[i] * torch.exp(power)).clamp(max=0.99)
         # Match the kernel's negligible-contribution cutoff and transmittance
         # early-termination exactly (not just approximately), so this stays
@@ -65,7 +69,9 @@ def rasterize_gaussians(
         # is equivalent to having broken out of the (unrollable, per-pixel)
         # loop early.
         active = trans >= 1e-4
-        alpha_eff = torch.where(active & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha))
+        alpha_eff = torch.where(
+            active & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha)
+        )
         weight = trans * alpha_eff
         image = image + weight[..., None] * colors[i]
         depth_map = depth_map + weight * depths[i]

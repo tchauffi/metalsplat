@@ -40,7 +40,9 @@ import torch
 from metalsplat import Camera, GaussianModel, render
 
 model = GaussianModel.random(n=5000, bound=1.0, device="mps")
-camera = Camera.identity(fx=128, fy=128, cx=64, cy=64, img_width=128, img_height=128).to("mps")
+camera = Camera.identity(
+    fx=128, fy=128, cx=64, cy=64, img_width=128, img_height=128
+).to("mps")
 
 image = render(model, camera)  # (H, W, 3), differentiable
 loss = image.pow(2).mean()

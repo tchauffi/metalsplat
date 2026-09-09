@@ -24,7 +24,9 @@ class EvalSH(torch.autograd.Function):
 
         if n > 0:
             lib = load_kernel("sh")
-            lib.sh_forward(sh_c, dirs_c, int(active_degree), int(num_coeffs), out_color, threads=n)
+            lib.sh_forward(
+                sh_c, dirs_c, int(active_degree), int(num_coeffs), out_color, threads=n
+            )
 
         ctx.save_for_backward(sh_c, dirs_c)
         ctx.n = n
@@ -44,8 +46,14 @@ class EvalSH(torch.autograd.Function):
         if n > 0:
             lib = load_kernel("sh")
             lib.sh_backward(
-                sh_coeffs, dirs, grad_color.contiguous(), int(ctx.active_degree),
-                int(ctx.num_coeffs), d_sh, d_dirs, threads=n,
+                sh_coeffs,
+                dirs,
+                grad_color.contiguous(),
+                int(ctx.active_degree),
+                int(ctx.num_coeffs),
+                d_sh,
+                d_dirs,
+                threads=n,
             )
 
         return d_sh, d_dirs, None  # active_degree is not differentiable

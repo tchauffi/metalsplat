@@ -77,7 +77,15 @@ class ProjectGaussians(torch.autograd.Function):
         return means2d, depths, conics, radii, valid, compensations
 
     @staticmethod
-    def backward(ctx, grad_means2d, grad_depths, grad_conics, grad_radii, grad_valid, grad_compensations):
+    def backward(
+        ctx,
+        grad_means2d,
+        grad_depths,
+        grad_conics,
+        grad_radii,
+        grad_valid,
+        grad_compensations,
+    ):
         means, scales, quats, rwc_flat, twc, valid = ctx.saved_tensors
         n = ctx.n
         device = means.device
@@ -112,7 +120,21 @@ class ProjectGaussians(torch.autograd.Function):
                 threads=n,
             )
 
-        return d_means, d_scales, d_quats, None, None, None, None, None, None, None, None, None, None
+        return (
+            d_means,
+            d_scales,
+            d_quats,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def project_gaussians(
@@ -136,5 +158,17 @@ def project_gaussians(
     metalsplat.reference.project_ref.ProjectionResult for field semantics.
     """
     return ProjectGaussians.apply(
-        means, scales, quats, R_wc, t_wc, fx, fy, cx, cy, img_width, img_height, near, eps2d
+        means,
+        scales,
+        quats,
+        R_wc,
+        t_wc,
+        fx,
+        fy,
+        cx,
+        cy,
+        img_width,
+        img_height,
+        near,
+        eps2d,
     )

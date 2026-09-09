@@ -102,7 +102,9 @@ def compute_3d_filter(
 
         # z / f is the world extent one pixel covers at that depth.
         focal = torch.maximum(fx, fy)
-        extent = torch.where(visible, z_safe / focal, torch.full_like(z_safe, float("inf")))
+        extent = torch.where(
+            visible, z_safe / focal, torch.full_like(z_safe, float("inf"))
+        )
         best = torch.minimum(best, extent.min(dim=1).values)
 
     unseen = torch.isinf(best)

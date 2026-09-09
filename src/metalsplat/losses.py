@@ -14,7 +14,9 @@ import torch.nn.functional as F
 DEFAULT_LAMBDA_DSSIM = 0.2
 
 
-def _gaussian_window(window_size: int, sigma: float, channels: int, device, dtype) -> torch.Tensor:
+def _gaussian_window(
+    window_size: int, sigma: float, channels: int, device, dtype
+) -> torch.Tensor:
     coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
     g1d = torch.exp(-(coords**2) / (2 * sigma**2))
     g1d = g1d / g1d.sum()
@@ -22,7 +24,9 @@ def _gaussian_window(window_size: int, sigma: float, channels: int, device, dtyp
     return g2d.expand(channels, 1, window_size, window_size).contiguous()
 
 
-def ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11, sigma: float = 1.5) -> torch.Tensor:
+def ssim(
+    pred: torch.Tensor, target: torch.Tensor, window_size: int = 11, sigma: float = 1.5
+) -> torch.Tensor:
     """pred, target: (H, W, C) in [0, 1]. Returns scalar mean SSIM over the image."""
     pred_c = pred.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
     target_c = target.permute(2, 0, 1).unsqueeze(0)
@@ -35,9 +39,17 @@ def ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11, sigma:
     mu_pred_sq, mu_target_sq = mu_pred.pow(2), mu_target.pow(2)
     mu_pred_target = mu_pred * mu_target
 
-    sigma_pred_sq = F.conv2d(pred_c * pred_c, window, padding=pad, groups=channels) - mu_pred_sq
-    sigma_target_sq = F.conv2d(target_c * target_c, window, padding=pad, groups=channels) - mu_target_sq
-    sigma_pred_target = F.conv2d(pred_c * target_c, window, padding=pad, groups=channels) - mu_pred_target
+    sigma_pred_sq = (
+        F.conv2d(pred_c * pred_c, window, padding=pad, groups=channels) - mu_pred_sq
+    )
+    sigma_target_sq = (
+        F.conv2d(target_c * target_c, window, padding=pad, groups=channels)
+        - mu_target_sq
+    )
+    sigma_pred_target = (
+        F.conv2d(pred_c * target_c, window, padding=pad, groups=channels)
+        - mu_pred_target
+    )
 
     c1, c2 = 0.01**2, 0.03**2
     ssim_map = ((2 * mu_pred_target + c1) * (2 * sigma_pred_target + c2)) / (
