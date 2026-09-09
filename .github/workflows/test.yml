@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    # Apple Silicon runner (M1+), free/unmetered on public repos.
+    # Note: MPS is unreliable on GitHub-hosted macOS runners, so
+    # MPS-only tests (guarded with torch.backends.mps.is_available())
+    # are expected to skip here rather than run. This job still
+    # catches import errors and exercises the CPU-only code paths.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest
