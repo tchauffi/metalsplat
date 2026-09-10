@@ -15,9 +15,10 @@ training cameras took. Left: RGB. Right: the depth pass -- expected depth
 per pixel, produced by the same forward rasterizer in the same pass.
 
 Trained by `examples/train_garden.py` and rendered by
-`examples/render_video.py`: 5000 iterations in 9.6 minutes on an M-series
-GPU, reaching **23.4 dB PSNR / 0.702 SSIM** on the 24 held-out views with
-435k gaussians.
+`examples/render_video.py`: 15000 iterations in 42 minutes on an M-series
+GPU, reaching **23.5 dB PSNR / 0.741 SSIM** on the 24 held-out views with
+330k gaussians. The trained scene renders back at **93 fps** at
+1297x840 (`examples/benchmark.py`).
 
 ## Requirements
 
