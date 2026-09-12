@@ -22,14 +22,27 @@ scene's own point spacing instead. The *shape* of the schedule (log-linear
 decay to 1% of the initial rate) is identical to the paper's, and every
 other hyperparameter is used exactly as published.
 
-The other deliberate, explicitly out-of-scope gap: this repo's 2DGS path
-has no adaptive density control yet (densify.py/seed.py are 3DGS-only), so
-unlike the paper this trains a *fixed* gaussian count (one per COLMAP
-sparse point, no split/clone/prune/reseed) for the full 30,000 iterations.
-The paper relies heavily on densification (from iteration 500 to 15,000)
-to allocate detail, so expect meaningfully lower quality than the paper's
-numbers -- this script reproduces its hyperparameters, not its full
-training-loop capability.
+Adaptive density control (split/clone/prune, see `metalsplat.densify2dgs`)
+runs on the paper's own schedule (`densify_from_iter=500` to
+`densify_until_iter=15000`, every `densification_interval=100` steps,
+`opacity_reset_interval=3000`) with one more deliberate deviation: the
+paper's literal `densify_grad_threshold=0.0002` is calibrated for a
+*plain* screen-space-gradient-norm signal, whereas this codebase's
+densification signal is AbsGS-style (sum of |gradient|, not the signed
+sum -- see `metalsplat.optim.SparseAdam`'s docstring and
+`train_garden.py`'s identical reasoning for why that's preferred here).
+The two signals live on different numeric scales, so reusing the paper's
+literal threshold could mean never densifying, or densifying everything,
+depending on luck. This reuses `train_garden.py`'s self-calibrating
+approach instead: the `densify_grad_percentile` quantile of the *first*
+densification round is frozen as an absolute bar for the rest of
+training. There is still no loss-driven seeding equivalent to
+`metalsplat.seed` for 2DGS, but the paper's own schedule doesn't have an
+equivalent of that either, so nothing is missing relative to the paper
+specifically.
+
+This repo's 2DGS path still has no `.ply` export, filter3d equivalent, or
+`seed_uncovered_regions` equivalent -- out of scope here, same as before.
 
 Usage: uv run python examples/train_garden_2dgs.py
 """
@@ -43,12 +56,14 @@ import torch
 
 from metalsplat import Gaussian2DModel, render_2dgs
 from metalsplat.data.colmap import load_colmap_scene
+from metalsplat.densify import reset_opacity
+from metalsplat.densify2dgs import densify_and_prune_2dgs
 from metalsplat.losses import (
     distortion_loss,
     gaussian_splatting_loss,
     normal_consistency_loss,
 )
-from metalsplat.optim import SparseAdam
+from metalsplat.optim import SparseAdam, migrate_optimizer_state
 
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
@@ -69,7 +84,18 @@ LAMBDA_DIST_START_ITER = 3000  # paper: `lambda_dist if iteration > 3000 else 0`
 SH_DEGREE = 3
 SH_DEGREE_INTERVAL = 1000  # paper: +1 band every 1000 steps (`oneupSHdegree`)
 INIT_OPACITY = 0.1  # paper default (`inverse_sigmoid(0.1 * ones(...))`)
+DENSIFY_START = 500  # paper: densify_from_iter
+DENSIFY_STOP = 15_000  # paper: densify_until_iter
+DENSIFY_INTERVAL = 100  # paper: densification_interval
+PRUNE_OPACITY_THRESH = 0.05  # paper: opacity_cull
+OPACITY_RESET_INTERVAL = (
+    3000  # paper default (reset_opacity()'s own 0.01 cap matches too)
+)
 # --- end paper defaults ---
+
+# Calibrated on the first densification round, then frozen -- see module
+# docstring for why this replaces the paper's literal densify_grad_threshold.
+DENSIFY_GRAD_PERCENTILE = 0.9
 
 EVAL_EVERY = 1000
 EVAL_HOLDOUT_STRIDE = 8
@@ -150,7 +176,7 @@ def main() -> None:
     print(
         f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval", flush=True
     )
-    print(f"{scene.points.shape[0]} sparse points (fixed -- no densification)")
+    print(f"{scene.points.shape[0]} initial sparse points")
 
     scene_scale = estimate_scene_scale(scene.points)
     init_scale = calibrate_initial_scale(scene.points, scene.cameras, scene_scale)
@@ -229,20 +255,31 @@ def main() -> None:
     save_image(scene.images[eval_idx[0]], OUT_DIR / "garden_2dgs_target_0.png")
     eval_and_save(0)
 
+    grad_accum = torch.zeros(model.num_points, device=DEVICE)
+    grad_count = torch.zeros(model.num_points, device=DEVICE)
+    # Calibrated on the first densification round, then held fixed -- see
+    # module docstring.
+    densify_threshold = None
+
     previous_sh_degree = model.active_sh_degree
     start = time.time()
     for step in range(1, NUM_ITERS + 1):
         t = step / NUM_ITERS
-        optimizer.param_groups[0]["lr"] = (
-            lr_means_init * (lr_means_final / lr_means_init) ** t
-        )
+        lr_means = lr_means_init * (lr_means_final / lr_means_init) ** t
+        optimizer.param_groups[0]["lr"] = lr_means
 
         idx = train_idx[int(torch.randint(len(train_idx), (1,)).item())]
         cam = scene.cameras[idx]
         target = scene.images[idx]
 
         optimizer.zero_grad()
-        aux = render_2dgs(model, cam, background=background, return_aux=True)
+        aux = render_2dgs(
+            model,
+            cam,
+            background=background,
+            return_aux=True,
+            abs_grad_accum=grad_accum,
+        )
         photo_loss = gaussian_splatting_loss(
             aux.image, target, lambda_dssim=LAMBDA_DSSIM
         )
@@ -256,19 +293,55 @@ def main() -> None:
         dist_loss = lambda_dist * distortion_loss(aux.distortion)
 
         loss = photo_loss + normal_loss + dist_loss
-        loss.backward()
-        optimizer.step(aux.valid > 0.5)
+        loss.backward()  # accumulates into grad_accum in place (AbsGS-style)
+        visible = aux.valid > 0.5
+        optimizer.step(visible)
+
+        with torch.no_grad():
+            grad_count[visible] += 1.0
 
         if step % 25 == 0 or step == 1:
             torch.mps.synchronize()
             elapsed = time.time() - start
             print(
-                f"step {step:5d}  loss {loss.item():.5f}  "
+                f"step {step:5d}  loss {loss.item():.5f}  n {model.num_points}  "
                 f"(photo {photo_loss.item():.5f}  normal {normal_loss.item():.5f}  "
                 f"dist {dist_loss.item():.5f})  "
                 f"({elapsed:.1f}s elapsed, {elapsed / step:.2f}s/step)",
                 flush=True,
             )
+
+        if DENSIFY_START <= step <= DENSIFY_STOP and step % DENSIFY_INTERVAL == 0:
+            model, stats = densify_and_prune_2dgs(
+                model,
+                grad_accum,
+                grad_count,
+                scene_scale=scene_scale,
+                grad_percentile=DENSIFY_GRAD_PERCENTILE,
+                prune_opacity_thresh=PRUNE_OPACITY_THRESH,
+                grad_threshold=densify_threshold,
+            )
+            if densify_threshold is None:
+                densify_threshold = stats.grad_threshold
+                print(
+                    f"  densify threshold calibrated to {densify_threshold:.3e} "
+                    f"(p{100 * DENSIFY_GRAD_PERCENTILE:.0f} of round 1); fixed from here",
+                    flush=True,
+                )
+            optimizer = migrate_optimizer_state(
+                optimizer, make_optimizer(model, lr_means), stats.source_index
+            )
+            grad_accum = torch.zeros(model.num_points, device=DEVICE)
+            grad_count = torch.zeros(model.num_points, device=DEVICE)
+            print(
+                f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
+                f"(+{stats.n_split} split, +{stats.n_cloned} cloned, -{stats.n_pruned} pruned)",
+                flush=True,
+            )
+
+        if OPACITY_RESET_INTERVAL and step % OPACITY_RESET_INTERVAL == 0:
+            reset_opacity(model)
+            print(f"  opacity reset @ step {step}", flush=True)
 
         if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
             active = model.increase_sh_degree()
@@ -281,7 +354,7 @@ def main() -> None:
 
     eval_and_save(NUM_ITERS)
     print(
-        f"Done. Renders saved to {OUT_DIR}. "
+        f"Done. {model.num_points} gaussians. Renders saved to {OUT_DIR}. "
         "(.ply export isn't implemented for Gaussian2DModel yet.)",
         flush=True,
     )
