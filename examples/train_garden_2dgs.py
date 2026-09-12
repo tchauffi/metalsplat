@@ -112,6 +112,12 @@ from metalsplat.optim import SparseAdam, migrate_optimizer_state
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
 OUT_DIR = Path(__file__).parent
+# >1.0 resizes every loaded image by 1/RESOLUTION_DOWNSCALE (2.0 = half
+# resolution) before training -- fewer pixels means faster steps (every
+# render/backward pays for H*W pixels), at the cost of fine detail. See
+# metalsplat.data.colmap.load_colmap_scene's docstring; intrinsics are
+# rescaled automatically, no other change needed.
+RESOLUTION_DOWNSCALE = 2.0
 
 # --- 2DGS paper defaults (arguments/__init__.py's OptimizationParams) ---
 NUM_ITERS = 11_000
@@ -231,12 +237,15 @@ def main() -> None:
         raise FileNotFoundError(f"Expected COLMAP scene at {DATA_ROOT}")
 
     print("Loading COLMAP scene...", flush=True)
-    scene = load_colmap_scene(DATA_ROOT, device=DEVICE)
+    scene = load_colmap_scene(DATA_ROOT, device=DEVICE, downscale=RESOLUTION_DOWNSCALE)
     n_images = len(scene.cameras)
     eval_idx = list(range(0, n_images, EVAL_HOLDOUT_STRIDE))
     train_idx = [i for i in range(n_images) if i not in set(eval_idx)]
+    cam0 = scene.cameras[0]
     print(
-        f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval", flush=True
+        f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval "
+        f"({cam0.img_width}x{cam0.img_height}, downscale={RESOLUTION_DOWNSCALE})",
+        flush=True,
     )
     print(f"{scene.points.shape[0]} initial sparse points")
 

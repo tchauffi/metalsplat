@@ -75,3 +75,24 @@ def test_image_store_supports_slicing():
     assert len(chunk) == 3
     assert all(t.dtype == torch.float32 for t in chunk)
     assert torch.allclose(chunk[0], torch.full((2, 2, 3), 1 / 255))
+
+
+def test_downscale_halves_resolution_and_rescales_intrinsics():
+    full = load_colmap_scene(GARDEN_ROOT)
+    half = load_colmap_scene(GARDEN_ROOT, downscale=2.0)
+
+    cam_full, cam_half = full.cameras[0], half.cameras[0]
+    # round(), not exact division -- odd source dimensions round to the
+    # nearest pixel, same as PIL's own resize.
+    assert cam_half.img_width == round(cam_full.img_width / 2)
+    assert cam_half.img_height == round(cam_full.img_height / 2)
+
+    img_full, img_half = full.images[0], half.images[0]
+    assert img_half.shape[:2] == (cam_half.img_height, cam_half.img_width)
+    assert img_full.shape[:2] == (cam_full.img_height, cam_full.img_width)
+
+    # Intrinsics rescale with the actual image size, same mechanism that
+    # already handles pre-downsampled image directories (e.g. images_4).
+    scale = cam_half.img_width / cam_full.img_width
+    assert abs(cam_half.fx - cam_full.fx * scale) < 1e-3
+    assert abs(cam_half.cx - cam_full.cx * scale) < 1e-3
