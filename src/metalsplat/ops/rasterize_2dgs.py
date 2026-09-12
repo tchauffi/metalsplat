@@ -61,6 +61,13 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         out_distortion = torch.zeros(
             img_height, img_width, device=device, dtype=torch.float32
         )
+        # Sum of weight*m (normalized depth) per pixel. Not a user-facing
+        # output: backward seeds the distortion recursion's running prefix
+        # sum from it, and it is a *different* accumulation from out_depth
+        # (which sums weight*z in metric units).
+        out_dist_depth = torch.zeros(
+            img_height, img_width, device=device, dtype=torch.float32
+        )
         out_final_T = torch.ones(
             img_height, img_width, device=device, dtype=torch.float32
         )
@@ -93,6 +100,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 out_depth,
                 out_normal,
                 out_distortion,
+                out_dist_depth,
                 out_final_T,
                 out_last_contributor,
                 threads=(width_padded, height_padded),
@@ -108,7 +116,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
             depths_c,
             sorted_ids_i32,
             tile_bins_i32,
-            out_depth,
+            out_dist_depth,
             out_final_T,
             out_last_contributor,
             background,
@@ -144,7 +152,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
             depths,
             sorted_ids,
             tile_bins,
-            out_depth,
+            dist_depth,
             final_T,
             last_contributor,
             background,
@@ -186,7 +194,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 float(ctx.eps2d),
                 background,
                 final_T,
-                out_depth,
+                dist_depth,
                 last_contributor,
                 grad_out_image.contiguous(),
                 grad_out_depth.contiguous(),
@@ -257,7 +265,10 @@ def rasterize_gaussians_2dgs(
     `rasterize_gaussians`, `depth` and `normal` here carry real gradients
     (the ray-splat intersection depth is differentiable), and `distortion`
     is the per-pixel Mip-NeRF-360/2DGS regularizer map (sum over
-    contributing gaussian pairs of `w_i*w_j*|z_i-z_j|`) -- feed
+    contributing gaussian pairs of `w_i*w_j*|m_i-m_j|`, on *normalized*
+    depth `m = far/(far-near)*(1-near/z)` rather than metric z, matching
+    the official implementation -- see
+    `metalsplat.reference.rasterize_2dgs_ref`'s module docstring) -- feed
     `distortion.mean()`-style reductions to `metalsplat.losses.
     distortion_loss`. `final_T` is the per-pixel final transmittance,
     forward-only, same convention as 3DGS.

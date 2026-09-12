@@ -95,8 +95,13 @@ def test_forward_matches_reference(n):
     assert torch.allclose(image, ref["image"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(depth, ref["depth"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(normal, ref["normal"], atol=1e-2, rtol=1e-2)
-    assert torch.allclose(distortion, ref["distortion"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(final_T, ref["final_T"], atol=1e-2, rtol=1e-2)
+    # Distortion needs its own, much tighter bound: it runs on *normalized*
+    # depth (see rasterize_2dgs_ref's module docstring), so its values sit
+    # around 1e-2 rather than O(1) like the maps above -- the shared 1e-2
+    # tolerance would pass no matter what the kernel computed. Measured max
+    # absolute deviation here is ~1e-7.
+    assert torch.allclose(distortion, ref["distortion"], atol=1e-4, rtol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 5, 40])
@@ -226,3 +231,75 @@ def test_abs_grad_accum_mutates_in_place_and_nonzero():
     assert abs_accum is accum_before
     assert (abs_accum >= 0).all()
     assert (abs_accum > 0).any()
+
+
+@pytest.mark.parametrize("n", [5, 40])
+def test_distortion_backward_matches_reference_in_isolation(n):
+    """Distortion-only upstream gradient.
+
+    `test_backward_matches_reference` sums image/depth/normal/distortion
+    gradients into one loss, and since distortion runs on normalized depth
+    its contribution there is ~1e-4 of the others -- well inside that
+    test's tolerance, so it would not notice if the distortion backward
+    (its closed-form alpha chain, and the dm/dz factor that maps its depth
+    gradient back to metric units) were wrong. This isolates it.
+    """
+    proj, opacities, colors = _random_scene(n, seed=1)
+    n_transform = proj.transform.reshape(n, 9)
+
+    means2d_ref = proj.means2d.clone().requires_grad_()
+    transform_ref = proj.transform.clone().requires_grad_()
+    opacities_ref = opacities.clone().requires_grad_()
+
+    ref = rasterize_gaussians_2dgs_ref(
+        means2d_ref,
+        proj.depths,
+        transform_ref,
+        proj.normal,
+        opacities_ref,
+        colors,
+        proj.valid,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    g = torch.Generator().manual_seed(11)
+    up_dist = torch.randn(H, W, generator=g)
+    (ref["distortion"] * up_dist).sum().backward()
+
+    means2d_mps = proj.means2d.to("mps").requires_grad_()
+    transform_mps = n_transform.to("mps").requires_grad_()
+    opacities_mps = opacities.to("mps").requires_grad_()
+
+    out = rasterize_gaussians_2dgs(
+        means2d_mps,
+        transform_mps,
+        proj.normal.to("mps"),
+        opacities_mps,
+        colors.to("mps"),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    (out[3] * up_dist.to("mps")).sum().backward()
+    torch.mps.synchronize()
+
+    # The gradients themselves are O(0.1-1) even though the distortion map
+    # is small, so these are ordinary tolerances, not inflated ones.
+    # Measured max deviation ~6e-6.
+    assert opacities_ref.grad.abs().max() > 1e-3, "scene exercises no distortion"
+    assert torch.allclose(
+        transform_mps.grad.cpu(), transform_ref.grad.reshape(n, 9), atol=1e-3, rtol=1e-2
+    )
+    assert torch.allclose(
+        opacities_mps.grad.cpu(), opacities_ref.grad, atol=1e-3, rtol=1e-2
+    )
+    assert torch.allclose(
+        means2d_mps.grad.cpu(), means2d_ref.grad, atol=1e-3, rtol=1e-2
+    )

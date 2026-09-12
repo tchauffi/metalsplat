@@ -16,9 +16,9 @@ module's plain recursion before being written into the kernel.
 
 Distortion is defined on the *compositing sequence* (gaussians sorted by
 mean depth, the same order used for alpha blending), as
-`2 * sum_k w_k * (z_k * A_{k-1} - D_{k-1})` where `A`/`D` are running
-prefix sums of weight / weight*z_hit -- algebraically equal to
-`sum_{i<j} w_i*w_j*(z_j - z_i)` over that *sequence* order. This is *not*
+`2 * sum_k w_k * (m_k * A_{k-1} - D_{k-1})` where `A`/`D` are running
+prefix sums of weight / weight*m -- algebraically equal to
+`sum_{i<j} w_i*w_j*(m_j - m_i)` over that *sequence* order. This is *not*
 the same as `sum_i sum_j w_i*w_j*|z_i - z_j|` re-sorted by actual
 intersection depth: 2DGS's exact per-pixel ray-splat intersection depth
 can differ from a gaussian's mean depth enough that the compositing
@@ -31,11 +31,30 @@ the same order-dependent definition the Metal kernel's running-sum forward
 uses -- the two must never be allowed to diverge (e.g. one re-sorting by
 `z_hit`, the other not), or kernel-vs-reference tests stop being a
 meaningful check of anything.
+
+`m` is *not* the raw metric intersection depth: it is the normalized
+inverse-depth `m = far/(far - near) * (1 - near/z_hit)`, which maps
+`z_hit` in `[near, far]` onto `[0, 1]`. This matches the official 2DGS
+CUDA rasterizer (`diff-surfel-rasterization`'s `forward.cu`, which
+computes exactly this `m` from its `near_n = 0.2` / `far_n = 100.0`
+constants) and it is what makes the paper's own `lambda_dist` values
+(100 for unbounded scenes, 1000 for bounded ones) meaningful. Accumulating
+raw metric `z_hit` instead would make the regularizer's magnitude scale
+with the square of the scene's units -- at a typical 5m depth, ~4 orders
+of magnitude larger -- so a `lambda_dist` copied from the paper would
+swamp the photometric loss entirely. `near` is this function's own `near`
+parameter (so the two stay consistent if it is changed); `far` is
+`DISTORTION_FAR`, matching the official implementation's hardcoded
+constant.
 """
 
 from __future__ import annotations
 
 import torch
+
+# Far plane used only to normalize depth for the distortion regularizer.
+# Matches diff-surfel-rasterization's `__device__ const float far_n = 100.0`.
+DISTORTION_FAR = 100.0
 
 
 def rasterize_gaussians_2dgs(
@@ -86,9 +105,10 @@ def rasterize_gaussians_2dgs(
 
     # Running prefix sums for the distortion telescoping recursion (see
     # module docstring): A = sum of weights so far, D = sum of
-    # weight*z_hit so far, in compositing-sequence order.
+    # weight*m so far (m = normalized depth), in compositing-sequence order.
     dist_A = torch.zeros(img_height, img_width, device=device, dtype=dtype)
     dist_D = torch.zeros(img_height, img_width, device=device, dtype=dtype)
+    dist_scale = DISTORTION_FAR / (DISTORTION_FAR - near)
 
     for i in order:
         if not bool(valid_mask[i]):
@@ -153,12 +173,18 @@ def rasterize_gaussians_2dgs(
         )
         weight = trans * alpha_eff
 
+        # Normalized depth for the distortion regularizer only -- `depth_map`
+        # stays in metric units. Clamped at `near` purely to keep `near/z`
+        # finite: alpha (hence weight) is already exactly 0 wherever
+        # `z_hit <= near`, so the clamp never touches a contributing term.
+        m = dist_scale * (1.0 - near / z_hit.clamp_min(near))
+
         image = image + weight[..., None] * colors[i]
         depth_map = depth_map + weight * z_hit
         normal_map = normal_map + weight[..., None] * normal[i]
-        distortion_map = distortion_map + 2.0 * weight * (z_hit * dist_A - dist_D)
+        distortion_map = distortion_map + 2.0 * weight * (m * dist_A - dist_D)
         dist_A = dist_A + weight
-        dist_D = dist_D + weight * z_hit
+        dist_D = dist_D + weight * m
         trans = trans * (1 - alpha_eff)
 
     image = image + trans[..., None] * background

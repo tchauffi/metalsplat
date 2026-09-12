@@ -3,9 +3,9 @@ data/garden, using the 2D Gaussian Splatting paper's (Huang et al. 2024)
 own hyperparameters: per-group learning rates (feature/opacity/scaling/
 rotation held constant, only position decayed), lambda_dssim=0.2,
 lambda_normal=0.05 (active after iteration 7000), lambda_dist=0.0 (active
-after iteration 3000; 0 is the paper's own default for general/unbounded
-scenes -- raise it for bounded, object-centric scenes), SH degree 3 grown
-by one band every 1000 steps, and 30,000 total iterations -- all read
+after iteration 3000; 0 is the reference repo's shipped default, while the
+paper itself uses 100 for unbounded scenes and 1000 for bounded ones), SH
+degree 3 grown by one band every 1000 steps, and 30,000 total iterations -- all read
 directly off the official reference implementation's `arguments/__init__.py`
 `OptimizationParams` and `train.py`'s loss/schedule
 (https://github.com/hbb1/2d-gaussian-splatting).
@@ -129,7 +129,11 @@ ROTATION_LR = 0.001
 LAMBDA_DSSIM = 0.2
 LAMBDA_NORMAL = 0.05
 LAMBDA_NORMAL_START_ITER = 7000  # paper: `lambda_normal if iteration > 7000 else 0`
-LAMBDA_DIST = 0.0  # paper default for general/unbounded scenes; raise for bounded ones
+# The reference repo ships 0.0; the paper uses 100 (unbounded) / 1000
+# (bounded). Those values transfer directly: the distortion map is computed
+# on normalized depth, matching the official CUDA rasterizer (see
+# metalsplat.reference.rasterize_2dgs_ref's module docstring).
+LAMBDA_DIST = 0.0
 LAMBDA_DIST_START_ITER = 3000  # paper: `lambda_dist if iteration > 3000 else 0`
 SH_DEGREE = 3
 SH_DEGREE_INTERVAL = 1000  # paper: +1 band every 1000 steps (`oneupSHdegree`)

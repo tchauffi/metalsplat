@@ -1,8 +1,12 @@
+import pytest
 import torch
 
 from metalsplat.reference.project_2dgs_ref import project_gaussians_2dgs
 from metalsplat.reference.project_ref import project_gaussians
-from metalsplat.reference.rasterize_2dgs_ref import rasterize_gaussians_2dgs
+from metalsplat.reference.rasterize_2dgs_ref import (
+    DISTORTION_FAR,
+    rasterize_gaussians_2dgs,
+)
 from metalsplat.reference.rasterize_ref import rasterize_gaussians
 
 IDENTITY_R = torch.eye(3)
@@ -194,3 +198,62 @@ def test_distortion_positive_for_overlapping_gaussians_at_different_depths():
     # Center pixel is covered by both overlapping, differently-depthed
     # disks, so its distortion should be strictly positive.
     assert result["distortion"][50, 50] > 0
+
+
+def test_distortion_uses_normalized_depth_not_metric_depth():
+    """Pins the distortion regularizer's depth parameterization.
+
+    Two front-facing disks on the optical axis, at known depths, produce a
+    two-term compositing sequence at the principal-point pixel whose
+    distortion is exactly `2*w1*w2*(m2 - m1)` -- with `m` the *normalized*
+    inverse depth `far/(far-near)*(1 - near/z)` the official 2DGS CUDA
+    rasterizer uses, not the raw metric `z`. Both alphas are exact there
+    (the optical-axis ray hits each disk at u=v=0, so rho=0 and
+    alpha=opacity), which makes the expected value fully analytic.
+
+    This matters beyond parameterization taste: accumulating metric `z`
+    instead inflates the term by ~4 orders of magnitude at ordinary scene
+    depths, which would silently make the paper's own `lambda_dist` values
+    swamp the photometric loss. Guards against a regression to metric depth.
+    """
+    near, z1, z2 = 0.2, 3.0, 7.0
+    o1, o2 = 0.5, 0.6
+    fx = fy = 100.0
+    cx = cy = 1.5  # principal point lands exactly on pixel (1, 1)'s center
+    w = h = 3
+
+    means = torch.tensor([[0.0, 0.0, z1], [0.0, 0.0, z2]])
+    scales = torch.tensor([[0.5, 0.5], [0.5, 0.5]])
+    quats = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    opacities = torch.tensor([o1, o2])
+    colors = torch.tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+
+    proj = project_gaussians_2dgs(
+        means, scales, quats, IDENTITY_R, ZERO_T, fx, fy, cx, cy, w, h, near=near
+    )
+    out = rasterize_gaussians_2dgs(
+        proj.means2d,
+        proj.depths,
+        proj.transform,
+        proj.normal,
+        opacities,
+        colors,
+        proj.valid,
+        w,
+        h,
+        near=near,
+    )
+
+    far = DISTORTION_FAR
+    m1 = far / (far - near) * (1.0 - near / z1)
+    m2 = far / (far - near) * (1.0 - near / z2)
+    w1 = o1
+    w2 = (1.0 - o1) * o2
+    expected = 2.0 * w1 * w2 * (m2 - m1)
+
+    assert out["distortion"][1, 1].item() == pytest.approx(expected, rel=1e-5)
+
+    # And the metric-depth version it must NOT be -- three orders of
+    # magnitude apart, so this can never pass by coincidence.
+    metric = 2.0 * w1 * w2 * (z2 - z1)
+    assert abs(metric / expected) > 100.0
