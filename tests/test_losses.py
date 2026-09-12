@@ -103,17 +103,21 @@ def test_normal_consistency_positive_for_wrong_normal():
     assert loss.item() > 0.9  # 1 - dot(perpendicular vectors) == 1
 
 
-def test_normal_consistency_gradients_flow_to_rendered_normal_only():
-    # The pseudo-normal (derived from depth) is deliberately `.detach()`ed
-    # (see the function's docstring): this loss pulls the *rendered*
-    # normal toward depth-implied geometry, it does not also backprop into
-    # depth itself (that's what the photometric/distortion losses are
-    # for) -- so `depth` must get no gradient here, only `rendered_normal`.
+def test_normal_consistency_gradients_flow_to_both_normal_and_depth():
+    # The pseudo-normal (derived from depth) is *not* detached (matching
+    # the official 2DGS reference implementation, see the function's
+    # docstring): gradient reaches both `rendered_normal` (the direct
+    # comparison) and `rendered_depth` (via the pseudo-normal's own
+    # construction).
     camera, depth, normal = _fronto_parallel_scene()
-    depth = depth.clone().requires_grad_()
+    # A tilted plane so depth actually varies spatially -- a perfectly
+    # flat depth's pseudo-normal gradient w.r.t. depth is degenerate at
+    # the cross product's own critical point.
+    h, w = depth.shape
+    tilt = torch.linspace(-0.5, 0.5, w).unsqueeze(0).expand(h, w)
+    depth = (depth + tilt).clone().requires_grad_()
     normal = normal.clone().requires_grad_()
     loss = normal_consistency_loss(normal, depth, camera)
     loss.backward()
-    assert depth.grad is None
-    assert normal.grad is not None
-    assert torch.isfinite(normal.grad).all()
+    assert depth.grad is not None and torch.isfinite(depth.grad).all()
+    assert normal.grad is not None and torch.isfinite(normal.grad).all()

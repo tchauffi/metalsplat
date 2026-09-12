@@ -106,11 +106,11 @@ def normal_consistency_loss(
     3D points) -- teaches depth and normals to agree with each other,
     which is what makes the reconstructed surface usable for meshing.
 
-    The pseudo-normal is `.detach()`ed -- treated as a fixed target for
-    this loss term (the common, more stable choice in reimplementations)
-    rather than differentiated through; gradient still reaches
-    `rendered_depth` via the comparison, just not via the pseudo-normal's
-    own construction.
+    The pseudo-normal is *not* detached: gradient flows into both
+    `rendered_normal` and `rendered_depth`, matching the official 2DGS
+    reference implementation's `depth_to_normal`/loss (no `.detach()`
+    anywhere in that path) -- letting both sides move toward mutual
+    consistency, not just the rendered normal toward a fixed target.
 
     Only defined on interior pixels (finite differences need both
     neighbours), so this compares `rendered_normal[1:-1, 1:-1]` against
@@ -131,7 +131,7 @@ def normal_consistency_loss(
 
     dx = points_world[1:-1, 2:, :] - points_world[1:-1, :-2, :]
     dy = points_world[2:, 1:-1, :] - points_world[:-2, 1:-1, :]
-    pseudo_normal = F.normalize(torch.linalg.cross(dx, dy, dim=-1), dim=-1).detach()
+    pseudo_normal = F.normalize(torch.linalg.cross(dx, dy, dim=-1), dim=-1)
 
     normal_interior = rendered_normal[1:-1, 1:-1, :]
     # Align sign to the (already camera-facing) rendered normal rather than
