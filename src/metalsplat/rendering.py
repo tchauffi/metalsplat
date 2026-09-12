@@ -187,6 +187,7 @@ def render_2dgs(
     tile_size: int = DEFAULT_TILE_SIZE,
     background: torch.Tensor | None = None,
     return_aux: bool = False,
+    abs_grad_accum: torch.Tensor | None = None,
 ):
     """Renders `model` (a `Gaussian2DModel`) from `camera`'s viewpoint.
 
@@ -202,6 +203,12 @@ def render_2dgs(
     `distortion.mean()`-style reductions feed `metalsplat.losses.
     distortion_loss`; `depth`/`normal` feed
     `metalsplat.losses.normal_consistency_loss`.
+
+    `abs_grad_accum`, if given, is passed through to
+    `rasterize_gaussians_2dgs`: an (N,) tensor that backward() atomically
+    adds each gaussian's AbsGS-style densification signal into -- see
+    that function's docstring and `metalsplat.densify2dgs` for how it's
+    used.
     """
     means2d, depths, conics, radii, valid, _compensation, transform, normal = (
         project_gaussians_2dgs(
@@ -245,6 +252,7 @@ def render_2dgs(
         near=near,
         eps2d=eps2d,
         background=background,
+        abs_grad_accum=abs_grad_accum,
     )
     if return_aux:
         return Render2DGSAux(

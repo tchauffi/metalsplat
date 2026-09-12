@@ -31,6 +31,8 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         near: float,
         eps2d: float,
         background: torch.Tensor,  # (3,) float32
+        abs_grad_accum: torch.Tensor
+        | None,  # (N,), mutated in place by backward -- see below
     ):
         device = means2d.device
         n = means2d.shape[0]
@@ -119,6 +121,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         ctx.near = near
         ctx.eps2d = eps2d
         ctx.n = n
+        ctx.abs_grad_accum = abs_grad_accum
         return out_image, out_depth, out_normal, out_distortion, out_final_T
 
     @staticmethod
@@ -154,6 +157,12 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         d_normal = torch.zeros(n, 3, device=device, dtype=torch.float32)
         d_opacities = torch.zeros(n, device=device, dtype=torch.float32)
         d_colors = torch.zeros(n, 3, device=device, dtype=torch.float32)
+        # AbsGS-style densification signal (see kernels/rasterize_2dgs.metal):
+        # if the caller passed a persistent accumulator, the kernel adds
+        # into it in place -- same convention as ops/rasterize.py.
+        abs_grad_accum = ctx.abs_grad_accum
+        if abs_grad_accum is None:
+            abs_grad_accum = torch.zeros(n, device=device, dtype=torch.float32)
 
         width_padded = ctx.tiles_x * ctx.tile_size
         height_padded = ctx.tiles_y * ctx.tile_size
@@ -188,6 +197,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 d_normal,
                 d_opacities,
                 d_colors,
+                abs_grad_accum,
                 threads=(width_padded, height_padded),
                 group_size=(ctx.tile_size, ctx.tile_size),
             )
@@ -195,13 +205,14 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         # One gradient per forward() input: means2d, transform, normal,
         # opacities, colors get real gradients; depths, sorted_ids,
         # tile_bins, tiles_x, img_width, img_height, tile_size, near,
-        # eps2d, background don't.
+        # eps2d, background, abs_grad_accum don't.
         return (
             d_means2d,
             d_transform,
             d_normal,
             d_opacities,
             d_colors,
+            None,
             None,
             None,
             None,
@@ -231,6 +242,7 @@ def rasterize_gaussians_2dgs(
     near: float = 0.2,
     eps2d: float = 0.3,
     background: torch.Tensor | None = None,
+    abs_grad_accum: torch.Tensor | None = None,
 ):
     """Tile-based differentiable ray-splat rasterization of 2D gaussians.
 
@@ -249,6 +261,15 @@ def rasterize_gaussians_2dgs(
     `distortion.mean()`-style reductions to `metalsplat.losses.
     distortion_loss`. `final_T` is the per-pixel final transmittance,
     forward-only, same convention as 3DGS.
+
+    `abs_grad_accum`, if given, is an (N,) tensor that backward()
+    atomically adds each gaussian's screen-space AbsGS-style
+    densification signal into -- see kernels/rasterize_2dgs.metal's
+    backward derivation note for how it's recovered from the ray-splat
+    path (most pixels don't take the screen-space-fallback path that a
+    literal `d_means2d` would only capture). Prefer this over
+    `means2d.grad.norm()` for `metalsplat.densify2dgs`, matching 3DGS's
+    `rendering.render`/`metalsplat.densify` convention.
     """
     binning = bin_and_sort_gaussians(
         means2d.detach(),
@@ -280,4 +301,5 @@ def rasterize_gaussians_2dgs(
         near,
         eps2d,
         background,
+        abs_grad_accum,
     )

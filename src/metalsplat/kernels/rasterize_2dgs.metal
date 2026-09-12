@@ -245,6 +245,7 @@ kernel void rasterize_2dgs_backward(
     device atomic_float* d_normal,                                 // (N,3)
     device atomic_float* d_opacities,                               // (N,)
     device atomic_float* d_colors,                                   // (N,3)
+    device atomic_float* d_means2d_abs,                               // (N,) AbsGS-style densification signal
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint2 local_pos [[thread_position_in_threadgroup]],
     uint local_idx [[thread_index_in_threadgroup]],
@@ -316,6 +317,7 @@ kernel void rasterize_2dgs_backward(
             float3 g_normal = float3(0.0), g_color = float3(0.0);
             float2 g_mean2d = float2(0.0);
             float g_opacity = 0.0;
+            float g_abs = 0.0;
 
             if (active && (batch_start + j) <= last) {
                 float3 row0 = sh_row0[j], row1 = sh_row1[j], row2 = sh_row2[j];
@@ -385,6 +387,28 @@ kernel void rasterize_2dgs_backward(
                         g_row2 = (lam1 * pcx + lam2 * pcy) * uv1 + d_row2_direct;
                     }
 
+                    // AbsGS-style densification signal, in the same
+                    // screen-space (pixel) units as 3DGS's rasterize.metal
+                    // uses. Two mutually-exclusive-per-pixel sources:
+                    // the screen-space-fallback branch's direct d_mean2d
+                    // (g_mean2d, already computed above), and -- the
+                    // dominant one in practice, since most well-resolved
+                    // pixels take the ray-splat branch, not the fallback
+                    // -- the ray-splat branch's own sensitivity to the
+                    // gaussian's *screen-projected* center, recovered from
+                    // g_row0.z/g_row1.z (the mean-column entries of
+                    // d_transform, i.e. d(row0[2])/d(row1[2])) via the
+                    // exact identity row0[2] = means2d.x * z_hit (row0[2]
+                    // is the pixel-x numerator, row2[2] the depth -- see
+                    // project_2dgs_ref), so d(means2d.x) = g_row0.z *
+                    // z_hit at fixed z_hit. This mirrors the official
+                    // 2DGS CUDA rasterizer's dL_dmean2D, which is
+                    // likewise derived from dL_dtransMat's mean-column
+                    // entries scaled by depth (diff-surfel-rasterization's
+                    // backward.cu), not from a screen-fallback-only term.
+                    float2 g_mean2d_equiv = g_mean2d + float2(g_row0.z, g_row1.z) * z_hit;
+                    g_abs = length(g_mean2d_equiv);
+
                     A_color = alpha * color + (1.0 - alpha) * A_color;
                     A_depth = alpha * z_hit + (1.0 - alpha) * A_depth;
                     A_normal = alpha * normal_g + (1.0 - alpha) * A_normal;
@@ -403,11 +427,13 @@ kernel void rasterize_2dgs_backward(
             float r_colx = simd_sum(g_color.x), r_coly = simd_sum(g_color.y), r_colz = simd_sum(g_color.z);
             float r_mx = simd_sum(g_mean2d.x), r_my = simd_sum(g_mean2d.y);
             float r_op = simd_sum(g_opacity);
+            float r_abs = simd_sum(g_abs);
 
             if (lane == 0) {
                 bool any = (r_row0x!=0.0)||(r_row0y!=0.0)||(r_row0z!=0.0)
                         || (r_row1x!=0.0)||(r_row1y!=0.0)||(r_row1z!=0.0)
                         || (r_row2x!=0.0)||(r_row2y!=0.0)||(r_row2z!=0.0)
+                        || (r_abs!=0.0)
                         || (r_nx!=0.0)||(r_ny!=0.0)||(r_nz!=0.0)
                         || (r_colx!=0.0)||(r_coly!=0.0)||(r_colz!=0.0)
                         || (r_mx!=0.0)||(r_my!=0.0)||(r_op!=0.0);
@@ -431,6 +457,7 @@ kernel void rasterize_2dgs_backward(
                     atomic_fetch_add_explicit(&d_means2d[gid*2+0], r_mx, memory_order_relaxed);
                     atomic_fetch_add_explicit(&d_means2d[gid*2+1], r_my, memory_order_relaxed);
                     atomic_fetch_add_explicit(&d_opacities[gid], r_op, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&d_means2d_abs[gid], r_abs, memory_order_relaxed);
                 }
             }
         }

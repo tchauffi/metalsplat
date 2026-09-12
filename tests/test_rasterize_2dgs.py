@@ -187,3 +187,42 @@ def test_backward_matches_reference(n):
         opacities_mps.grad.cpu(), opacities_ref.grad, atol=1e-1, rtol=5e-2
     )
     assert torch.allclose(colors_mps.grad.cpu(), colors_ref.grad, atol=1e-1, rtol=5e-2)
+
+
+def test_abs_grad_accum_mutates_in_place_and_nonzero():
+    # Unlike 3DGS (where means2d feeds the alpha computation directly),
+    # most well-resolved pixels here take the exact ray-splat branch, not
+    # the screen-space fallback that a literal d_means2d would capture --
+    # so this only checks basic wiring (buffer size, atomic writes land)
+    # rather than replicating 3DGS's sign-cancellation test, which relies
+    # on means2d being the primary differentiable path.
+    n = 20
+    proj, opacities, colors = _random_scene(n, seed=2)
+
+    abs_accum = torch.zeros(n, device="mps")
+    accum_before = abs_accum
+
+    means2d_mps = proj.means2d.to("mps").requires_grad_()
+    transform_mps = proj.transform.reshape(n, 9).to("mps").requires_grad_()
+    out = rasterize_gaussians_2dgs(
+        means2d_mps,
+        transform_mps,
+        proj.normal.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+        abs_grad_accum=abs_accum,
+    )
+    out[0].sum().backward()
+    torch.mps.synchronize()
+
+    assert abs_accum is accum_before
+    assert (abs_accum >= 0).all()
+    assert (abs_accum > 0).any()
