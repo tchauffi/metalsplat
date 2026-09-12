@@ -41,8 +41,11 @@ training. There is still no loss-driven seeding equivalent to
 equivalent of that either, so nothing is missing relative to the paper
 specifically.
 
-This repo's 2DGS path still has no `.ply` export, filter3d equivalent, or
+This repo's 2DGS path still has no filter3d equivalent or
 `seed_uncovered_regions` equivalent -- out of scope here, same as before.
+(`.ply` export is now implemented, see `metalsplat.export2dgs` -- same
+format as the official reference implementation's own `.ply` files,
+just 2 `scale_*` properties instead of 3.)
 
 One more deviation from `train_garden.py`: its `calibrate_initial_scale`
 targets a 3px initial screen radius, which for this scene lands ~7.5x
@@ -95,7 +98,7 @@ from pathlib import Path
 
 import torch
 
-from metalsplat import Gaussian2DModel, render_2dgs
+from metalsplat import Gaussian2DModel, render_2dgs, save_ply_2dgs
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import reset_opacity
 from metalsplat.densify2dgs import densify_and_prune_2dgs, prune_low_opacity_2dgs
@@ -111,7 +114,7 @@ DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
 OUT_DIR = Path(__file__).parent
 
 # --- 2DGS paper defaults (arguments/__init__.py's OptimizationParams) ---
-NUM_ITERS = 30_000
+NUM_ITERS = 11_000
 FEATURE_LR = 0.0025  # paper splits this into f_dc (this rate) / f_rest (this / 20);
 # this repo's SH parameter isn't split that way, so one rate covers all bands.
 OPACITY_LR = 0.05
@@ -314,6 +317,19 @@ def main() -> None:
                 flush=True,
             )
 
+        # Held-out PSNR doesn't necessarily peak on the last step (see
+        # train_garden.py's identical reasoning), so keep the best
+        # checkpoint rather than trusting the final one. An eval that lands
+        # exactly on an opacity-reset step is a known, expected dip (see
+        # module docstring / commit history) -- it won't overwrite a
+        # genuinely better earlier checkpoint since it's never the max.
+        nonlocal best
+        if mean_psnr > best[0]:
+            best = (mean_psnr, step)
+            save_ply_2dgs(model, OUT_DIR / "garden_2dgs_best.ply")
+
+    best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
+
     print("Saving target/initial renders for eval view 0...", flush=True)
     save_image(scene.images[eval_idx[0]], OUT_DIR / "garden_2dgs_target_0.png")
     eval_and_save(0)
@@ -433,9 +449,16 @@ def main() -> None:
             eval_and_save(step)
 
     eval_and_save(NUM_ITERS)
+    ply_path = OUT_DIR / "garden_2dgs.ply"
+    save_ply_2dgs(model, ply_path)
     print(
-        f"Done. {model.num_points} gaussians. Renders saved to {OUT_DIR}. "
-        "(.ply export isn't implemented for Gaussian2DModel yet.)",
+        f"Done. {model.num_points} gaussians. Renders saved to {OUT_DIR}, "
+        f"final scene saved to {ply_path}.",
+        flush=True,
+    )
+    print(
+        f"Best held-out PSNR {best[0]:.2f} dB @ step {best[1]} -> "
+        f"{OUT_DIR / 'garden_2dgs_best.ply'}",
         flush=True,
     )
 

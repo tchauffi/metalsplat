@@ -230,10 +230,21 @@ loss.backward()
   rasterizer's distortion map) and `normal_consistency_loss` (compares the
   rendered normal against a pseudo-normal derived from the depth map's
   local shape, teaching depth and normals to agree).
+- **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`/
+  `prune_low_opacity_2dgs`, adaptive density control for `Gaussian2DModel`
+  -- a parallel module to `metalsplat/densify.py`, differing only in
+  split-offset sampling (confined to the tangent plane, since a 2D splat
+  has no third axis to offset along). `reset_opacity` is reused unchanged
+  from the 3DGS module.
+- **`metalsplat/export2dgs.py`**: `save_ply`/`load_ply` for
+  `Gaussian2DModel`, matching the official 2DGS reference implementation's
+  own `.ply` layout exactly (identical to `metalsplat/export.py`'s 3DGS
+  format except 2 `scale_*` properties instead of 3).
 
-Out of scope for this pass (natural follow-ups): mesh/TSDF extraction,
-`.ply` export/import for 2DGS models, Mip-Splatting's 3D filter and
-adaptive densification generalized to 2 scales.
+Out of scope for this pass (natural follow-ups): mesh/TSDF extraction (the
+actual point of 2DGS's surface-accuracy machinery -- depth/normal/
+distortion outputs exist but nothing consumes them into a mesh yet) and
+Mip-Splatting's 3D filter generalized to 2 scales.
 
 ## Roadmap
 
