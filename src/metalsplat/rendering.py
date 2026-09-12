@@ -202,7 +202,10 @@ def render_2dgs(
     see that NamedTuple's docstring for which fields carry real gradients.
     `distortion.mean()`-style reductions feed `metalsplat.losses.
     distortion_loss`; `depth`/`normal` feed
-    `metalsplat.losses.normal_consistency_loss`.
+    `metalsplat.losses.normal_consistency_loss`, which also needs the
+    accumulated opacity `1 - final_T` -- `depth` and `normal` are both
+    alpha-weighted *sums*, so neither can be interpreted without it (see
+    that function's docstring).
 
     `abs_grad_accum`, if given, is passed through to
     `rasterize_gaussians_2dgs`: an (N,) tensor that backward() atomically

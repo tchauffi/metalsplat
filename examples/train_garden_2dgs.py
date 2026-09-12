@@ -380,7 +380,7 @@ def main() -> None:
         lambda_normal = LAMBDA_NORMAL if step > LAMBDA_NORMAL_START_ITER else 0.0
         lambda_dist = LAMBDA_DIST if step > LAMBDA_DIST_START_ITER else 0.0
         normal_loss = lambda_normal * normal_consistency_loss(
-            aux.normal, aux.depth, cam
+            aux.normal, aux.depth, 1.0 - aux.final_T, cam
         )
         dist_loss = lambda_dist * distortion_loss(aux.distortion)
 

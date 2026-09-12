@@ -198,7 +198,7 @@ aux = render_2dgs(
 loss = (
     aux.image.pow(2).mean()
     + 0.01 * distortion_loss(aux.distortion)
-    + 0.01 * normal_consistency_loss(aux.normal, aux.depth, camera)
+    + 0.01 * normal_consistency_loss(aux.normal, aux.depth, 1.0 - aux.final_T, camera)
 )
 loss.backward()
 ```

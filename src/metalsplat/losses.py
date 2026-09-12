@@ -95,9 +95,44 @@ def distortion_loss(distortion_map: torch.Tensor) -> torch.Tensor:
     return distortion_map.clamp_min(0.0).mean()
 
 
+ALPHA_EPS = 1e-6  # floor for the depth/alpha division below
+
+_RAY_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _camera_rays(h, w, camera: Camera, device, dtype) -> torch.Tensor:
+    """(H, W, 3) camera-space ray directions (z == 1) through pixel centers.
+
+    Depends only on the image size and intrinsics, so it is built once per
+    distinct camera geometry rather than per call -- a capture typically
+    shares one intrinsic matrix across every view, making this a single
+    cached tensor for a whole training run. Rebuilding it each step costs
+    four extra kernel launches on MPS for a result that never changes.
+    """
+    key = (h, w, camera.fx, camera.fy, camera.cx, camera.cy, device, dtype)
+    rays = _RAY_CACHE.get(key)
+    if rays is None:
+        ys, xs = torch.meshgrid(
+            torch.arange(h, device=device, dtype=dtype) + 0.5,
+            torch.arange(w, device=device, dtype=dtype) + 0.5,
+            indexing="ij",
+        )
+        rays = torch.stack(
+            [
+                (xs - camera.cx) / camera.fx,
+                (ys - camera.cy) / camera.fy,
+                torch.ones_like(xs),
+            ],
+            dim=-1,
+        )
+        _RAY_CACHE[key] = rays
+    return rays
+
+
 def normal_consistency_loss(
     rendered_normal: torch.Tensor,  # (H, W, 3), world-space, from render_2dgs
     rendered_depth: torch.Tensor,  # (H, W), camera-space z, from render_2dgs
+    alpha: torch.Tensor,  # (H, W) accumulated opacity, i.e. 1 - render_2dgs's final_T
     camera: Camera,
 ) -> torch.Tensor:
     """2DGS's normal-consistency regularizer: compares the alpha-composited
@@ -106,39 +141,83 @@ def normal_consistency_loss(
     3D points) -- teaches depth and normals to agree with each other,
     which is what makes the reconstructed surface usable for meshing.
 
-    The pseudo-normal is *not* detached: gradient flows into both
-    `rendered_normal` and `rendered_depth`, matching the official 2DGS
-    reference implementation's `depth_to_normal`/loss (no `.detach()`
-    anywhere in that path) -- letting both sides move toward mutual
-    consistency, not just the rendered normal toward a fixed target.
+    Both of the rasterizer's outputs this consumes are *alpha-weighted
+    sums*, not averages, so `alpha` is needed to interpret either one --
+    this mirrors the official implementation's two uses of `render_alpha`
+    (`gaussian_renderer/__init__.py`), and dropping either is silently
+    wrong rather than merely approximate:
+
+    - **The depth is un-normalized.** `rendered_depth` is `sum_k w_k*z_k`,
+      which is the expected depth scaled by `alpha`. It has to be divided
+      by `alpha` before unprojecting, or the unprojected points carry a
+      spatially-varying scale factor and the finite differences below
+      measure that factor's gradient rather than the surface's. Harmless
+      where alpha saturates, badly wrong everywhere else: measured ~70
+      degrees of pseudo-normal error at alpha 0.5-0.99, against ~6 degrees
+      at alpha ~1.
+    - **The rendered normal is un-normalized** too (its magnitude is
+      ~alpha), so the unit pseudo-normal is scaled by `alpha` to match.
+      Without that the target is systematically too long wherever the
+      surface is semi-transparent, and -- the part that actually bites --
+      the gradient stays full-strength in empty regions instead of
+      vanishing with alpha, so the term keeps pushing normals (and through
+      them opacities) up in parts of the frame that should stay empty.
+
+    The pseudo-normal's *direction* is not detached: gradient flows into
+    both `rendered_normal` and `rendered_depth`, matching the official
+    implementation's `depth_to_normal` path -- letting both sides move
+    toward mutual consistency, not just the rendered normal toward a fixed
+    target. Its alpha *scale* is detached, also matching.
+
+    Note `alpha` itself carries no gradient here: it comes from
+    `render_2dgs`'s `final_T`, which this codebase's rasterizer treats as a
+    forward-only structural output. The official rasterizer does
+    differentiate its alpha channel, so the depth-normalization path
+    differs from it by that (conservative) omission.
 
     Only defined on interior pixels (finite differences need both
     neighbours), so this compares `rendered_normal[1:-1, 1:-1]` against
     the pseudo-normal.
     """
     h, w = rendered_depth.shape
-    device, dtype = rendered_depth.device, rendered_depth.dtype
-    ys, xs = torch.meshgrid(
-        torch.arange(h, device=device, dtype=dtype) + 0.5,
-        torch.arange(w, device=device, dtype=dtype) + 0.5,
-        indexing="ij",
+    # Expected depth. The `where` is not just cosmetic: a plain
+    # `rendered_depth / alpha.clamp_min(eps)` would send gradients through
+    # the floor at uncovered pixels, scaling them by 1/eps -- measured
+    # 1e8-magnitude depth gradients leaking back into the rasterizer from
+    # pixels where nothing was rendered at all. `where` blocks the
+    # unselected branch, so those pixels contribute a clean zero, which is
+    # also what the official implementation's nan_to_num(0/0) does (its
+    # backward zeroes the gradient of every non-finite entry).
+    covered = alpha > ALPHA_EPS
+    expected_depth = torch.where(
+        covered, rendered_depth / alpha.clamp_min(ALPHA_EPS), torch.zeros_like(alpha)
     )
-    x_cam = (xs - camera.cx) / camera.fx * rendered_depth
-    y_cam = (ys - camera.cy) / camera.fy * rendered_depth
-    points_cam = torch.stack([x_cam, y_cam, rendered_depth], dim=-1)  # (H, W, 3)
-    # world = (cam - t_wc) @ R_wc, inverting cam = world @ R_wc.T + t_wc.
-    points_world = (points_cam - camera.t_wc) @ camera.R_wc
 
-    dx = points_world[1:-1, 2:, :] - points_world[1:-1, :-2, :]
-    dy = points_world[2:, 1:-1, :] - points_world[:-2, 1:-1, :]
+    # Unprojection stays in *camera* space and the rendered normal is
+    # rotated into it, rather than the other way round. A rotation commutes
+    # with both the cross product (R is proper, so cross(Ra, Rb) =
+    # R cross(a, b)) and the normalize, so the comparison is identical --
+    # but this way the (H, W, 3) point cloud never has to be rotated or
+    # translated, which on MPS is most of this function's cost. The
+    # translation drops out entirely: finite differences cancel it.
+    rays = _camera_rays(h, w, camera, rendered_depth.device, rendered_depth.dtype)
+    points_cam = rays * expected_depth[..., None]  # (H, W, 3)
+
+    dx = points_cam[1:-1, 2:, :] - points_cam[1:-1, :-2, :]
+    dy = points_cam[2:, 1:-1, :] - points_cam[:-2, 1:-1, :]
     pseudo_normal = F.normalize(torch.linalg.cross(dx, dy, dim=-1), dim=-1)
 
     normal_interior = rendered_normal[1:-1, 1:-1, :]
-    # Align sign to the (already camera-facing) rendered normal rather than
-    # hardcoding a convention -- the finite-difference cross product's
-    # orientation depends on pixel-grid handedness, not scene geometry.
-    dot = (pseudo_normal * normal_interior).sum(-1, keepdim=True)
-    sign = torch.where(dot < 0, -torch.ones_like(dot), torch.ones_like(dot))
-    pseudo_normal = pseudo_normal * sign
+    normal_cam = normal_interior @ camera.R_wc.T  # world -> camera
 
-    return (1.0 - (normal_interior * pseudo_normal).sum(-1)).mean()
+    # `abs()` is the sign alignment: the finite-difference cross product's
+    # orientation depends on pixel-grid handedness, not scene geometry, so
+    # the pseudo-normal is flipped to agree with the (already camera-facing)
+    # rendered normal. Folding that into the dot product is exactly the old
+    # `pseudo * where(dot < 0, -1, 1)` -- sign(dot)*dot == |dot| -- with the
+    # same subgradient, minus three full-size elementwise passes.
+    dot = (pseudo_normal * normal_cam).sum(-1)
+    # `alpha` matches the rendered normal's own alpha weighting; detached,
+    # as upstream. It is already gradient-free here (final_T is forward-only)
+    # but the detach keeps that intent explicit.
+    return (1.0 - alpha[1:-1, 1:-1].detach() * dot.abs()).mean()
