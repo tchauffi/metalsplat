@@ -44,6 +44,33 @@ specifically.
 This repo's 2DGS path still has no `.ply` export, filter3d equivalent, or
 `seed_uncovered_regions` equivalent -- out of scope here, same as before.
 
+One more deviation from `train_garden.py`: its `calibrate_initial_scale`
+targets a 3px initial screen radius, which for this scene lands ~7.5x
+below `scene_scale` (the point-cloud spacing `densify_and_prune_2dgs`'s
+split-vs-clone decision is calibrated against). Since split only fires
+for gaussians *already larger* than `scene_scale`, that gap meant almost
+no gaussian qualified for hundreds of steps -- densification was nearly
+pure clone (duplicate exactly in place, then slowly drift apart via
+gradient descent) rather than split (an immediate, differently-positioned
+offset). Confirmed via an instrumented run: 0 splits for the first two
+densify rounds, and only a handful for several more. Clone-then-drift is
+particularly slow wherever many gaussians overlap and share credit/blame
+for the same pixels (the drift signal is diluted across all of them), so
+this disproportionately kept complex, overlapping regions stuck as a
+blurry pile of near-duplicate disks long after simple/background regions
+(where a lone clone's drift signal is concentrated, not shared) had
+separated and sharpened. Raising the target to 10px narrows that gap
+(init scale ~45% of scene_scale here, instead of ~14%) without
+reintroducing the original giant-overlapping-blob failure mode
+`train_garden.py`'s comment describes (measured ~23px unrecalibrated on
+this scene) -- verified empirically: splits appear within the first few
+rounds instead of being starved for ~500 steps, and held-out PSNR at a
+fixed step count improves. This does not fully close the gap between
+complex/overlapping regions and simple ones -- some of that is 2DGS's
+own planarity prior working against non-planar, repeated detail (foliage,
+moss) rather than a densification bug -- but it removes the
+easily-avoidable part of it.
+
 Usage: uv run python examples/train_garden_2dgs.py
 """
 
@@ -179,7 +206,11 @@ def main() -> None:
     print(f"{scene.points.shape[0]} initial sparse points")
 
     scene_scale = estimate_scene_scale(scene.points)
-    init_scale = calibrate_initial_scale(scene.points, scene.cameras, scene_scale)
+    # target_pixel_radius=10 (not train_garden.py's 3): see module docstring
+    # for why 3px starves densify_and_prune_2dgs's split path on this scene.
+    init_scale = calibrate_initial_scale(
+        scene.points, scene.cameras, scene_scale, target_pixel_radius=10.0
+    )
     print(
         f"Scene scale (median NN spacing): {scene_scale:.4f}, calibrated initial gaussian scale: {init_scale:.5f}",
         flush=True,
