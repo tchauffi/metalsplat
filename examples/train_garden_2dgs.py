@@ -174,6 +174,14 @@ EVAL_HOLDOUT_STRIDE = 8
 EVAL_IMAGES_SAVED = 3
 
 
+def _as_float(x: torch.Tensor | float) -> float:
+    """Log helper: a regularizer term is a plain 0.0 when its weight is 0
+    (the term is skipped rather than built), and a tensor otherwise. `.item()`
+    rather than `float()` so a still-attached tensor doesn't warn.
+    """
+    return x.item() if torch.is_tensor(x) else float(x)
+
+
 def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     mse = (pred - target).pow(2).mean().item()
     if mse <= 0:
@@ -376,15 +384,27 @@ def main() -> None:
             aux.image, target, lambda_dssim=LAMBDA_DSSIM
         )
 
-        # Paper's exact iteration-gated regularizer weights.
+        # Paper's exact iteration-gated regularizer weights. A zero-weighted
+        # term is skipped outright rather than multiplied by 0.0: building it
+        # anyway still runs its forward and drags its whole subgraph through
+        # backward for a contribution that is identically zero. With the
+        # paper's schedule that is most of a run: the normal term is inactive
+        # for the first 7000 steps and LAMBDA_DIST is 0.0 throughout, and
+        # building both anyway measured ~1.9ms of a ~40ms step.
         lambda_normal = LAMBDA_NORMAL if step > LAMBDA_NORMAL_START_ITER else 0.0
         lambda_dist = LAMBDA_DIST if step > LAMBDA_DIST_START_ITER else 0.0
-        normal_loss = lambda_normal * normal_consistency_loss(
-            aux.normal, aux.depth, 1.0 - aux.final_T, cam
-        )
-        dist_loss = lambda_dist * distortion_loss(aux.distortion)
 
-        loss = photo_loss + normal_loss + dist_loss
+        loss = photo_loss
+        normal_loss: torch.Tensor | float = 0.0
+        dist_loss: torch.Tensor | float = 0.0
+        if lambda_normal > 0.0:
+            normal_loss = lambda_normal * normal_consistency_loss(
+                aux.normal, aux.depth, 1.0 - aux.final_T, cam
+            )
+            loss = loss + normal_loss
+        if lambda_dist > 0.0:
+            dist_loss = lambda_dist * distortion_loss(aux.distortion)
+            loss = loss + dist_loss
         loss.backward()  # accumulates into grad_accum in place (AbsGS-style)
         visible = aux.valid > 0.5
         optimizer.step(visible)
@@ -397,8 +417,8 @@ def main() -> None:
             elapsed = time.time() - start
             print(
                 f"step {step:5d}  loss {loss.item():.5f}  n {model.num_points}  "
-                f"(photo {photo_loss.item():.5f}  normal {normal_loss.item():.5f}  "
-                f"dist {dist_loss.item():.5f})  "
+                f"(photo {photo_loss.item():.5f}  normal {_as_float(normal_loss):.5f}  "
+                f"dist {_as_float(dist_loss):.5f})  "
                 f"({elapsed:.1f}s elapsed, {elapsed / step:.2f}s/step)",
                 flush=True,
             )
