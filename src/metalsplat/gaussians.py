@@ -18,8 +18,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from metalsplat.ops.sh import eval_sh
-from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
+from metalsplat import sh_color
+from metalsplat.sh_color import logit
 
 
 class GaussianModel(nn.Module):
@@ -40,10 +40,7 @@ class GaussianModel(nn.Module):
         n = means.shape[0]
         device = means.device
 
-        if not 0 <= sh_degree <= MAX_SH_DEGREE:
-            raise ValueError(
-                f"sh_degree must be between 0 and {MAX_SH_DEGREE}, got {sh_degree}"
-            )
+        sh_color.validate_sh_degree(sh_degree)
         self.sh_degree = sh_degree
         # Degrees actually evaluated right now. Training can start this
         # at 0 and grow it (see increase_sh_degree): fitting all bands
@@ -61,28 +58,16 @@ class GaussianModel(nn.Module):
             quats[:, 0] = 1.0
         if opacities is None:
             opacities = torch.full((n,), 0.5, device=device)
-        if colors is None:
-            colors = torch.full((n, 3), 0.5, device=device)
 
         self.means = nn.Parameter(means.clone())
         self.raw_scales = nn.Parameter(scales.clone().log())
         self.raw_quats = nn.Parameter(quats.clone())
         self.raw_opacities = nn.Parameter(logit(opacities.clone()))
 
-        if sh_degree == 0:
-            self.raw_colors = nn.Parameter(logit(colors.clone()))
-        elif sh_coeffs is not None:
-            expected = num_sh_coeffs(sh_degree)
-            if sh_coeffs.shape[1] != expected:
-                raise ValueError(
-                    f"sh_degree={sh_degree} needs {expected} coefficients per channel, "
-                    f"got sh_coeffs with shape {tuple(sh_coeffs.shape)}"
-                )
-            self.raw_sh = nn.Parameter(sh_coeffs.clone())
-        else:
-            raw_sh = torch.zeros(n, num_sh_coeffs(sh_degree), 3, device=device)
-            raw_sh[:, 0, :] = (colors.clone() - 0.5) / SH_C0
-            self.raw_sh = nn.Parameter(raw_sh)
+        color_param_name, color_param_init = sh_color.init_color_param(
+            n, sh_degree, colors, sh_coeffs, device
+        )
+        setattr(self, color_param_name, nn.Parameter(color_param_init))
 
     @property
     def scales(self) -> torch.Tensor:
@@ -113,12 +98,13 @@ class GaussianModel(nn.Module):
             raise AttributeError(
                 "This model has sh_degree=0; use the `colors` property instead."
             )
-        return eval_sh(self.raw_sh, view_dirs, self.active_sh_degree) + 0.5
+        return sh_color.colors_from_view(self.raw_sh, self.active_sh_degree, view_dirs)
 
     def increase_sh_degree(self) -> int:
         """Activates one more SH band, up to this model's sh_degree."""
-        if self.active_sh_degree < self.sh_degree:
-            self.active_sh_degree += 1
+        self.active_sh_degree = sh_color.increase_sh_degree(
+            self.sh_degree, self.active_sh_degree
+        )
         return self.active_sh_degree
 
     @property
@@ -132,8 +118,3 @@ class GaussianModel(nn.Module):
         means = (torch.rand(n, 3, device=device) * 2 - 1) * bound
         colors = torch.rand(n, 3, device=device)
         return cls(means, colors=colors)
-
-
-def logit(p: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    p = p.clamp(eps, 1 - eps)
-    return torch.log(p / (1 - p))
