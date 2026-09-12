@@ -204,11 +204,21 @@ def main() -> None:
         with torch.no_grad():
             psnrs = []
             for k, idx in enumerate(eval_idx):
-                pred = render_2dgs(model, scene.cameras[idx], background=background)
+                aux = render_2dgs(
+                    model, scene.cameras[idx], background=background, return_aux=True
+                )
                 torch.mps.synchronize()
-                psnrs.append(psnr(pred, scene.images[idx]))
+                psnrs.append(psnr(aux.image, scene.images[idx]))
                 if k < EVAL_IMAGES_SAVED:
-                    save_image(pred, OUT_DIR / f"garden_2dgs_eval_{k}_step{step}.png")
+                    save_image(
+                        aux.image, OUT_DIR / f"garden_2dgs_eval_{k}_step{step}.png"
+                    )
+                    # World-space normal in [-1, 1] -> [0, 1] for display,
+                    # the standard normal-map visualization convention.
+                    save_image(
+                        aux.normal * 0.5 + 0.5,
+                        OUT_DIR / f"garden_2dgs_normal_{k}_step{step}.png",
+                    )
             mean_psnr = sum(psnrs) / len(psnrs)
             print(
                 f"  eval PSNR ({len(psnrs)} held-out views): {mean_psnr:.2f} dB",
