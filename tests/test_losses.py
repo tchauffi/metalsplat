@@ -1,6 +1,12 @@
 import torch
 
-from metalsplat.losses import gaussian_splatting_loss, ssim
+from metalsplat.camera import Camera
+from metalsplat.losses import (
+    distortion_loss,
+    gaussian_splatting_loss,
+    normal_consistency_loss,
+    ssim,
+)
 
 
 def _random_image(h=32, w=32, seed=0):
@@ -55,3 +61,59 @@ def test_lambda_zero_matches_plain_l1():
     loss = gaussian_splatting_loss(pred, target, lambda_dssim=0.0)
     l1 = (pred - target).abs().mean()
     assert torch.allclose(loss, l1)
+
+
+def test_distortion_loss_is_mean():
+    m = torch.rand(8, 8)
+    assert torch.allclose(distortion_loss(m), m.mean())
+
+
+def test_distortion_loss_gradients_flow():
+    m = torch.rand(8, 8, requires_grad=True)
+    distortion_loss(m).backward()
+    assert m.grad is not None
+    assert torch.allclose(m.grad, torch.full_like(m, 1.0 / m.numel()))
+
+
+def _fronto_parallel_scene(h=16, w=16, depth=5.0, fx=50.0, fy=50.0):
+    camera = Camera.identity(
+        fx=fx, fy=fy, cx=w / 2, cy=h / 2, img_width=w, img_height=h
+    )
+    rendered_depth = torch.full((h, w), depth)
+    # A depth plane exactly perpendicular to the optical axis has a
+    # constant camera-space (and world-space, identity camera) normal of
+    # (0, 0, -1) -- facing back at the camera, matching project_2dgs_ref's
+    # camera-facing convention.
+    rendered_normal = torch.zeros(h, w, 3)
+    rendered_normal[..., 2] = -1.0
+    return camera, rendered_depth, rendered_normal
+
+
+def test_normal_consistency_near_zero_for_consistent_frontoparallel_plane():
+    camera, depth, normal = _fronto_parallel_scene()
+    loss = normal_consistency_loss(normal, depth, camera)
+    assert loss.item() < 1e-4
+
+
+def test_normal_consistency_positive_for_wrong_normal():
+    camera, depth, normal = _fronto_parallel_scene()
+    wrong_normal = torch.zeros_like(normal)
+    wrong_normal[..., 0] = 1.0  # orthogonal to the true (0, 0, -1) normal
+    loss = normal_consistency_loss(wrong_normal, depth, camera)
+    assert loss.item() > 0.9  # 1 - dot(perpendicular vectors) == 1
+
+
+def test_normal_consistency_gradients_flow_to_rendered_normal_only():
+    # The pseudo-normal (derived from depth) is deliberately `.detach()`ed
+    # (see the function's docstring): this loss pulls the *rendered*
+    # normal toward depth-implied geometry, it does not also backprop into
+    # depth itself (that's what the photometric/distortion losses are
+    # for) -- so `depth` must get no gradient here, only `rendered_normal`.
+    camera, depth, normal = _fronto_parallel_scene()
+    depth = depth.clone().requires_grad_()
+    normal = normal.clone().requires_grad_()
+    loss = normal_consistency_loss(normal, depth, camera)
+    loss.backward()
+    assert depth.grad is None
+    assert normal.grad is not None
+    assert torch.isfinite(normal.grad).all()
