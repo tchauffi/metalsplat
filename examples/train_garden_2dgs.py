@@ -71,6 +71,20 @@ own planarity prior working against non-planar, repeated detail (foliage,
 moss) rather than a densification bug -- but it removes the
 easily-avoidable part of it.
 
+One more gap, found by timing a real 30k-step run (wall-clock time per
+1000 steps kept climbing well past the point densification stops):
+`OPACITY_RESET_INTERVAL` keeps firing every 3000 steps all the way to
+`NUM_ITERS`, but pruning here only ever ran *inside*
+`densify_and_prune_2dgs`, which itself only runs through `DENSIFY_STOP`
+(15000). Every reset after that point caps a fresh batch of gaussians'
+opacity near zero with nothing left to clean them up afterward -- they
+sit there forever, still costing full projection/rasterization compute
+every step while contributing ~nothing to the image, compounding with
+each subsequent reset (18000, 21000, 24000, 27000). `train_garden.py`
+already solves this for 3DGS with a standalone prune schedule that keeps
+running past its own densify-stop point; this adds the identical thing
+here via `prune_low_opacity_2dgs`.
+
 Usage: uv run python examples/train_garden_2dgs.py
 """
 
@@ -84,7 +98,7 @@ import torch
 from metalsplat import Gaussian2DModel, render_2dgs
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import reset_opacity
-from metalsplat.densify2dgs import densify_and_prune_2dgs
+from metalsplat.densify2dgs import densify_and_prune_2dgs, prune_low_opacity_2dgs
 from metalsplat.losses import (
     distortion_loss,
     gaussian_splatting_loss,
@@ -123,6 +137,24 @@ OPACITY_RESET_INTERVAL = (
 # Calibrated on the first densification round, then frozen -- see module
 # docstring for why this replaces the paper's literal densify_grad_threshold.
 DENSIFY_GRAD_PERCENTILE = 0.9
+
+# Standalone prune schedule, matching train_garden.py's identical one: unlike
+# densify_and_prune_2dgs's own inline prune (which only runs during the
+# DENSIFY_START..DENSIFY_STOP window), this keeps running for the rest of
+# training -- see module docstring for why that gap matters once
+# OPACITY_RESET_INTERVAL keeps firing past DENSIFY_STOP.
+#
+# Deliberately its own, *lower* threshold rather than reusing
+# PRUNE_OPACITY_THRESH (0.05): OPACITY_RESET_INTERVAL and PRUNE_INTERVAL can
+# land on the same step, and reset_opacity() caps every gaussian at 0.01 --
+# a threshold above that would prune the entire model the instant a reset
+# and a prune coincide (confirmed by a smoke test: n=0 immediately after
+# such a step). train_garden.py's own standalone prune uses the same 0.005
+# for the identical reason, safely below its own 0.01 reset cap.
+STANDALONE_PRUNE_OPACITY_THRESH = 0.005
+PRUNE_START = 100
+PRUNE_STOP = NUM_ITERS
+PRUNE_INTERVAL = 100
 
 EVAL_EVERY = 1000
 EVAL_HOLDOUT_STRIDE = 8
@@ -373,6 +405,23 @@ def main() -> None:
         if OPACITY_RESET_INTERVAL and step % OPACITY_RESET_INTERVAL == 0:
             reset_opacity(model)
             print(f"  opacity reset @ step {step}", flush=True)
+
+        # Standalone prune: keeps running after DENSIFY_STOP, unlike
+        # densify_and_prune_2dgs's own inline prune -- see module docstring.
+        if PRUNE_START <= step <= PRUNE_STOP and step % PRUNE_INTERVAL == 0:
+            model, n_pruned, prune_index = prune_low_opacity_2dgs(
+                model, prune_opacity_thresh=STANDALONE_PRUNE_OPACITY_THRESH
+            )
+            if n_pruned > 0:
+                optimizer = migrate_optimizer_state(
+                    optimizer, make_optimizer(model, lr_means), prune_index
+                )
+                grad_accum = torch.zeros(model.num_points, device=DEVICE)
+                grad_count = torch.zeros(model.num_points, device=DEVICE)
+                print(
+                    f"  prune @ step {step}: -{n_pruned} (n={model.num_points})",
+                    flush=True,
+                )
 
         if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
             active = model.increase_sh_degree()
