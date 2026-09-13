@@ -185,6 +185,32 @@ Fields"). It shares this repo's tiling stage and SH color path with the
 3DGS pipeline but has its own model, kernels, render entry point, losses
 and densification.
 
+![RGB and surface-normal renders of the garden scene, over a full orbit](docs/garden_2dgs_orbit.webp)
+
+*Full-quality h264 version: [`docs/garden_2dgs_orbit.mp4`](https://github.com/tchauffi/metalsplat/raw/main/docs/garden_2dgs_orbit.mp4)*
+
+The same garden scene and the same analytic orbit as the video at the top
+of this README, reconstructed with 2DGS instead. Left: RGB. Right: the
+rendered surface normal, straight out of the same rasterizer pass -- not a
+post-process, and not available at all from the 3DGS pipeline.
+
+The normal pane is the one worth reading closely, because it is the whole
+argument for 2DGS. Colour encodes *world-space* orientation, so a correctly
+reconstructed surface holds one steady colour as the camera moves: the
+table top stays flat magenta through the entire revolution, the paving
+holds its own tone, and the vase shows a smooth gradient around its curve.
+Where the colour boils instead -- grass, background foliage -- the geometry
+genuinely isn't planar, and a flat disk is the wrong primitive for it.
+That is the trade-off visible in a single frame.
+
+Trained by `examples/train_garden_2dgs.py` and rendered by
+`examples/render_video_2dgs.py`: 15000 iterations at half resolution,
+reaching **24.8 dB PSNR / 0.719 SSIM** on the 24 held-out views with 812k
+surfels. That figure is *not* comparable to the 3DGS one at the top of this
+README -- that run is at full resolution with 330k gaussians, and PSNR
+rises as resolution falls, so the two differ by more than the method. No
+like-for-like comparison has been run.
+
 ### Why a second pipeline
 
 3DGS optimizes for how the scene *looks*, and its primitives are 3D
@@ -375,15 +401,12 @@ the hand-written Metal backward passes are tested against.
 
 ### Status
 
-No held-out quality numbers are quoted for 2DGS yet: the most recent full
-training run predates a correctness fix to the normal-consistency loss, so
-its geometry past iteration 7000 was trained against a wrong target. The
-figures at the top of this README are from the 3DGS pipeline.
-
 Natural follow-ups, not implemented: **mesh/TSDF extraction** (the actual
 payoff of 2DGS's surface accuracy -- the depth/normal/distortion outputs
-all exist, but nothing consumes them into a mesh yet) and Mip-Splatting's
-3D filter generalized to two scales.
+all exist, but nothing consumes them into a mesh yet), Mip-Splatting's 3D
+filter generalized to two scales, and a `Gaussian2DModel` equivalent of
+`metalsplat/cleanup.py`'s floater pruning and view-dependence damping (the
+orbit above is rendered from the raw trained model, with no cleanup pass).
 
 ## Roadmap
 
