@@ -108,7 +108,18 @@ def load_colmap_scene(
     image_dir: str = "images",
     sparse_subdir: str = "sparse/0",
     device: str | torch.device = "cpu",
+    downscale: float = 1.0,
 ) -> ColmapScene:
+    """`downscale` (>=1.0) resizes every loaded image by `1/downscale`
+    (e.g. `downscale=2.0` halves both dimensions) -- a plain training-speed
+    knob (fewer pixels per render/backward), matching 3DGS/2DGS's
+    convention of a resolution downscale factor. Intrinsics don't need any
+    special handling for this: the existing `scale = actual_width /
+    colmap_cam.width` rescaling below already reacts to whatever size the
+    image actually is after resizing, the same way it already handles
+    scenes shipped with pre-downsampled image directories (e.g.
+    MipNeRF360's `images_4`).
+    """
     scene_root = Path(scene_root)
     rec = pycolmap.Reconstruction(str(scene_root / sparse_subdir))
 
@@ -121,6 +132,12 @@ def load_colmap_scene(
     for colmap_image in images_by_name:
         image_path = scene_root / image_dir / colmap_image.name
         pil_image = Image.open(image_path).convert("RGB")
+        if downscale != 1.0:
+            new_size = (
+                round(pil_image.width / downscale),
+                round(pil_image.height / downscale),
+            )
+            pil_image = pil_image.resize(new_size, Image.LANCZOS)
         actual_width, actual_height = pil_image.size
 
         colmap_cam = rec.cameras[colmap_image.camera_id]

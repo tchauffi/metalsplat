@@ -174,6 +174,78 @@ the differentiable render): `metalsplat/densify.py` (split/clone/prune,
 opacity reset), `metalsplat/seed.py` (loss-driven gaussian seeding),
 `metalsplat/losses.py` (L1+D-SSIM), `metalsplat/export.py` (`.ply` export).
 
+## 2D Gaussian Splatting
+
+A second, parallel pipeline implementing 2D Gaussian Splatting (Huang et
+al. 2024, "2D Gaussian Splatting for Geometrically Accurate Radiance
+Fields"): each splat is a flat, oriented disk (a "surfel") in world space
+-- a position, an orientation, and two tangent-plane scales -- rasterized
+via an *exact* per-pixel ray-splat intersection rather than 3DGS's
+local-affine (EWA) approximation, giving more accurate depth and normals.
+
+```python
+from metalsplat import Camera, Gaussian2DModel, render_2dgs
+from metalsplat.losses import distortion_loss, normal_consistency_loss
+
+model = Gaussian2DModel.random(n=5000, bound=1.0, device="mps")
+camera = Camera.identity(
+    fx=128, fy=128, cx=64, cy=64, img_width=128, img_height=128
+).to("mps")
+
+aux = render_2dgs(
+    model, camera, return_aux=True
+)  # image, depth, normal, distortion all differentiable
+loss = (
+    aux.image.pow(2).mean()
+    + 0.01 * distortion_loss(aux.distortion)
+    + 0.01 * normal_consistency_loss(aux.normal, aux.depth, 1.0 - aux.final_T, camera)
+)
+loss.backward()
+```
+
+- **`metalsplat/gaussians_2dgs.py`** (`Gaussian2DModel`): `raw_scales` is
+  `(N, 2)` -- the tangent-plane extents `(s_u, s_v)` -- with no third,
+  depth-axis scale. `quat_to_rotmat`'s columns 0/1 are the disk's tangent
+  axes, column 2 its surface normal (`.normals`, sign-flipped to face the
+  camera at render time). Color/SH parameterization is shared with
+  `GaussianModel` via `metalsplat/sh_color.py`.
+- **`metalsplat/ops/project_2dgs.py`** (Metal kernel,
+  `kernels/project_2dgs.metal`): reuses the exact 3DGS EWA/conic math
+  (treating the missing 3rd scale as a fixed small epsilon) for the
+  tile-culling bound, so `metalsplat/ops/tiling.py` is reused completely
+  unmodified for tile binning. Additionally outputs the 9 independent
+  entries of `M = W @ H` (the composition of the camera's projection with
+  the local tangent-plane-to-world embedding) and the camera-facing
+  normal, both consumed by the rasterizer's exact per-pixel intersection.
+- **`metalsplat/ops/rasterize_2dgs.py`** (Metal kernel,
+  `kernels/rasterize_2dgs.metal`): same tile-based front-to-back
+  compositing structure as 3DGS's rasterizer, but per-pixel alpha comes
+  from resolving the ray-splat intersection (a homogeneous-plane pullback
+  and cross product, no per-pixel matrix inverse) instead of an analytic
+  conic. Unlike 3DGS's forward-only depth, `depth` and `normal` here are
+  genuinely differentiable, and the rasterizer also produces a per-pixel
+  `distortion` map (the Mip-NeRF-360/2DGS "concentrate the weight along
+  the ray" regularizer) with a hand-derived closed-form backward.
+- **`metalsplat/losses.py`**: `distortion_loss` (a reduction over the
+  rasterizer's distortion map) and `normal_consistency_loss` (compares the
+  rendered normal against a pseudo-normal derived from the depth map's
+  local shape, teaching depth and normals to agree).
+- **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`/
+  `prune_low_opacity_2dgs`, adaptive density control for `Gaussian2DModel`
+  -- a parallel module to `metalsplat/densify.py`, differing only in
+  split-offset sampling (confined to the tangent plane, since a 2D splat
+  has no third axis to offset along). `reset_opacity` is reused unchanged
+  from the 3DGS module.
+- **`metalsplat/export2dgs.py`**: `save_ply`/`load_ply` for
+  `Gaussian2DModel`, matching the official 2DGS reference implementation's
+  own `.ply` layout exactly (identical to `metalsplat/export.py`'s 3DGS
+  format except 2 `scale_*` properties instead of 3).
+
+Out of scope for this pass (natural follow-ups): mesh/TSDF extraction (the
+actual point of 2DGS's surface-accuracy machinery -- depth/normal/
+distortion outputs exist but nothing consumes them into a mesh yet) and
+Mip-Splatting's 3D filter generalized to 2 scales.
+
 ## Roadmap
 
 Deliberately out of scope for this pass:
