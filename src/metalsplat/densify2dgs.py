@@ -58,6 +58,21 @@ def densify_and_prune_2dgs(
     Dividing by covered pixels instead makes it a per-pixel mean, which is
     comparable across depths.
 
+    **This removes the brake that makes densification terminate, so it is
+    not safe on its own.** The un-normalized sum falls when a gaussian is
+    split or cloned, because each child covers fewer pixels than the
+    parent did; that decay is what eventually puts every gaussian below a
+    fixed threshold and stops growth. Divide it by coverage and a clone
+    scores exactly what its parent scored, so it qualifies again on the
+    next round, and the next. Measured on the garden scene against an
+    otherwise identical run: gaussians added per round decays 11% -> 4.8%
+    -> 4.0% un-normalized (count converges), and *accelerates* normalized
+    (138k -> 700k by step 1500, ~3M by 3000). Recalibrating the threshold
+    each round bounds the rate but not the total, since a percentile always
+    selects a fixed fraction -- a steady ~7.5% per round still compounds.
+    Pair it with `max_points`, or with an absolute threshold tuned for the
+    normalized scale (the two differ by ~100x), or leave it off.
+
     This is pixel-aware in the sense of Pixel-GS (Zhang et al. 2024), but
     not that paper's rule: it weights *views* by coverage to accelerate
     large gaussians, whereas this normalizes *by* coverage to stop small
