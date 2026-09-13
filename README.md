@@ -116,8 +116,9 @@ learning rate) is decayed exponentially over training, matching standard
 should make large exploratory moves early and settle down for fine detail
 late, not keep taking large steps throughout.
 
-Set `SH_DEGREE = 2` at the top of `examples/train_garden.py` to train
-view-dependent color (see below) instead of the default plain RGB.
+`SH_DEGREE` at the top of `examples/train_garden.py` selects the color
+model: `0` is plain per-gaussian RGB, `1..3` is view-dependent spherical
+harmonics (see below). It defaults to `3`, the 3DGS default.
 
 The training loss (`metalsplat/losses.py`) is the standard 3DGS objective:
 `(1 - lambda) * L1 + lambda * D-SSIM`, `D-SSIM = (1 - SSIM) / 2`, with the
@@ -151,10 +152,12 @@ CUDA kernels.
   threadgroup per tile. Backward accumulates per-gaussian gradients via
   Metal atomics (many pixels write to the same gaussian).
 - **`metalsplat/ops/sh.py`** (Metal kernel, `kernels/sh.metal`): optional
-  degree<=2 spherical-harmonics view-dependent color (`GaussianModel(...,
-  sh_degree=2)`). Evaluates the SH basis given each gaussian's raw
-  coefficients and its unit view direction to the camera (`Camera.position`
-  gives the world-space camera center); the view-direction normalize
+  degree<=3 spherical-harmonics view-dependent color (`GaussianModel(...,
+  sh_degree=3)`), with the active degree selectable at runtime so bands can
+  be introduced progressively during training. Evaluates the SH basis given
+  each gaussian's raw coefficients and its unit view direction to the
+  camera (`Camera.position` gives the world-space camera center); the
+  view-direction normalize
   itself is left to plain PyTorch autograd (cheap, no need for a custom
   kernel), so the Metal kernel's backward only needs to produce
   `d_sh_coeffs` and `d_dirs` -- gradient flows from there through the
@@ -178,10 +181,32 @@ opacity reset), `metalsplat/seed.py` (loss-driven gaussian seeding),
 
 A second, parallel pipeline implementing 2D Gaussian Splatting (Huang et
 al. 2024, "2D Gaussian Splatting for Geometrically Accurate Radiance
-Fields"): each splat is a flat, oriented disk (a "surfel") in world space
--- a position, an orientation, and two tangent-plane scales -- rasterized
-via an *exact* per-pixel ray-splat intersection rather than 3DGS's
-local-affine (EWA) approximation, giving more accurate depth and normals.
+Fields"). It shares this repo's tiling stage and SH color path with the
+3DGS pipeline but has its own model, kernels, render entry point, losses
+and densification.
+
+### Why a second pipeline
+
+3DGS optimizes for how the scene *looks*, and its primitives are 3D
+ellipsoids. That works well for novel-view synthesis but leaves the
+geometry ill-defined: a 3D blob has no unambiguous surface, so "the depth
+at this pixel" and "the normal at this point" are not really properties of
+the model -- an ellipsoid seen from two angles disagrees with itself about
+where its surface is. This is why 3DGS's depth output here is
+forward-only: nothing in training constrains it to be correct.
+
+2DGS removes the third dimension from the primitive itself. Each splat is
+a flat oriented disk (a "surfel"): a position, an orientation, and *two*
+tangent-plane scales `(s_u, s_v)` instead of three. A disk has an exact
+intersection point with any ray and an unambiguous normal, so depth and
+normals become real, differentiable, supervisable outputs rather than
+byproducts. That is the whole trade: a more constrained primitive costs
+some photometric quality (2DGS typically scores slightly below 3DGS on
+PSNR for the same scene) and buys geometry that is consistent enough to
+extract a surface from.
+
+Use `render` (3DGS) for the best-looking novel views; use `render_2dgs`
+when you care about depth, normals, or eventually a mesh.
 
 ```python
 from metalsplat import Camera, Gaussian2DModel, render_2dgs
@@ -203,6 +228,101 @@ loss = (
 loss.backward()
 ```
 
+`examples/fit_image_2dgs.py` is the 2DGS counterpart to `fit_image.py` --
+a single-image overfit, useful as a smoke test.
+
+### Exact ray-splat intersection
+
+3DGS computes a pixel's alpha from an analytic 2D conic: the gaussian is
+projected once per frame through a *local affine* (EWA) approximation of
+the perspective transform, which is only accurate near the splat's center
+and degrades for large or heavily tilted splats.
+
+2DGS instead intersects the viewing ray with the disk's plane exactly, per
+pixel. The direct form of that -- invert a matrix per pixel -- would be
+far too slow, so the kernel uses the paper's reformulation: the pixel's
+two ray-defining planes are pulled back into the splat's local `(u, v)`
+frame, where the intersection is the cross product of two homogeneous
+lines. No per-pixel inverse, no approximation. Because the local
+embedding's third column is exactly zero and the projection's last two
+rows are identical by construction, the whole transform collapses to **9
+independent floats** per gaussian, which is what the projection stage
+hands the rasterizer.
+
+The 3DGS EWA path is still computed, but only to bound each splat's screen
+footprint for tile culling, so the existing tiling stage is reused
+unmodified.
+
+### The two regularizers
+
+Exact per-pixel depth and normals are necessary but not sufficient --
+nothing yet forces them to be *mutually* consistent or spatially sharp.
+2DGS adds two terms, both gated to start partway through training:
+
+- **Depth distortion** (`distortion_loss`) concentrates each ray's weight
+  at a single depth instead of smeared across many. A pixel whose
+  contributing splats sit at wildly different depths is penalized in
+  proportion to how far apart they are. This is the Mip-NeRF-360
+  regularizer adapted to splatting, and it is what makes a depth map
+  crisp at object boundaries rather than a soft blend of foreground and
+  background.
+- **Normal consistency** (`normal_consistency_loss`) compares the
+  alpha-composited surfel normal against a *pseudo-normal* derived from
+  the local gradient of the rendered depth map. Where the two disagree,
+  the splats are not lying on a coherent surface. Gradient flows into both
+  sides, so depth and normals converge toward agreeing with each other
+  rather than one chasing a fixed target -- which is precisely the
+  property a mesher needs downstream.
+
+Both are computed on the rasterizer's own outputs: the distortion map is
+accumulated inside the Metal kernel in a single front-to-back pass (with a
+hand-derived closed-form backward), so the loss itself is just a
+reduction.
+
+### Training a real scene
+
+```bash
+uv run python examples/train_garden_2dgs.py
+```
+
+Same COLMAP scene and loader as the 3DGS script, starting from the 2DGS
+paper's own hyperparameters (read off the reference implementation's
+`OptimizationParams` and `train.py`): `lambda_dssim=0.2`,
+`lambda_normal=0.05`, SH degree 3 grown one band at a time, adaptive
+density control, periodic opacity reset, and the two regularizers gated to
+switch on partway through training. Every one of these lives in a single
+constants block at the top of the script, each annotated with the paper's
+own value where it has since been tuned for this scene -- that block, not
+this README, is the source of truth for what a run actually uses. Held-out
+renders *and* normal maps are saved periodically, so the geometry is
+inspectable during training, and the result is written as a `.ply`.
+
+Four documented deviations, each explained at length in the script's
+docstring:
+
+- **Position learning rate** is calibrated to the scene's own point
+  spacing. The paper's absolute values assume its scene-normalization
+  step, which this loader doesn't apply; the *shape* of the schedule
+  (log-linear decay to 1%) is unchanged.
+- **Densification threshold** self-calibrates from a percentile of the
+  first densification round, because this repo's AbsGS-style gradient
+  signal lives on a different numeric scale than the plain gradient norm
+  the paper's literal `0.0002` assumes.
+- **Initial splat scale** targets a 10px screen radius rather than
+  `train_garden.py`'s 3px. At 3px almost nothing exceeded the
+  split-vs-clone size threshold, so densification degenerated into
+  near-pure cloning and complex overlapping regions stayed blurry.
+- **`lambda_dist` defaults to 0.0**, matching the reference repo rather
+  than the paper's 100 (unbounded) / 1000 (bounded). Those values do
+  transfer directly if you want them -- the distortion map is normalized
+  the same way the official CUDA rasterizer normalizes it.
+
+`RESOLUTION_DOWNSCALE` at the top of either training script trades detail
+for speed (step time is linear in pixel count); intrinsics are rescaled
+automatically.
+
+### Module map
+
 - **`metalsplat/gaussians_2dgs.py`** (`Gaussian2DModel`): `raw_scales` is
   `(N, 2)` -- the tangent-plane extents `(s_u, s_v)` -- with no third,
   depth-axis scale. `quat_to_rotmat`'s columns 0/1 are the disk's tangent
@@ -220,16 +340,23 @@ loss.backward()
 - **`metalsplat/ops/rasterize_2dgs.py`** (Metal kernel,
   `kernels/rasterize_2dgs.metal`): same tile-based front-to-back
   compositing structure as 3DGS's rasterizer, but per-pixel alpha comes
-  from resolving the ray-splat intersection (a homogeneous-plane pullback
-  and cross product, no per-pixel matrix inverse) instead of an analytic
+  from the ray-splat intersection described above instead of an analytic
   conic. Unlike 3DGS's forward-only depth, `depth` and `normal` here are
-  genuinely differentiable, and the rasterizer also produces a per-pixel
-  `distortion` map (the Mip-NeRF-360/2DGS "concentrate the weight along
-  the ray" regularizer) with a hand-derived closed-form backward.
-- **`metalsplat/losses.py`**: `distortion_loss` (a reduction over the
-  rasterizer's distortion map) and `normal_consistency_loss` (compares the
-  rendered normal against a pseudo-normal derived from the depth map's
-  local shape, teaching depth and normals to agree).
+  genuinely differentiable, and the rasterizer also produces the per-pixel
+  `distortion` map with a hand-derived closed-form backward. Gradients
+  w.r.t. the projection's transform go through an implicit-function-theorem
+  adjoint on the two ray-plane equations rather than differentiating the
+  cross-product solve directly.
+- **`metalsplat/rendering.py`** (`render_2dgs`): a separate entry point
+  rather than a flag on `render()`, since `render()`'s signature carries
+  3DGS-specific concepts (Mip-Splatting's `filter_3d`/`antialias`
+  compensation) that don't apply here. `return_aux=True` gives
+  `Render2DGSAux` with the differentiable `depth`/`normal`/`distortion`.
+- **`metalsplat/losses.py`**: `distortion_loss` and
+  `normal_consistency_loss` (see above). Both follow the official
+  implementation's handling of accumulated alpha -- the rasterizer's depth
+  and normal outputs are alpha-weighted *sums*, so the normal loss needs
+  `1 - final_T` to interpret either of them.
 - **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`/
   `prune_low_opacity_2dgs`, adaptive density control for `Gaussian2DModel`
   -- a parallel module to `metalsplat/densify.py`, differing only in
@@ -241,22 +368,31 @@ loss.backward()
   own `.ply` layout exactly (identical to `metalsplat/export.py`'s 3DGS
   format except 2 `scale_*` properties instead of 3).
 
-Out of scope for this pass (natural follow-ups): mesh/TSDF extraction (the
-actual point of 2DGS's surface-accuracy machinery -- depth/normal/
-distortion outputs exist but nothing consumes them into a mesh yet) and
-Mip-Splatting's 3D filter generalized to 2 scales.
+As with the 3DGS path, every kernel-backed stage has a pure-PyTorch twin
+under `metalsplat/reference/` that serves as the executable spec, the CPU
+fallback, and -- being plain differentiable torch -- the gradient oracle
+the hand-written Metal backward passes are tested against.
+
+### Status
+
+No held-out quality numbers are quoted for 2DGS yet: the most recent full
+training run predates a correctness fix to the normal-consistency loss, so
+its geometry past iteration 7000 was trained against a wrong target. The
+figures at the top of this README are from the 3DGS pipeline.
+
+Natural follow-ups, not implemented: **mesh/TSDF extraction** (the actual
+payoff of 2DGS's surface accuracy -- the depth/normal/distortion outputs
+all exist, but nothing consumes them into a mesh yet) and Mip-Splatting's
+3D filter generalized to two scales.
 
 ## Roadmap
 
 Deliberately out of scope for this pass:
 
-- SH degree 3 (only degree<=2, 9 coefficients/channel, is implemented; the
-  kernel pattern extends directly, just more basis-function terms).
-- Exact anti-aliasing compensation factor (currently a small `eps * I`
-  regularizer on the 2D covariance for numerical stability instead).
 - Multi-camera batching.
-- Depth/alpha auxiliary render outputs and depth supervision.
+- Depth supervision (depth and alpha *are* available as auxiliary render
+  outputs -- `render(..., return_aux=True)` -- but nothing trains against
+  a depth prior).
 - Camera lens distortion (only undistorted PINHOLE/SIMPLE_PINHOLE COLMAP
   cameras are supported).
-- `.ply` import (`metalsplat.export.save_ply` only exports; loading a
-  `.ply` back into a `GaussianModel` isn't implemented).
+- Mesh/TSDF extraction from the 2DGS pipeline (see its own section above).
