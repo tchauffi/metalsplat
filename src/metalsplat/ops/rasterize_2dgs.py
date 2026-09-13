@@ -33,6 +33,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         background: torch.Tensor,  # (3,) float32
         abs_grad_accum: torch.Tensor
         | None,  # (N,), mutated in place by backward -- see below
+        pixel_count_accum: torch.Tensor | None,  # (N,), likewise
     ):
         device = means2d.device
         n = means2d.shape[0]
@@ -130,6 +131,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         ctx.eps2d = eps2d
         ctx.n = n
         ctx.abs_grad_accum = abs_grad_accum
+        ctx.pixel_count_accum = pixel_count_accum
         return out_image, out_depth, out_normal, out_distortion, out_final_T
 
     @staticmethod
@@ -171,6 +173,11 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         abs_grad_accum = ctx.abs_grad_accum
         if abs_grad_accum is None:
             abs_grad_accum = torch.zeros(n, device=device, dtype=torch.float32)
+        # Covered-pixel counter, the denominator that turns abs_grad_accum
+        # from a sum over pixels into a per-pixel mean (metalsplat.densify2dgs).
+        pixel_count_accum = ctx.pixel_count_accum
+        if pixel_count_accum is None:
+            pixel_count_accum = torch.zeros(n, device=device, dtype=torch.float32)
 
         width_padded = ctx.tiles_x * ctx.tile_size
         height_padded = ctx.tiles_y * ctx.tile_size
@@ -206,6 +213,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 d_opacities,
                 d_colors,
                 abs_grad_accum,
+                pixel_count_accum,
                 threads=(width_padded, height_padded),
                 group_size=(ctx.tile_size, ctx.tile_size),
             )
@@ -213,13 +221,14 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         # One gradient per forward() input: means2d, transform, normal,
         # opacities, colors get real gradients; depths, sorted_ids,
         # tile_bins, tiles_x, img_width, img_height, tile_size, near,
-        # eps2d, background, abs_grad_accum don't.
+        # eps2d, background, abs_grad_accum, pixel_count_accum don't.
         return (
             d_means2d,
             d_transform,
             d_normal,
             d_opacities,
             d_colors,
+            None,
             None,
             None,
             None,
@@ -251,6 +260,7 @@ def rasterize_gaussians_2dgs(
     eps2d: float = 0.3,
     background: torch.Tensor | None = None,
     abs_grad_accum: torch.Tensor | None = None,
+    pixel_count_accum: torch.Tensor | None = None,
 ):
     """Tile-based differentiable ray-splat rasterization of 2D gaussians.
 
@@ -281,6 +291,15 @@ def rasterize_gaussians_2dgs(
     literal `d_means2d` would only capture). Prefer this over
     `means2d.grad.norm()` for `metalsplat.densify2dgs`, matching 3DGS's
     `rendering.render`/`metalsplat.densify` convention.
+
+    `pixel_count_accum`, if given, is an (N,) tensor that backward()
+    accumulates the number of pixels each gaussian actually composited
+    into, on exactly the condition that contributes to `abs_grad_accum`.
+    It is the denominator that turns that sum over pixels into a
+    per-pixel mean: without it the signal scales with a gaussian's
+    screen *area*, so a distant gaussian covering one pixel scores
+    orders of magnitude below a near one covering hundreds, whatever
+    their actual reconstruction error. See `metalsplat.densify2dgs`.
     """
     binning = bin_and_sort_gaussians(
         means2d.detach(),
@@ -313,4 +332,5 @@ def rasterize_gaussians_2dgs(
         eps2d,
         background,
         abs_grad_accum,
+        pixel_count_accum,
     )

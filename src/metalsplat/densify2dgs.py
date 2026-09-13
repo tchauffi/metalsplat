@@ -37,13 +37,37 @@ def densify_and_prune_2dgs(
     prune_opacity_thresh: float = 0.005,
     split_scale_factor: float = 1.6,
     max_points: int | None = None,
+    pixel_count: torch.Tensor | None = None,  # (N,) covered pixels, see below
 ) -> tuple[Gaussian2DModel, DensifyStats]:
     """Splits, clones and prunes a `Gaussian2DModel`, returning the new
     model and stats. See `metalsplat.densify.densify_and_prune` for the
-    full parameter semantics (identical here) -- the only difference is
-    how a split child's random offset is sampled (confined to the
-    parent's tangent plane, since a 2D splat has no third, depth-axis
-    scale to offset along).
+    full parameter semantics (identical here) -- the differences are how a
+    split child's random offset is sampled (confined to the parent's
+    tangent plane, since a 2D splat has no third, depth-axis scale to
+    offset along) and the optional `pixel_count` normalization below.
+
+    `pixel_count`, if given, is the per-gaussian covered-pixel count from
+    `render_2dgs(..., pixel_count_accum=...)`, and replaces `grad_count`
+    as the divisor for `grad_accum`. `grad_accum` is a sum over every
+    (pixel, gaussian) pair, so dividing by the number of *views* leaves a
+    signal proportional to each gaussian's screen **area**: on the garden
+    scene the mean signal falls ~35x from the nearest depth quintile to
+    the farthest, which with a fixed absolute `grad_threshold` means
+    distant gaussians are essentially never selected however badly they
+    reconstruct their region -- the far field silently stops densifying.
+    Dividing by covered pixels instead makes it a per-pixel mean, which is
+    comparable across depths.
+
+    This is pixel-aware in the sense of Pixel-GS (Zhang et al. 2024), but
+    not that paper's rule: it weights *views* by coverage to accelerate
+    large gaussians, whereas this normalizes *by* coverage to stop small
+    ones being starved. The failure modes are opposite, so the direction
+    is too; a gaussian covering one pixel in every view is unaffected by
+    the paper's weighting and rescued by this.
+
+    `grad_count` is still what defines visibility, so a gaussian that was
+    in frustum but composited into no pixel is skipped rather than
+    dividing by zero.
     """
     device = model.means.device
     n = model.num_points
@@ -64,7 +88,14 @@ def densify_and_prune_2dgs(
         )
 
     avg_grad = torch.zeros(n, device=device)
-    avg_grad[visible] = grad_accum[visible] / grad_count[visible]
+    if pixel_count is None:
+        avg_grad[visible] = grad_accum[visible] / grad_count[visible]
+    else:
+        # Only gaussians that actually covered a pixel have a meaningful
+        # per-pixel mean; the rest keep 0 and fall below any threshold.
+        covered = visible & (pixel_count > 0)
+        avg_grad[covered] = grad_accum[covered] / pixel_count[covered]
+        visible = covered
     if grad_threshold is None:
         threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
     else:

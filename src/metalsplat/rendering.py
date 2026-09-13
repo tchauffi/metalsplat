@@ -188,6 +188,7 @@ def render_2dgs(
     background: torch.Tensor | None = None,
     return_aux: bool = False,
     abs_grad_accum: torch.Tensor | None = None,
+    pixel_count_accum: torch.Tensor | None = None,
 ):
     """Renders `model` (a `Gaussian2DModel`) from `camera`'s viewpoint.
 
@@ -211,7 +212,9 @@ def render_2dgs(
     `rasterize_gaussians_2dgs`: an (N,) tensor that backward() atomically
     adds each gaussian's AbsGS-style densification signal into -- see
     that function's docstring and `metalsplat.densify2dgs` for how it's
-    used.
+    used. Pass `pixel_count_accum` alongside it to also collect the
+    covered-pixel counts that normalize that signal per pixel rather
+    than per screen area.
     """
     means2d, depths, conics, radii, valid, _compensation, transform, normal = (
         project_gaussians_2dgs(
@@ -256,6 +259,7 @@ def render_2dgs(
         eps2d=eps2d,
         background=background,
         abs_grad_accum=abs_grad_accum,
+        pixel_count_accum=pixel_count_accum,
     )
     if return_aux:
         return Render2DGSAux(

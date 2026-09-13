@@ -303,3 +303,135 @@ def test_distortion_backward_matches_reference_in_isolation(n):
     assert torch.allclose(
         means2d_mps.grad.cpu(), means2d_ref.grad, atol=1e-3, rtol=1e-2
     )
+
+
+def _reference_pixel_counts(proj, opacities):
+    """Brute-force per-gaussian covered-pixel tally from the reference
+    rasterizer's own compositing rules (alpha >= 1/255 while the pixel is
+    still transmissive), independent of the kernel under test.
+    """
+    order = torch.argsort(
+        torch.where(proj.valid, proj.depths, torch.full_like(proj.depths, float("inf")))
+    )
+    ys, xs = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32) + 0.5,
+        torch.arange(W, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    trans = torch.ones(H, W)
+    counts = torch.zeros(proj.means2d.shape[0])
+    for i in order:
+        if not bool(proj.valid[i]):
+            continue
+        row0, row1, row2 = proj.transform[i]
+        hu = row0 - xs.unsqueeze(-1) * row2
+        hv = row1 - ys.unsqueeze(-1) * row2
+        cross = torch.linalg.cross(hu, hv, dim=-1)
+        wloc = cross[..., 2]
+        degen = wloc.abs() < 1e-9
+        safe = torch.where(degen, torch.ones_like(wloc), wloc)
+        u, v = cross[..., 0] / safe, cross[..., 1] / safe
+        rho_uv = torch.where(degen, torch.full_like(wloc, float("inf")), u * u + v * v)
+        d = torch.stack([xs, ys], dim=-1) - proj.means2d[i]
+        rho_screen = (d[..., 0] ** 2 + d[..., 1] ** 2) / EPS2D
+        uv_active = rho_uv <= rho_screen
+        rho = torch.where(uv_active, rho_uv, rho_screen)
+        z_hit = torch.where(
+            degen | ~uv_active,
+            proj.depths[i].expand_as(wloc),
+            row2[0] * u + row2[1] * v + row2[2],
+        )
+        alpha = (opacities[i] * torch.exp(-0.5 * rho)).clamp(max=0.99)
+        alpha = torch.where(z_hit <= NEAR, torch.zeros_like(alpha), alpha)
+        contributes = (trans >= 1e-4) & (alpha >= 1.0 / 255.0)
+        counts[i] = contributes.sum()
+        trans = trans * torch.where(contributes, 1 - alpha, torch.ones_like(alpha))
+    return counts
+
+
+def test_pixel_count_accum_counts_covered_pixels():
+    """`pixel_count_accum` must count the pixels each gaussian composited
+    into, on exactly the condition that feeds `abs_grad_accum`.
+
+    It is the denominator that turns the AbsGS sum into a per-pixel mean
+    (metalsplat.densify2dgs), so the two have to agree about which
+    (pixel, gaussian) pairs count: a gaussian with a non-zero signal and a
+    zero count would divide by zero, and a count that included pixels the
+    gaussian never touched would understate dense regions.
+    """
+    n = 20
+    proj, opacities, colors = _random_scene(n, seed=4)
+    counts = torch.zeros(n, device="mps")
+    absgrad = torch.zeros(n, device="mps")
+
+    out = rasterize_gaussians_2dgs(
+        proj.means2d.to("mps"),
+        proj.transform.reshape(n, 9).to("mps").requires_grad_(),
+        proj.normal.to("mps"),
+        opacities.to("mps").requires_grad_(),
+        colors.to("mps").requires_grad_(),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+        abs_grad_accum=absgrad,
+        pixel_count_accum=counts,
+    )
+    out[0].sum().backward()
+    torch.mps.synchronize()
+
+    counts_cpu, absgrad_cpu = counts.cpu(), absgrad.cpu()
+    assert counts_cpu.shape == (n,)
+    assert (counts_cpu >= 0).all()
+    assert counts_cpu.sum() > 0, "no gaussian covered any pixel"
+    # Whole numbers: this is a tally, accumulated as float only because
+    # Metal's atomic_fetch_add is float here.
+    assert torch.allclose(counts_cpu, counts_cpu.round())
+    # No pixel is counted twice per gaussian, so the tally cannot exceed
+    # the number of pixels in the image.
+    assert counts_cpu.max() <= W * H
+    # The two accumulators must agree on which pairs contribute, or the
+    # per-pixel mean divides by zero exactly where it matters most.
+    assert not ((absgrad_cpu > 0) & (counts_cpu == 0)).any()
+
+
+def test_pixel_count_accum_matches_a_brute_force_count():
+    """Cross-checks the tally against the reference rasterizer's own
+    per-pixel loop, so it measures coverage rather than merely being
+    self-consistent.
+    """
+    n = 12
+    proj, opacities, colors = _random_scene(n, seed=5)
+    counts = torch.zeros(n, device="mps")
+
+    out = rasterize_gaussians_2dgs(
+        proj.means2d.to("mps"),
+        proj.transform.reshape(n, 9).to("mps").requires_grad_(),
+        proj.normal.to("mps"),
+        opacities.to("mps").requires_grad_(),
+        colors.to("mps").requires_grad_(),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+        pixel_count_accum=counts,
+    )
+    out[0].sum().backward()
+    torch.mps.synchronize()
+
+    expected = _reference_pixel_counts(proj, opacities)
+    # Exact agreement is not expected at the alpha>=1/255 and T<1e-4
+    # cutoffs, where GPU-vs-CPU float32 noise flips individual pixels --
+    # the same boundary effect the forward/backward tests allow for.
+    diff = (counts.cpu() - expected).abs()
+    assert diff.max() <= 0.02 * expected.clamp_min(1.0).max(), (
+        f"max |diff| {diff.max()} against counts up to {expected.max()}"
+    )

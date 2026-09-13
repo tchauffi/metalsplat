@@ -279,6 +279,7 @@ kernel void rasterize_2dgs_backward(
     device atomic_float* d_opacities,                               // (N,)
     device atomic_float* d_colors,                                   // (N,3)
     device atomic_float* d_means2d_abs,                               // (N,) AbsGS-style densification signal
+    device atomic_float* d_pixel_count,                                // (N,) pixels this gaussian contributed to
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint2 local_pos [[thread_position_in_threadgroup]],
     uint local_idx [[thread_index_in_threadgroup]],
@@ -351,6 +352,11 @@ kernel void rasterize_2dgs_backward(
             float2 g_mean2d = float2(0.0);
             float g_opacity = 0.0;
             float g_abs = 0.0;
+            // 1.0 for each pixel this gaussian actually composited into, so
+            // the host can turn the summed |screen gradient| into a *per
+            // pixel* mean. Counted on exactly the same condition that adds
+            // to g_abs, so the two are always consistent denominators.
+            float g_pixels = 0.0;
 
             if (active && (batch_start + j) <= last) {
                 float3 row0 = sh_row0[j], row1 = sh_row1[j], row2 = sh_row2[j];
@@ -447,6 +453,7 @@ kernel void rasterize_2dgs_backward(
                     // backward.cu), not from a screen-fallback-only term.
                     float2 g_mean2d_equiv = g_mean2d + float2(g_row0.z, g_row1.z) * z_hit;
                     g_abs = length(g_mean2d_equiv);
+                    g_pixels = 1.0;
 
                     A_color = alpha * color + (1.0 - alpha) * A_color;
                     A_depth = alpha * z_hit + (1.0 - alpha) * A_depth;
@@ -467,12 +474,13 @@ kernel void rasterize_2dgs_backward(
             float r_mx = simd_sum(g_mean2d.x), r_my = simd_sum(g_mean2d.y);
             float r_op = simd_sum(g_opacity);
             float r_abs = simd_sum(g_abs);
+            float r_pixels = simd_sum(g_pixels);
 
             if (lane == 0) {
                 bool any = (r_row0x!=0.0)||(r_row0y!=0.0)||(r_row0z!=0.0)
                         || (r_row1x!=0.0)||(r_row1y!=0.0)||(r_row1z!=0.0)
                         || (r_row2x!=0.0)||(r_row2y!=0.0)||(r_row2z!=0.0)
-                        || (r_abs!=0.0)
+                        || (r_abs!=0.0) || (r_pixels!=0.0)
                         || (r_nx!=0.0)||(r_ny!=0.0)||(r_nz!=0.0)
                         || (r_colx!=0.0)||(r_coly!=0.0)||(r_colz!=0.0)
                         || (r_mx!=0.0)||(r_my!=0.0)||(r_op!=0.0);
@@ -497,6 +505,7 @@ kernel void rasterize_2dgs_backward(
                     atomic_fetch_add_explicit(&d_means2d[gid*2+1], r_my, memory_order_relaxed);
                     atomic_fetch_add_explicit(&d_opacities[gid], r_op, memory_order_relaxed);
                     atomic_fetch_add_explicit(&d_means2d_abs[gid], r_abs, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&d_pixel_count[gid], r_pixels, memory_order_relaxed);
                 }
             }
         }
