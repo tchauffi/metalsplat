@@ -14,23 +14,31 @@ would otherwise be the hardest thing in this feature to hand-derive and
 trust; that closed form was validated against `torch.autograd` on this
 module's plain recursion before being written into the kernel.
 
-Distortion is defined on the *compositing sequence* (gaussians sorted by
-mean depth, the same order used for alpha blending), as
-`2 * sum_k w_k * (m_k * A_{k-1} - D_{k-1})` where `A`/`D` are running
-prefix sums of weight / weight*m -- algebraically equal to
-`sum_{i<j} w_i*w_j*(m_j - m_i)` over that *sequence* order. This is *not*
-the same as `sum_i sum_j w_i*w_j*|z_i - z_j|` re-sorted by actual
-intersection depth: 2DGS's exact per-pixel ray-splat intersection depth
-can differ from a gaussian's mean depth enough that the compositing
-sequence isn't itself monotonic in `z_hit` at a given pixel, in which case
-this (deliberately, for O(N) tractability -- re-sorting per pixel would
-need an O(N log N) sort with its own backward) can be small or even
-slightly negative rather than the ideal always-non-negative penalty. This
-matches what an efficient GPU implementation can actually compute, and is
-the same order-dependent definition the Metal kernel's running-sum forward
-uses -- the two must never be allowed to diverge (e.g. one re-sorting by
-`z_hit`, the other not), or kernel-vs-reference tests stop being a
-meaningful check of anything.
+Distortion is Mip-NeRF-360's pairwise second moment of the per-pixel
+weight distribution, `sum_{i<j} w_i*w_j*(m_i - m_j)^2`, accumulated in a
+single front-to-back pass by the standard prefix-sum expansion
+`sum_k w_k * (m_k^2*A_{k-1} - 2*m_k*M1_{k-1} + M2_{k-1})`, where `A`/`M1`/
+`M2` are running prefix sums of `w` / `w*m` / `w*m^2` (this is exactly
+2DGS's appendix trick, and exactly what `diff-surfel-rasterization`'s
+`forward.cu` computes).
+
+The *squared* difference is what makes this a regularizer at all, and it
+is worth being explicit about why, because the cheaper-looking
+first-power variant `2 * sum_k w_k * (m_k*A_{k-1} - D_{k-1})` =
+`sum_{i<j} w_i*w_j*(m_j - m_i)` is a trap this module used to fall into.
+That variant is *signed* and therefore depends on the compositing
+sequence rather than on the weight distribution: gaussians are composited
+in order of their *mean* depth, but each pixel's actual ray-splat
+intersection depth `z_hit` need not be monotonic in that order, so the
+sum can be driven arbitrarily negative by tilting splats until their
+`z_hit` ordering contradicts their mean-depth ordering. Minimizing it
+therefore *rewards* edge-on, depth-scrambling splats -- the exact
+opposite of the intended "concentrate the weight along the ray" effect --
+and no per-pixel clamp fixes that, since a clamp at zero still leaves
+depth-scrambling as a free way to reach zero. The squared form has
+neither problem: every term is non-negative, the sum is symmetric in
+`i`/`j` so the compositing order drops out entirely, and its only
+minimizer is a weight distribution concentrated at a single depth.
 
 `m` is *not* the raw metric intersection depth: it is the normalized
 inverse-depth `m = far/(far - near) * (1 - near/z_hit)`, which maps
@@ -103,11 +111,12 @@ def rasterize_gaussians_2dgs(
     distortion_map = torch.zeros(img_height, img_width, device=device, dtype=dtype)
     trans = torch.ones(img_height, img_width, device=device, dtype=dtype)
 
-    # Running prefix sums for the distortion telescoping recursion (see
-    # module docstring): A = sum of weights so far, D = sum of
-    # weight*m so far (m = normalized depth), in compositing-sequence order.
+    # Running prefix sums for the distortion expansion (see module
+    # docstring): the zeroth/first/second moments of the weight
+    # distribution over normalized depth `m` accumulated so far.
     dist_A = torch.zeros(img_height, img_width, device=device, dtype=dtype)
-    dist_D = torch.zeros(img_height, img_width, device=device, dtype=dtype)
+    dist_M1 = torch.zeros(img_height, img_width, device=device, dtype=dtype)
+    dist_M2 = torch.zeros(img_height, img_width, device=device, dtype=dtype)
     dist_scale = DISTORTION_FAR / (DISTORTION_FAR - near)
 
     for i in order:
@@ -182,9 +191,12 @@ def rasterize_gaussians_2dgs(
         image = image + weight[..., None] * colors[i]
         depth_map = depth_map + weight * z_hit
         normal_map = normal_map + weight[..., None] * normal[i]
-        distortion_map = distortion_map + 2.0 * weight * (m * dist_A - dist_D)
+        distortion_map = distortion_map + weight * (
+            m * m * dist_A - 2.0 * m * dist_M1 + dist_M2
+        )
         dist_A = dist_A + weight
-        dist_D = dist_D + weight * m
+        dist_M1 = dist_M1 + weight * m
+        dist_M2 = dist_M2 + weight * m * m
         trans = trans * (1 - alpha_eff)
 
     image = image + trans[..., None] * background

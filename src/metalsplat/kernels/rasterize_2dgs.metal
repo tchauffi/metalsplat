@@ -104,8 +104,9 @@ kernel void rasterize_2dgs_forward(
     device float* out_depth,                            // (H,W)
     device float* out_normal,                            // (H,W,3)
     device float* out_distortion,                         // (H,W)
-    device float* out_dist_depth,                          // (H,W) sum of weight*m, backward-only
-    device float* out_final_T,                              // (H,W)
+    device float* out_dist_m1,                             // (H,W) sum of weight*m, backward-only
+    device float* out_dist_m2,                              // (H,W) sum of weight*m*m, backward-only
+    device float* out_final_T,                               // (H,W)
     device int* out_last_contributor,                        // (H,W)
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint2 local_pos [[thread_position_in_threadgroup]])
@@ -125,10 +126,11 @@ kernel void rasterize_2dgs_forward(
     float T = 1.0;
     int last_contributor = -1;
 
-    // Running (weight, depth) prefix sums for the distortion loss, in the
+    // Running zeroth/first/second moments of the per-pixel weight
+    // distribution over normalized depth, for the distortion loss -- the
     // exact same accumulation this pixel's backward pass will need to
-    // invert -- see rasterize_2dgs_backward's module-level derivation.
-    float A_dist = 0.0, D_dist = 0.0, L_dist = 0.0;
+    // invert (see rasterize_2dgs_backward's module-level derivation).
+    float A_dist = 0.0, M1_dist = 0.0, M2_dist = 0.0, L_dist = 0.0;
 
     for (int idx = start; idx < end; idx++) {
         int gid = sorted_ids[idx];
@@ -154,17 +156,18 @@ kernel void rasterize_2dgs_forward(
         accum_depth += weight * z_hit;
         accum_normal += weight * normal_g;
 
-        // Mip-NeRF-360/2DGS distortion regularizer, accumulated in one
-        // front-to-back pass via the telescoping identity (see
-        // rasterize_2dgs_ref's module docstring and
-        // rasterize_2dgs_backward's derivation note for the exact
-        // compositing-order-based definition and why it isn't re-sorted
-        // by actual per-pixel z_hit). Runs on normalized depth `m`, not
-        // metric z_hit -- `accum_depth` above keeps the metric units.
+        // Mip-NeRF-360/2DGS distortion regularizer
+        // sum_{i<j} w_i*w_j*(m_i - m_j)^2, accumulated in one front-to-back
+        // pass via the prefix-moment expansion (see rasterize_2dgs_ref's
+        // module docstring, including why the *squared* difference is
+        // load-bearing and the cheaper signed variant is not a regularizer
+        // at all). Runs on normalized depth `m`, not metric z_hit --
+        // `accum_depth` above keeps the metric units.
         float m = normalized_depth(z_hit, near);
-        L_dist += 2.0 * weight * (m * A_dist - D_dist);
+        L_dist += weight * (m * m * A_dist - 2.0 * m * M1_dist + M2_dist);
         A_dist += weight;
-        D_dist += weight * m;
+        M1_dist += weight * m;
+        M2_dist += weight * m * m;
 
         T = test_T;
         last_contributor = idx;
@@ -181,7 +184,8 @@ kernel void rasterize_2dgs_forward(
     out_normal[pixel_idx * 3 + 1] = accum_normal.y;
     out_normal[pixel_idx * 3 + 2] = accum_normal.z;
     out_distortion[pixel_idx] = L_dist;
-    out_dist_depth[pixel_idx] = D_dist;
+    out_dist_m1[pixel_idx] = M1_dist;
+    out_dist_m2[pixel_idx] = M2_dist;
     out_final_T[pixel_idx] = T;
     out_last_contributor[pixel_idx] = last_contributor;
 }
@@ -196,39 +200,48 @@ kernel void rasterize_2dgs_forward(
 // (unlike color's `A`, which seeds at `background` because the forward
 // pass adds a T*background residual that depth/normal don't have).
 //
-// The distortion loss L = 2*sum_k w_k*(mu_k*A_{k-1} - D_{k-1}) (A/D =
-// running prefix weight/weight*mu sums, in *compositing-sequence*
-// order -- see rasterize_2dgs_ref's module docstring for why this is
-// defined on sequence order rather than re-sorted by actual z_hit) is NOT
-// of that linear form (each term depends on *other* gaussians' weights
-// through the prefix/suffix sums), so it needs its own derivation. Writing
-// it this way and differentiating w.r.t. alpha_m through the full
+// The distortion loss L = sum_{i<j} w_i*w_j*(mu_i - mu_j)^2 (accumulated
+// forward via prefix moments A/M1/M2 of w / w*mu / w*mu^2 -- see
+// rasterize_2dgs_ref's module docstring) is NOT of that linear form (each
+// term depends on *other* gaussians' weights), so it needs its own
+// derivation. Differentiating w.r.t. alpha_m through the full
 // transmittance chain (T_k depends on alpha_m for every k > m too, not
-// just k = m) gives, after collecting every pair (i,j) that alpha_m's
-// perturbation touches:
+// just k = m) and collecting every pair (i,j) that alpha_m's perturbation
+// touches gives:
 //
-//   dL/dalpha_m = 2*[ T_m*f_m
-//                    + T_m*Zsuffix_m*(1-2*alpha_m)/(1-alpha_m)
-//                    - Lsuffix_m/(1-alpha_m)
-//                    - (A_{m-1}*Dsuffix_m - D_{m-1}*Asuffix_m)/(1-alpha_m) ]
+//   dL/dalpha_m = T_m*Fpre_m
+//               + T_m*Gsuf_m*(1-2*alpha_m)/(1-alpha_m)
+//               - 2*Lsuf_m/(1-alpha_m)
+//               - Cross_m/(1-alpha_m)
 //
-// where f_m = mu_m*A_{m-1} - D_{m-1}, Zsuffix_m = Dsuffix_m -
-// mu_m*Asuffix_m, and Lsuffix_m is L itself computed using only gaussians
-// *after* m. All four pieces -- A_{m-1}/D_{m-1} (prefix, decremented as we
-// walk back-to-front from a running total seeded at the forward pass's
-// final A_total=1-final_T/D_total=dist_depth) and
-// Asuffix_m/Dsuffix_m/Lsuffix_m (suffix, incremented as we walk) -- are
-// O(1)-update running scalars in the SAME single back-to-front pass already
-// used for color/opacity/mean.
+// where, splitting the contributors at m into a prefix (i < m) and a
+// suffix (k > m):
+//
+//   Fpre_m = sum_{i<m} w_i*(mu_m - mu_i)^2
+//          = mu_m^2*Apre - 2*mu_m*M1pre + M2pre
+//   Gsuf_m = sum_{k>m} w_k*(mu_m - mu_k)^2
+//          = mu_m^2*Asuf - 2*mu_m*M1suf + M2suf
+//   Cross_m = sum_{i<m} sum_{k>m} w_i*w_k*(mu_i - mu_k)^2
+//           = M2pre*Asuf - 2*M1pre*M1suf + Apre*M2suf
+//   Lsuf_m  = L itself computed using only gaussians *after* m
+//
+// Every piece is an O(1)-update running scalar in the SAME single
+// back-to-front pass already used for color/opacity/mean: the prefix
+// moments Apre/M1pre/M2pre are decremented from running totals seeded at
+// the forward pass's finals (A_total = 1-final_T, M1_total = dist_m1,
+// M2_total = dist_m2), and the suffix moments Asuf/M1suf/M2suf plus
+// Lsuf (via Lsuf += w_m*Gsuf_m) are incremented as we walk.
 //
 // `mu_k` here is the *normalized* depth m = far/(far-near)*(1 - near/z_k),
 // not the metric z_k (see normalized_depth() above and
 // rasterize_2dgs_ref's module docstring for why). That only changes the
-// depth-gradient branch: dL/dmu_m = 2*w_m*(A_{m-1}-Asuffix_m) (which needs
-// no alpha-chain correction, since depths don't affect weights) is chained
-// onto z by dm/dz = far/(far-near)*near/z^2. Note D_run must therefore be
-// seeded from the forward's `dist_depth` (sum of w*m), NOT from `out_depth`
-// (sum of w*z, the metric depth map) -- those are different accumulations.
+// depth-gradient branch: dL/dmu_m = 2*w_m*(mu_m*(Apre+Asuf) -
+// (M1pre+M1suf)) (which needs no alpha-chain correction, since depths
+// don't affect weights) is chained onto z by dm/dz =
+// far/(far-near)*near/z^2. Note the moment running totals must therefore
+// be seeded from the forward's `dist_m1`/`dist_m2` (sums of w*m and
+// w*m*m), NOT from `out_depth` (sum of w*z, the metric depth map) --
+// those are different accumulations.
 //
 // This closed form was derived and numerically verified against
 // torch.autograd on rasterize_2dgs_ref's plain-torch recursion before being
@@ -267,8 +280,9 @@ kernel void rasterize_2dgs_backward(
     constant float& eps2d,
     constant float* background,
     device const float* final_T,                       // (H,W), from forward
-    device const float* dist_depth,                      // (H,W), from forward, sum of weight*m
-    device const int* last_contributor,                   // (H,W), from forward
+    device const float* dist_m1,                         // (H,W), from forward, sum of weight*m
+    device const float* dist_m2,                          // (H,W), from forward, sum of weight*m*m
+    device const int* last_contributor,                    // (H,W), from forward
     device const float* d_out_image,                       // (H,W,3)
     device const float* d_out_depth,                         // (H,W)
     device const float* d_out_normal,                         // (H,W,3)
@@ -319,13 +333,15 @@ kernel void rasterize_2dgs_backward(
     float A_depth = 0.0;
     float3 A_normal = float3(0.0);
 
-    // Distortion running state: A_run/D_run = prefix through the current
-    // index inclusive (seeded at the forward totals, decremented as we
-    // walk back-to-front); Asuf/Dsuf/Lsuf = suffix strictly after the
-    // current index (seeded at 0, incremented as we walk).
+    // Distortion running state: A_run/M1_run/M2_run = prefix moments
+    // through the current index inclusive (seeded at the forward totals,
+    // decremented as we walk back-to-front); Asuf/M1suf/M2suf/Lsuf =
+    // suffix strictly after the current index (seeded at 0, incremented
+    // as we walk).
     float A_run = active ? (1.0 - T) : 0.0;
-    float D_run = active ? dist_depth[pixel_idx] : 0.0;
-    float Asuf = 0.0, Dsuf = 0.0, Lsuf = 0.0;
+    float M1_run = active ? dist_m1[pixel_idx] : 0.0;
+    float M2_run = active ? dist_m2[pixel_idx] : 0.0;
+    float Asuf = 0.0, M1suf = 0.0, M2suf = 0.0, Lsuf = 0.0;
 
     for (int batch_end = end; batch_end > start; batch_end -= BACKWARD_BATCH) {
         int batch_start = max(start, batch_end - BACKWARD_BATCH);
@@ -379,21 +395,26 @@ kernel void rasterize_2dgs_backward(
                     float d_alpha_n = dot(T * (normal_g - A_normal), d_Normal);
 
                     // Distortion runs on normalized depth `m`, so every
-                    // prefix/suffix sum here is over weight*m, and the
+                    // prefix/suffix moment here is over weight*m^p, and the
                     // resulting depth gradient is chained back onto metric
                     // z_hit via dm/dz. See the derivation note above.
                     float m_norm = normalized_depth(z_hit, near);
+                    float m_sq = m_norm * m_norm;
                     float A_excl = A_run - weight;
-                    float D_excl = D_run - weight * m_norm;
-                    float f_m = m_norm * A_excl - D_excl;
-                    float Zsuf = Dsuf - m_norm * Asuf;
-                    float contrib1 = T * f_m;
-                    float contrib2 = T * Zsuf * (1.0 - 2.0 * alpha) / (1.0 - alpha);
-                    float contrib3 = -Lsuf / (1.0 - alpha);
-                    float contrib4 = -(A_excl * Dsuf - D_excl * Asuf) / (1.0 - alpha);
-                    float d_alpha_dist = 2.0 * (contrib1 + contrib2 + contrib3 + contrib4) * d_Dist;
-                    float g_zhit_dist = 2.0 * weight * (A_excl - Asuf) * d_Dist
-                                        * d_normalized_depth_dz(z_hit, near);
+                    float M1_excl = M1_run - weight * m_norm;
+                    float M2_excl = M2_run - weight * m_sq;
+                    float inv_1ma = 1.0 / (1.0 - alpha);  // alpha <= 0.99, never singular
+                    float Fpre = m_sq * A_excl - 2.0 * m_norm * M1_excl + M2_excl;
+                    float Gsuf = m_sq * Asuf - 2.0 * m_norm * M1suf + M2suf;
+                    float cross = M2_excl * Asuf - 2.0 * M1_excl * M1suf + A_excl * M2suf;
+                    float contrib1 = T * Fpre;
+                    float contrib2 = T * Gsuf * (1.0 - 2.0 * alpha) * inv_1ma;
+                    float contrib3 = -2.0 * Lsuf * inv_1ma;
+                    float contrib4 = -cross * inv_1ma;
+                    float d_alpha_dist = (contrib1 + contrib2 + contrib3 + contrib4) * d_Dist;
+                    float g_zhit_dist = 2.0 * weight
+                                        * (m_norm * (A_excl + Asuf) - (M1_excl + M1suf))
+                                        * d_Dist * d_normalized_depth_dz(z_hit, near);
 
                     float d_alpha = d_alpha_c + d_alpha_z + d_alpha_n + d_alpha_dist;
                     if (raw >= 0.99) d_alpha = 0.0;
@@ -458,11 +479,13 @@ kernel void rasterize_2dgs_backward(
                     A_color = alpha * color + (1.0 - alpha) * A_color;
                     A_depth = alpha * z_hit + (1.0 - alpha) * A_depth;
                     A_normal = alpha * normal_g + (1.0 - alpha) * A_normal;
-                    Lsuf = Lsuf + 2.0 * weight * Zsuf;
+                    Lsuf = Lsuf + weight * Gsuf;
                     Asuf = Asuf + weight;
-                    Dsuf = Dsuf + weight * m_norm;
+                    M1suf = M1suf + weight * m_norm;
+                    M2suf = M2suf + weight * m_sq;
                     A_run = A_excl;
-                    D_run = D_excl;
+                    M1_run = M1_excl;
+                    M2_run = M2_excl;
                 }
             }
 

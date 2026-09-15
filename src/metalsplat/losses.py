@@ -80,19 +80,22 @@ def gaussian_splatting_loss(
 def distortion_loss(distortion_map: torch.Tensor) -> torch.Tensor:
     """`distortion_map`: (H, W), `render_2dgs(..., return_aux=True).distortion`
     (Mip-NeRF-360/2DGS's "concentrate the weight along the ray"
-    regularizer -- see `rasterize_2dgs_ref`'s module docstring for its
-    exact definition). The expensive part already happened in the
-    rasterizer; this is mostly the scalar reduction.
+    regularizer, `sum_{i<j} w_i*w_j*(m_i - m_j)^2` per pixel -- see
+    `rasterize_2dgs_ref`'s module docstring for the full definition). The
+    expensive part already happened in the rasterizer; this is just the
+    scalar reduction.
 
-    Clamped at 0 per pixel first: the map is defined on the compositing
-    (mean-depth-sorted) order rather than each pixel's actual ray-splat
-    intersection order, so a pixel whose contributing gaussians happen to
-    be out of order in `z_hit` can come out slightly negative -- an
-    approximation artifact, not a real "negative distortion". Averaging
-    those in unclamped would let the optimizer *reward* creating more such
-    artifacts instead of only ever penalizing spread-out depth.
+    No clamp: every term of that sum is a weighted square, so the map is
+    non-negative up to float32 cancellation in the rasterizer's
+    prefix-moment expansion (measured a few units in the last place, ~1e-5
+    of a typical peak -- nothing an optimizer can exploit). It used to be
+    clamped at 0, back when the rasterizer accumulated the *signed*
+    first-power variant, which went genuinely negative and whose minimizer
+    was depth-scrambling rather than depth-concentrating; no clamp could
+    fix that, since zero stayed reachable by scrambling. See the same
+    docstring.
     """
-    return distortion_map.clamp_min(0.0).mean()
+    return distortion_map.mean()
 
 
 ALPHA_EPS = 1e-6  # floor for the depth/alpha division below

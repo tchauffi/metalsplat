@@ -205,7 +205,7 @@ def test_distortion_uses_normalized_depth_not_metric_depth():
 
     Two front-facing disks on the optical axis, at known depths, produce a
     two-term compositing sequence at the principal-point pixel whose
-    distortion is exactly `2*w1*w2*(m2 - m1)` -- with `m` the *normalized*
+    distortion is exactly `w1*w2*(m2 - m1)^2` -- with `m` the *normalized*
     inverse depth `far/(far-near)*(1 - near/z)` the official 2DGS CUDA
     rasterizer uses, not the raw metric `z`. Both alphas are exact there
     (the optical-axis ray hits each disk at u=v=0, so rho=0 and
@@ -249,11 +249,168 @@ def test_distortion_uses_normalized_depth_not_metric_depth():
     m2 = far / (far - near) * (1.0 - near / z2)
     w1 = o1
     w2 = (1.0 - o1) * o2
-    expected = 2.0 * w1 * w2 * (m2 - m1)
+    expected = w1 * w2 * (m2 - m1) ** 2
 
-    assert out["distortion"][1, 1].item() == pytest.approx(expected, rel=1e-5)
+    # rel=1e-4, not tighter: (m2 - m1) is a cancelling difference of two
+    # O(1) float32 numbers and squaring doubles its relative error.
+    assert out["distortion"][1, 1].item() == pytest.approx(expected, rel=1e-4)
 
-    # And the metric-depth version it must NOT be -- three orders of
+    # And the metric-depth version it must NOT be -- four orders of
     # magnitude apart, so this can never pass by coincidence.
-    metric = 2.0 * w1 * w2 * (z2 - z1)
+    metric = w1 * w2 * (z2 - z1) ** 2
     assert abs(metric / expected) > 100.0
+
+
+def _per_gaussian_weights_and_depths(proj, opacities, near=0.2, eps2d=0.3):
+    """Replays the reference rasterizer's compositing loop, but keeps each
+    contributing gaussian's per-pixel `(weight, normalized depth)` instead
+    of accumulating them -- so a test can brute-force the distortion's
+    pairwise definition rather than re-deriving the same running sums the
+    implementation uses (which would just test the code against itself).
+
+    Returns two `(N, H, W)` tensors, in compositing order.
+    """
+    order = torch.argsort(
+        torch.where(proj.valid, proj.depths, torch.full_like(proj.depths, float("inf")))
+    )
+    h, w = 40, 40  # matches _tilted_overlapping_scene's camera
+    ys, xs = torch.meshgrid(
+        torch.arange(h, dtype=torch.float32) + 0.5,
+        torch.arange(w, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    trans = torch.ones(h, w)
+    weights, depths_m = [], []
+    scale = DISTORTION_FAR / (DISTORTION_FAR - near)
+    for i in order:
+        if not bool(proj.valid[i]):
+            continue
+        row0, row1, row2 = proj.transform[i]
+        h_u = row0 - xs.unsqueeze(-1) * row2
+        h_v = row1 - ys.unsqueeze(-1) * row2
+        cross = torch.linalg.cross(h_u, h_v, dim=-1)
+        w_local = cross[..., 2]
+        degenerate = w_local.abs() < 1e-9
+        safe = torch.where(degenerate, torch.ones_like(w_local), w_local)
+        u, v = cross[..., 0] / safe, cross[..., 1] / safe
+        rho_uv = torch.where(
+            degenerate, torch.full_like(w_local, float("inf")), u * u + v * v
+        )
+        d2d = torch.stack([xs, ys], dim=-1) - proj.means2d[i]
+        rho_screen = (d2d[..., 0] ** 2 + d2d[..., 1] ** 2) / eps2d
+        uv_active = rho_uv <= rho_screen
+        rho = torch.where(uv_active, rho_uv, rho_screen)
+        z_hit = torch.where(
+            degenerate | ~uv_active,
+            proj.depths[i].expand_as(w_local),
+            row2[0] * u + row2[1] * v + row2[2],
+        )
+        alpha = (opacities[i] * torch.exp(-0.5 * rho)).clamp(max=0.99)
+        alpha = torch.where(z_hit <= near, torch.zeros_like(alpha), alpha)
+        alpha_eff = torch.where(
+            (trans >= 1e-4) & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha)
+        )
+        weights.append(trans * alpha_eff)
+        depths_m.append(scale * (1.0 - near / z_hit.clamp_min(near)))
+        trans = trans * (1 - alpha_eff)
+    return torch.stack(weights), torch.stack(depths_m)
+
+
+def _tilted_overlapping_scene(seed=0, n=12):
+    """Random *steeply tilted* overlapping disks in front of a 40x40 camera.
+
+    Tilt is the point: a disk whose plane is oblique to the view direction
+    has a per-pixel ray-splat intersection depth that varies across its own
+    footprint, so the compositing sequence (sorted by each gaussian's
+    *mean* depth) stops being monotonic in `z_hit` at a given pixel. That
+    is the configuration the distortion regularizer has to stay
+    well-behaved on.
+    """
+    g = torch.Generator().manual_seed(seed)
+    means = torch.randn(n, 3, generator=g) * 0.6
+    means[:, 2] = means[:, 2].abs() * 0.5 + 4.0
+    scales = torch.rand(n, 2, generator=g) * 0.5 + 0.4
+    quats = torch.randn(n, 4, generator=g)
+    quats = quats / quats.norm(dim=-1, keepdim=True)
+    opacities = torch.rand(n, generator=g) * 0.5 + 0.3
+    colors = torch.rand(n, 3, generator=g)
+    proj = project_gaussians_2dgs(
+        means, scales, quats, IDENTITY_R, ZERO_T, 120.0, 120.0, 20.0, 20.0, 40, 40
+    )
+    return proj, opacities, colors
+
+
+def test_distortion_is_the_squared_pairwise_second_moment():
+    """Pins the distortion map to `sum_{i<j} w_i*w_j*(m_i - m_j)^2`.
+
+    Checked against a brute-force double loop over contributing pairs, on a
+    tilted scene (see `_tilted_overlapping_scene`), rather than against the
+    prefix-moment recursion the implementation itself runs.
+    """
+    proj, opacities, colors = _tilted_overlapping_scene()
+    out = rasterize_gaussians_2dgs(
+        proj.means2d,
+        proj.depths,
+        proj.transform,
+        proj.normal,
+        opacities,
+        colors,
+        proj.valid,
+        40,
+        40,
+    )
+    weights, m = _per_gaussian_weights_and_depths(proj, opacities)
+
+    k = weights.shape[0]
+    brute = torch.zeros(40, 40)
+    for i in range(k):
+        for j in range(i + 1, k):
+            brute += weights[i] * weights[j] * (m[i] - m[j]) ** 2
+
+    assert torch.allclose(out["distortion"], brute, atol=1e-7)
+
+
+def test_distortion_stays_non_negative_when_z_hit_contradicts_mean_depth_order():
+    """Regression guard for the signed first-power variant this used to be.
+
+    That variant accumulated `2*sum_{i<j} w_i*w_j*(m_j - m_i)`, which is
+    signed, so it went *negative* on exactly the configuration tilted
+    splats produce: a pixel whose contributing gaussians are out of `z_hit`
+    order relative to the mean-depth compositing sequence. Minimizing it
+    therefore rewarded tilting splats until their intersection depths
+    contradicted their mean depths -- edge-on, depth-scrambling surfels --
+    instead of concentrating weight along the ray.
+
+    The scene below is built so that pathology is actually exercised: the
+    signed variant is negative on a substantial fraction of its pixels
+    (asserted, so this can't quietly become a test of nothing), while the
+    squared second moment this now computes stays non-negative.
+    """
+    proj, opacities, colors = _tilted_overlapping_scene()
+    out = rasterize_gaussians_2dgs(
+        proj.means2d,
+        proj.depths,
+        proj.transform,
+        proj.normal,
+        opacities,
+        colors,
+        proj.valid,
+        40,
+        40,
+    )
+    weights, m = _per_gaussian_weights_and_depths(proj, opacities)
+
+    k = weights.shape[0]
+    signed = torch.zeros(40, 40)
+    for i in range(k):
+        for j in range(i + 1, k):
+            signed += 2.0 * weights[i] * weights[j] * (m[j] - m[i])
+
+    assert (signed < -1e-7).float().mean() > 0.05, (
+        "scene doesn't exercise the pathology"
+    )
+    # -1e-9, not 0: the prefix-moment expansion m^2*A - 2*m*M1 + M2 is a
+    # cancelling form in float32, so a pixel whose weight is already
+    # concentrated can land a few ulps below zero. That is ~1e-5 of this
+    # scene's peak, against the signed variant's own -1e-3 minimum above.
+    assert out["distortion"].min() >= -1e-9

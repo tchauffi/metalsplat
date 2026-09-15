@@ -108,6 +108,47 @@ def test_normal_consistency_positive_for_wrong_normal():
     assert loss.item() > 0.9  # 1 - dot(perpendicular vectors) == 1
 
 
+@pytest.mark.parametrize(
+    "n_true", [(0.3, -0.5, -1.0), (-0.6, 0.2, -1.0), (0.0, 0.7, -1.0)]
+)
+def test_normal_consistency_near_zero_for_consistent_tilted_plane(n_true):
+    """The fronto-parallel case above can't see most of this function.
+
+    There the pseudo-normal is (0, 0, +-1) whatever the finite differences
+    do, so a swapped dx/dy (which flips the cross product's handedness), a
+    dropped `abs()` sign alignment, or an fx/fy mix-up in the ray
+    construction would all still pass it. A *tilted* plane -- which is what
+    a real ground plane or table top is -- pins all three: its pseudo-normal
+    has to come out parallel to the plane's true normal, and only does if
+    the unprojection and the cross product are both right.
+
+    fx != fy deliberately, so an fx-for-fy substitution can't cancel out.
+    """
+    h = w = 32
+    fx, fy = 50.0, 70.0
+    camera = Camera.identity(
+        fx=fx, fy=fy, cx=w / 2, cy=h / 2, img_width=w, img_height=h
+    )
+
+    n = torch.tensor(n_true)
+    n = n / n.norm()
+    # Camera-space plane n . X = n.z * d0, i.e. through (0, 0, d0). Depth
+    # along each pixel ray follows analytically, so the rendered depth and
+    # rendered normal below are exactly consistent by construction.
+    d0 = 5.0
+    ys, xs = torch.meshgrid(
+        torch.arange(h, dtype=torch.float32) + 0.5,
+        torch.arange(w, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    rx, ry = (xs - camera.cx) / fx, (ys - camera.cy) / fy
+    depth = (n[2] * d0) / (n[0] * rx + n[1] * ry + n[2])
+
+    normal = n.expand(h, w, 3).contiguous()
+    alpha = torch.ones(h, w)
+    assert normal_consistency_loss(normal, depth, alpha, camera).item() < 1e-5
+
+
 def test_normal_consistency_gradients_flow_to_both_normal_and_depth():
     # The pseudo-normal (derived from depth) is *not* detached (matching
     # the official 2DGS reference implementation, see the function's

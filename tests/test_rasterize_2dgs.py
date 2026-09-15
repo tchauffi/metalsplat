@@ -96,12 +96,13 @@ def test_forward_matches_reference(n):
     assert torch.allclose(depth, ref["depth"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(normal, ref["normal"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(final_T, ref["final_T"], atol=1e-2, rtol=1e-2)
-    # Distortion needs its own, much tighter bound: it runs on *normalized*
-    # depth (see rasterize_2dgs_ref's module docstring), so its values sit
-    # around 1e-2 rather than O(1) like the maps above -- the shared 1e-2
-    # tolerance would pass no matter what the kernel computed. Measured max
-    # absolute deviation here is ~1e-7.
-    assert torch.allclose(distortion, ref["distortion"], atol=1e-4, rtol=1e-2)
+    # Distortion needs its own, much tighter bound: it is a *squared*
+    # difference of *normalized* depths (see rasterize_2dgs_ref's module
+    # docstring), so its values peak around 1e-4 on these scenes rather
+    # than O(1) like the maps above -- the shared 1e-2 tolerance, or even
+    # 1e-4, would pass no matter what the kernel computed (a zeroed output
+    # included). Measured max absolute deviation here is ~1.3e-7.
+    assert torch.allclose(distortion, ref["distortion"], atol=1e-6, rtol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 5, 40])
@@ -290,18 +291,20 @@ def test_distortion_backward_matches_reference_in_isolation(n):
     (out[3] * up_dist.to("mps")).sum().backward()
     torch.mps.synchronize()
 
-    # The gradients themselves are O(0.1-1) even though the distortion map
-    # is small, so these are ordinary tolerances, not inflated ones.
-    # Measured max deviation ~6e-6.
-    assert opacities_ref.grad.abs().max() > 1e-3, "scene exercises no distortion"
+    # The distortion term is a *squared* normalized-depth difference, so
+    # both the map and its gradients are small in absolute terms (measured
+    # |grad|max ~1e-3 for n=5, ~7e-3 for n=40). atol is set ~2 orders below
+    # that rather than at an "ordinary" 1e-3, which here would pass even on
+    # an entirely zeroed backward.
+    assert opacities_ref.grad.abs().max() > 1e-5, "scene exercises no distortion"
     assert torch.allclose(
-        transform_mps.grad.cpu(), transform_ref.grad.reshape(n, 9), atol=1e-3, rtol=1e-2
+        transform_mps.grad.cpu(), transform_ref.grad.reshape(n, 9), atol=1e-5, rtol=1e-2
     )
     assert torch.allclose(
-        opacities_mps.grad.cpu(), opacities_ref.grad, atol=1e-3, rtol=1e-2
+        opacities_mps.grad.cpu(), opacities_ref.grad, atol=1e-5, rtol=1e-2
     )
     assert torch.allclose(
-        means2d_mps.grad.cpu(), means2d_ref.grad, atol=1e-3, rtol=1e-2
+        means2d_mps.grad.cpu(), means2d_ref.grad, atol=1e-5, rtol=1e-2
     )
 
 
