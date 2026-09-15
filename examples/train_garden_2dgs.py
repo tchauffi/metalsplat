@@ -47,32 +47,32 @@ This repo's 2DGS path still has no filter3d equivalent or
 format as the official reference implementation's own `.ply` files,
 just 2 `scale_*` properties instead of 3.)
 
-One more deviation from `train_garden.py`: its `calibrate_initial_scale`
-targets a 3px initial screen radius, which for this scene lands ~7.5x
-below `scene_scale` (the point-cloud spacing `densify_and_prune_2dgs`'s
-split-vs-clone decision is calibrated against). Since split only fires
-for gaussians *already larger* than `scene_scale`, that gap meant almost
-no gaussian qualified for hundreds of steps -- densification was nearly
-pure clone (duplicate exactly in place, then slowly drift apart via
-gradient descent) rather than split (an immediate, differently-positioned
-offset). Confirmed via an instrumented run: 0 splits for the first two
-densify rounds, and only a handful for several more. Clone-then-drift is
-particularly slow wherever many gaussians overlap and share credit/blame
-for the same pixels (the drift signal is diluted across all of them), so
-this disproportionately kept complex, overlapping regions stuck as a
-blurry pile of near-duplicate disks long after simple/background regions
-(where a lone clone's drift signal is concentrated, not shared) had
-separated and sharpened. Raising the target to 10px narrows that gap
-(init scale ~45% of scene_scale here, instead of ~14%) without
-reintroducing the original giant-overlapping-blob failure mode
-`train_garden.py`'s comment describes (measured ~23px unrecalibrated on
-this scene) -- verified empirically: splits appear within the first few
-rounds instead of being starved for ~500 steps, and held-out PSNR at a
-fixed step count improves. This does not fully close the gap between
-complex/overlapping regions and simple ones -- some of that is 2DGS's
-own planarity prior working against non-planar, repeated detail (foliage,
-moss) rather than a densification bug -- but it removes the
-easily-avoidable part of it.
+The initial gaussian size uses `train_garden.py`'s own 3px screen-radius
+target. It used to be raised to 10px here, to work around
+`densify_and_prune_2dgs` splitting only gaussians larger than an absolute
+world-space bar (the sparse cloud's median nearest-neighbor spacing):
+a 3px target lands well below that bar, so nothing qualified to split for
+hundreds of steps and densification degenerated into pure clone-then-drift,
+which is slowest exactly where gaussians overlap and share the drift
+signal. That bar is now relative to the model's own size distribution
+(`split_scale_quantile`, see `metalsplat.densify2dgs`), so splits fire
+from the first round at any initial size and the workaround is no longer
+needed -- which matters, because it was expensive: a 10px target stacks
+140 semi-transparent disks on the average pixel at step 0 against 22.5 at
+3px (measured on this scene at `RESOLUTION_DOWNSCALE=2.0`), and every one
+of those is depth-spread the distortion regularizer then has to undo.
+
+Note the two calibrations never agreed in the first place and could not
+be made to: the initial size is set in *screen* units and depends on
+`RESOLUTION_DOWNSCALE`, while the old bar was a fixed *world* length. At
+half resolution the same 10px target produces twice the world-space size
+it would at full resolution, so any hand-tuned pairing of the two silently
+breaks the moment the training resolution changes.
+
+This does not fully close the gap between complex/overlapping regions and
+simple ones -- some of that is 2DGS's own planarity prior working against
+non-planar, repeated detail (foliage, moss) rather than a densification
+bug -- but it removes the easily-avoidable part of it.
 
 One more gap, found by timing a real 30k-step run (wall-clock time per
 1000 steps kept climbing well past the point densification stops):
@@ -117,10 +117,10 @@ OUT_DIR = Path(__file__).parent
 # render/backward pays for H*W pixels), at the cost of fine detail. See
 # metalsplat.data.colmap.load_colmap_scene's docstring; intrinsics are
 # rescaled automatically, no other change needed.
-RESOLUTION_DOWNSCALE = 2.0
+RESOLUTION_DOWNSCALE = 4.0
 
 # --- 2DGS paper defaults (arguments/__init__.py's OptimizationParams) ---
-NUM_ITERS = 11_000
+NUM_ITERS = 15_000
 FEATURE_LR = 0.0025  # paper splits this into f_dc (this rate) / f_rest (this / 20);
 # this repo's SH parameter isn't split that way, so one rate covers all bands.
 OPACITY_LR = 0.05
@@ -129,21 +129,55 @@ ROTATION_LR = 0.001
 LAMBDA_DSSIM = 0.2
 LAMBDA_NORMAL = 0.05
 LAMBDA_NORMAL_START_ITER = 7000  # paper: `lambda_normal if iteration > 7000 else 0`
-# The reference repo ships 0.0; the paper uses 100 (unbounded) / 1000
-# (bounded). Those values transfer directly: the distortion map is computed
-# on normalized depth, matching the official CUDA rasterizer (see
-# metalsplat.reference.rasterize_2dgs_ref's module docstring).
-LAMBDA_DIST = 0.0
+# The reference repo ships 0.0; the paper uses 100 (unbounded, which garden
+# is) / 1000 (bounded). Those values transfer directly now that the
+# distortion map is the paper's actual regularizer -- the squared pairwise
+# second moment of the per-pixel weight distribution over *normalized*
+# depth, matching the official CUDA rasterizer (see
+# metalsplat.reference.rasterize_2dgs_ref's module docstring, which also
+# records the signed first-power variant this used to be and why that one
+# made the geometry worse rather than better).
+#
+# Measured on this scene at the ~500k-gaussian checkpoint: the distortion
+# term is ~1e-5 against a ~0.06 photometric loss, so 100 puts it at ~1.6%
+# of the total -- a regularizer, not a second objective. The old 0.01 here
+# was not a considered weight, it was the value the broken term had to be
+# beaten down to before it stopped visibly wrecking the surfaces.
+LAMBDA_DIST = 100.0
 LAMBDA_DIST_START_ITER = 3000  # paper: `lambda_dist if iteration > 3000 else 0`
 SH_DEGREE = 3
 SH_DEGREE_INTERVAL = 1000  # paper: +1 band every 1000 steps (`oneupSHdegree`)
 INIT_OPACITY = 0.1  # paper default (`inverse_sigmoid(0.1 * ones(...))`)
 DENSIFY_START = 500  # paper: densify_from_iter
-DENSIFY_STOP = 15_000  # paper: densify_until_iter
+DENSIFY_STOP = 9_000  # paper: densify_until_iter
 DENSIFY_INTERVAL = 100  # paper: densification_interval
+# Divide the AbsGS signal by covered pixels rather than by view count, so
+# the densification bar means the same thing at every depth (see
+# densify2dgs). OFF, because it removes the brake that makes densification
+# terminate.
+#
+# The un-normalized signal is a sum over the pixels a gaussian covers, so
+# splitting or cloning one lowers its score and it stops re-qualifying:
+# growth decays (measured on this scene, gaussians added per round: 11% ->
+# 4.8% -> 4.0%) and the count converges. Dividing that sum by coverage
+# removes the dependence on size, so a clone scores exactly what its parent
+# did and qualifies again next round. Measured: 138k -> 700k by step 1500
+# and still accelerating, ~3M by step 3000. Recalibrating the threshold
+# every round instead of freezing it bounds the rate but not the total --
+# a percentile always selects a fixed fraction, which still compounds
+# (~7.5%/round, steady rather than decaying).
+#
+# Keep it False unless you pair it with a growth cap (max_points) or an
+# absolute threshold tuned for the normalized scale. The two signals differ
+# by ~100x, so a threshold calibrated under one is meaningless under the
+# other.
+PIXEL_NORMALIZED_DENSIFY = False
 PRUNE_OPACITY_THRESH = 0.05  # paper: opacity_cull
 OPACITY_RESET_INTERVAL = (
     3000  # paper default (reset_opacity()'s own 0.01 cap matches too)
+)
+OPACITY_STOP_RESET = (
+    7000  # paper: densify_until_iter + 3000 (last reset after last densify)
 )
 # --- end paper defaults ---
 
@@ -261,11 +295,12 @@ def main() -> None:
     )
     print(f"{scene.points.shape[0]} initial sparse points")
 
+    # scene_scale is only the position-learning-rate calibration now --
+    # densify_and_prune_2dgs's split-vs-clone bar no longer reads it (see
+    # module docstring and metalsplat.densify2dgs).
     scene_scale = estimate_scene_scale(scene.points)
-    # target_pixel_radius=10 (not train_garden.py's 3): see module docstring
-    # for why 3px starves densify_and_prune_2dgs's split path on this scene.
     init_scale = calibrate_initial_scale(
-        scene.points, scene.cameras, scene_scale, target_pixel_radius=10.0
+        scene.points, scene.cameras, scene_scale, target_pixel_radius=3.0
     )
     print(
         f"Scene scale (median NN spacing): {scene_scale:.4f}, calibrated initial gaussian scale: {init_scale:.5f}",
@@ -357,6 +392,9 @@ def main() -> None:
 
     grad_accum = torch.zeros(model.num_points, device=DEVICE)
     grad_count = torch.zeros(model.num_points, device=DEVICE)
+    # Covered-pixel counts, the per-pixel normalizer for grad_accum -- see
+    # PIXEL_NORMALIZED_DENSIFY and densify2dgs's docstring.
+    pixel_count = torch.zeros(model.num_points, device=DEVICE)
     # Calibrated on the first densification round, then held fixed -- see
     # module docstring.
     densify_threshold = None
@@ -379,6 +417,7 @@ def main() -> None:
             background=background,
             return_aux=True,
             abs_grad_accum=grad_accum,
+            pixel_count_accum=pixel_count if PIXEL_NORMALIZED_DENSIFY else None,
         )
         photo_loss = gaussian_splatting_loss(
             aux.image, target, lambda_dssim=LAMBDA_DSSIM
@@ -428,7 +467,7 @@ def main() -> None:
                 model,
                 grad_accum,
                 grad_count,
-                scene_scale=scene_scale,
+                pixel_count=pixel_count if PIXEL_NORMALIZED_DENSIFY else None,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 prune_opacity_thresh=PRUNE_OPACITY_THRESH,
                 grad_threshold=densify_threshold,
@@ -445,13 +484,18 @@ def main() -> None:
             )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
+            pixel_count = torch.zeros(model.num_points, device=DEVICE)
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
                 f"(+{stats.n_split} split, +{stats.n_cloned} cloned, -{stats.n_pruned} pruned)",
                 flush=True,
             )
 
-        if OPACITY_RESET_INTERVAL and step % OPACITY_RESET_INTERVAL == 0:
+        if (
+            OPACITY_RESET_INTERVAL
+            and step % OPACITY_RESET_INTERVAL == 0
+            and step <= OPACITY_STOP_RESET
+        ):
             reset_opacity(model)
             print(f"  opacity reset @ step {step}", flush=True)
 
@@ -467,6 +511,7 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
+                pixel_count = torch.zeros(model.num_points, device=DEVICE)
                 print(
                     f"  prune @ step {step}: -{n_pruned} (n={model.num_points})",
                     flush=True,
