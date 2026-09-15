@@ -4,12 +4,10 @@ from metalsplat.densify import reset_opacity
 from metalsplat.densify2dgs import densify_and_prune_2dgs, prune_low_opacity_2dgs
 from metalsplat.gaussians_2dgs import Gaussian2DModel
 
-SCENE_SCALE = 1.0
-
 
 def _model(n=10):
     means = torch.zeros(n, 3)
-    scales = torch.full((n, 2), 0.5)  # below scene_scale by default
+    scales = torch.full((n, 2), 0.5)  # uniform; raise one to make it split-eligible
     opacities = torch.full((n,), 0.5)
     colors = torch.rand(n, 3)
     return Gaussian2DModel(means, scales=scales, opacities=opacities, colors=colors)
@@ -34,7 +32,6 @@ def test_split_clone_and_prune():
         model,
         grad_accum,
         grad_count,
-        scene_scale=SCENE_SCALE,
         grad_percentile=0.8,
     )
 
@@ -64,7 +61,7 @@ def test_split_child_offset_lies_in_parent_tangent_plane():
     grad_accum[0] = 10.0
 
     new_model, stats = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.8
+        model, grad_accum, grad_count, grad_percentile=0.8
     )
     assert stats.n_split == 1
 
@@ -82,9 +79,7 @@ def test_no_visible_gaussians_is_a_no_op():
     grad_count = torch.zeros(n)
     grad_accum = torch.zeros(n)
 
-    new_model, stats = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE
-    )
+    new_model, stats = densify_and_prune_2dgs(model, grad_accum, grad_count)
 
     assert stats.n_split == 0 and stats.n_cloned == 0 and stats.n_pruned == 0
     assert new_model.num_points == n
@@ -101,7 +96,6 @@ def test_max_points_stops_densification():
         model,
         grad_accum,
         grad_count,
-        scene_scale=SCENE_SCALE,
         max_points=n,
     )
 
@@ -132,7 +126,6 @@ def test_split_clone_and_prune_preserves_sh_coefficients():
         model,
         grad_accum,
         grad_count,
-        scene_scale=SCENE_SCALE,
         grad_percentile=0.8,
     )
 
@@ -198,7 +191,7 @@ def test_rebuilds_preserve_active_sh_degree():
     grad_accum = torch.full((n,), 1.0)
     grad_accum[0] = 10.0
     densified, _ = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.8
+        model, grad_accum, grad_count, grad_percentile=0.8
     )
     assert densified.active_sh_degree == 1
 
@@ -221,13 +214,11 @@ def test_absolute_threshold_selects_only_gaussians_above_it():
     n = 100
     model, grad_accum, grad_count = _grad_scene(n)
 
-    _, stats = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_threshold=5.0
-    )
+    _, stats = densify_and_prune_2dgs(model, grad_accum, grad_count, grad_threshold=5.0)
     assert stats.n_split + stats.n_cloned == 10
 
     _, none_stats = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_threshold=50.0
+        model, grad_accum, grad_count, grad_threshold=50.0
     )
     assert none_stats.n_split + none_stats.n_cloned == 0
     assert none_stats.n_after == none_stats.n_before
@@ -243,7 +234,6 @@ def test_percentile_promotes_a_fixed_fraction_however_well_fit():
             model,
             torch.full((n,), magnitude),
             grad_count,
-            scene_scale=SCENE_SCALE,
             grad_percentile=0.9,
         )
         assert stats.n_split + stats.n_cloned > 0, (
@@ -256,7 +246,7 @@ def test_calibrated_threshold_makes_densification_decay():
     model, grad_accum, grad_count = _grad_scene(n)
 
     _, first = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.9
+        model, grad_accum, grad_count, grad_percentile=0.9
     )
     bar = first.grad_threshold
     assert bar > 0
@@ -268,7 +258,6 @@ def test_calibrated_threshold_makes_densification_decay():
             m,
             grad_accum * decay,
             grad_count,
-            scene_scale=SCENE_SCALE,
             grad_threshold=bar,
         )
         promoted.append(stats.n_split + stats.n_cloned)
@@ -282,14 +271,77 @@ def test_reported_threshold_round_trips():
     n = 50
     model, grad_accum, grad_count = _grad_scene(n)
     _, stats = densify_and_prune_2dgs(
-        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, grad_percentile=0.9
+        model, grad_accum, grad_count, grad_percentile=0.9
     )
     m2 = _model(n)
     _, again = densify_and_prune_2dgs(
         m2,
         grad_accum,
         grad_count,
-        scene_scale=SCENE_SCALE,
         grad_threshold=stats.grad_threshold,
     )
     assert again.n_split + again.n_cloned == stats.n_split + stats.n_cloned
+
+
+def _stratified_grad_scene(n=50, lo=0.1, hi=1.0, n_hot=5):
+    """Gaussians spanning a range of sizes, with the high-gradient ones
+    spread evenly *across* that range rather than clustered at one end --
+    so the split-vs-clone partition is actually free to move when the bar
+    does. (`_grad_scene` puts every high gradient on the first few
+    indices, which for a sorted size range means they are all the smallest
+    gaussians and always clone.)
+    """
+    model = _model(n)
+    with torch.no_grad():
+        model.raw_scales.copy_(torch.log(torch.linspace(lo, hi, n))[:, None])
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+    grad_accum[torch.linspace(0, n - 1, n_hot).round().long()] = 10.0
+    return model, grad_accum, grad_count
+
+
+def test_split_bar_is_relative_so_a_uniformly_tiny_model_still_splits():
+    """Regression guard for the absolute split bar this used to use.
+
+    The bar was the sparse cloud's median nearest-neighbor spacing, a fixed
+    world-space length, while the initial gaussian size is chosen in screen
+    units -- so a model whose gaussians all sat below that length could
+    never split at all, however badly it reconstructed the scene, and
+    densification degenerated into clone-then-drift. The scene here is that
+    case taken to its limit: every gaussian is ~1e-3 world units, orders
+    below any plausible absolute bar. A relative bar still splits the
+    larger half of the selected candidates.
+    """
+    model, grad_accum, grad_count = _stratified_grad_scene(lo=1e-3, hi=2e-3)
+    _, stats = densify_and_prune_2dgs(
+        model, grad_accum, grad_count, grad_percentile=0.9
+    )
+    assert stats.n_split > 0
+    assert stats.n_cloned > 0
+
+
+def test_split_quantile_shifts_the_partition_but_not_the_count():
+    """`split_scale_quantile` must not be a growth knob.
+
+    Split drops the parent and adds two children, clone keeps the parent
+    and adds one, so both are net +1 per selected candidate. Moving the bar
+    therefore only trades splits for clones -- it can't change how many
+    gaussians a round adds, and so (unlike `pixel_count`) can't affect
+    whether densification terminates.
+    """
+    counts = []
+    for quantile in (0.1, 0.5, 0.9):
+        model, grad_accum, grad_count = _stratified_grad_scene()
+        _, stats = densify_and_prune_2dgs(
+            model,
+            grad_accum,
+            grad_count,
+            grad_percentile=0.9,
+            split_scale_quantile=quantile,
+        )
+        counts.append((stats.n_split, stats.n_cloned, stats.n_after))
+
+    assert len({s + c for s, c, _ in counts}) == 1, f"candidates moved: {counts}"
+    assert len({a for _, _, a in counts}) == 1, f"gaussian count moved: {counts}"
+    # ...while the partition itself really did shift across that range.
+    assert counts[0][0] > counts[-1][0], counts

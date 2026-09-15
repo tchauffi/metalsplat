@@ -31,20 +31,59 @@ def densify_and_prune_2dgs(
     model: Gaussian2DModel,
     grad_accum: torch.Tensor,  # (N,) accumulated means2d-grad norms since last call
     grad_count: torch.Tensor,  # (N,) number of steps each gaussian was visible
-    scene_scale: float,
     grad_percentile: float = 0.8,
     grad_threshold: float | None = None,
     prune_opacity_thresh: float = 0.005,
     split_scale_factor: float = 1.6,
+    split_scale_quantile: float = 0.5,
     max_points: int | None = None,
     pixel_count: torch.Tensor | None = None,  # (N,) covered pixels, see below
 ) -> tuple[Gaussian2DModel, DensifyStats]:
     """Splits, clones and prunes a `Gaussian2DModel`, returning the new
     model and stats. See `metalsplat.densify.densify_and_prune` for the
-    full parameter semantics (identical here) -- the differences are how a
-    split child's random offset is sampled (confined to the parent's
-    tangent plane, since a 2D splat has no third, depth-axis scale to
-    offset along) and the optional `pixel_count` normalization below.
+    full parameter semantics -- the differences are how a split child's
+    random offset is sampled (confined to the parent's tangent plane,
+    since a 2D splat has no third, depth-axis scale to offset along), the
+    relative `split_scale_quantile` bar described below (3DGS's version
+    still takes an absolute `scene_scale`), and the optional `pixel_count`
+    normalization further down.
+
+    `split_scale_quantile` sets the split-vs-clone bar: a selected
+    gaussian is *split* (replaced by two smaller, tangentially-offset
+    children) if its larger scale axis exceeds this quantile of the whole
+    population's, and *cloned* (duplicated in place at the same size)
+    otherwise.
+
+    This is deliberately relative to the model's own current size
+    distribution rather than an absolute world-space length, because the
+    absolute version has no way to stay calibrated. An initial gaussian
+    size is naturally chosen in *screen* units (a target pixel radius --
+    see `train_garden_2dgs.calibrate_initial_scale`), while an absolute
+    bar like the sparse cloud's median nearest-neighbor spacing lives in
+    *world* units, and nothing keeps the two in step: change the training
+    resolution, the scene, or the initialization and they drift apart. On
+    the garden scene at half resolution they landed 3.6x apart, which put
+    every gaussian below the bar -- so *nothing* qualified to split for
+    hundreds of steps and densification degenerated into pure
+    clone-then-drift (duplicate in place, then separate only as slowly as
+    gradient descent moves them apart). That is at its worst exactly where
+    it hurts most: where many gaussians overlap, the drift signal is
+    shared among all of them, so complex regions stay a blurry pile long
+    after simple ones have sharpened. Working around it by inflating the
+    initial size until it approached the bar cost 6.2x the initial
+    overdraw (140 vs 22.5 gaussians composited per pixel, measured).
+
+    A relative bar removes the failure mode rather than compensating for
+    it: "larger than typical" is always answerable, at any initialization
+    and any resolution. It also keeps adapting -- late in training, when
+    high-error gaussians tend to be small detail rather than large blobs,
+    most candidates fall below the bar and clone.
+
+    Note this does not change how *many* gaussians a round adds, only
+    which kind: split drops the parent and adds two children, clone keeps
+    the parent and adds one, so both are net +1 per candidate however the
+    partition falls. Unlike `pixel_count` below, it therefore cannot
+    affect whether densification terminates.
 
     `pixel_count`, if given, is the per-gaussian covered-pixel count from
     `render_2dgs(..., pixel_count_accum=...)`, and replaces `grad_count`
@@ -123,7 +162,14 @@ def densify_and_prune_2dgs(
     opacities = model.opacities.detach()
     color_like = (model.colors if model.sh_degree == 0 else model.raw_sh).detach()
 
-    is_large = candidates & (scales.max(dim=-1).values > scene_scale)
+    # Relative split-vs-clone bar -- see the docstring for why this is a
+    # quantile of the population's own sizes rather than an absolute
+    # world-space length. Taken over every gaussian, not just the selected
+    # candidates, so it answers "is this larger than typical for the
+    # model?" rather than "is it larger than the other high-error ones?".
+    extent = scales.max(dim=-1).values
+    split_bar = torch.quantile(extent, split_scale_quantile)
+    is_large = candidates & (extent > split_bar)
     is_small = candidates & ~is_large
 
     split_idx = is_large.nonzero(as_tuple=True)[0]
