@@ -2,13 +2,23 @@
 data/garden, using the 2D Gaussian Splatting paper's (Huang et al. 2024)
 own hyperparameters: per-group learning rates (feature/opacity/scaling/
 rotation held constant, only position decayed), lambda_dssim=0.2,
-lambda_normal=0.05 (active after iteration 7000), lambda_dist=0.0 (active
-after iteration 3000; 0 is the reference repo's shipped default, while the
-paper itself uses 100 for unbounded scenes and 1000 for bounded ones), SH
-degree 3 grown by one band every 1000 steps, and 30,000 total iterations -- all read
-directly off the official reference implementation's `arguments/__init__.py`
-`OptimizationParams` and `train.py`'s loss/schedule
+lambda_normal=0.05 (active after iteration 7000), lambda_dist=100 (active
+after iteration 3000; the paper's own weight for unbounded scenes, which
+garden is -- 1000 for bounded ones -- rather than the reference repo's
+shipped 0.0 default) and SH degree 3 grown by one band every 1000 steps --
+all read directly off the official reference implementation's
+`arguments/__init__.py` `OptimizationParams` and `train.py`'s loss/schedule
 (https://github.com/hbb1/2d-gaussian-splatting).
+
+The schedule is shortened rather than copied: this runs `NUM_ITERS`
+15,000 steps against the paper's 30,000, and stops densifying at
+`DENSIFY_STOP` 9,000 against its `densify_until_iter=15000`. Both are
+budget choices for a single-GPU-on-a-laptop run, not claims about the
+paper; every *rate* and *weight* below is the published one, and the
+loss/regularizer start iterations (7000 for normal, 3000 for distortion)
+are unchanged, so the shortened run still spends its last third under the
+full regularized objective. Raise both back to the paper's values for a
+faithful reproduction.
 
 One deliberate deviation: the paper's `position_lr_init`/`position_lr_final`
 (0.00016/0.0000016) are calibrated for the reference implementation's own
@@ -23,9 +33,10 @@ decay to 1% of the initial rate) is identical to the paper's, and every
 other hyperparameter is used exactly as published.
 
 Adaptive density control (split/clone/prune, see `metalsplat.densify2dgs`)
-runs on the paper's own schedule (`densify_from_iter=500` to
-`densify_until_iter=15000`, every `densification_interval=100` steps,
-`opacity_reset_interval=3000`) with one more deliberate deviation: the
+runs on the paper's own schedule (`densify_from_iter=500`, every
+`densification_interval=100` steps, `opacity_reset_interval=3000`, and
+`densify_until_iter` shortened to `DENSIFY_STOP` as described above) with
+one more deliberate deviation: the
 paper's literal `densify_grad_threshold=0.0002` is calibrated for a
 *plain* screen-space-gradient-norm signal, whereas this codebase's
 densification signal is AbsGS-style (sum of |gradient|, not the signed
@@ -76,17 +87,17 @@ bug -- but it removes the easily-avoidable part of it.
 
 One more gap, found by timing a real 30k-step run (wall-clock time per
 1000 steps kept climbing well past the point densification stops):
-`OPACITY_RESET_INTERVAL` keeps firing every 3000 steps all the way to
+opacity resets used to keep firing every 3000 steps all the way to
 `NUM_ITERS`, but pruning here only ever ran *inside*
-`densify_and_prune_2dgs`, which itself only runs through `DENSIFY_STOP`
-(15000). Every reset after that point caps a fresh batch of gaussians'
-opacity near zero with nothing left to clean them up afterward -- they
-sit there forever, still costing full projection/rasterization compute
-every step while contributing ~nothing to the image, compounding with
-each subsequent reset (18000, 21000, 24000, 27000). `train_garden.py`
-already solves this for 3DGS with a standalone prune schedule that keeps
-running past its own densify-stop point; this adds the identical thing
-here via `prune_low_opacity_2dgs`.
+`densify_and_prune_2dgs`, which itself stops at `DENSIFY_STOP`. Every
+reset past that point caps a fresh batch of gaussians' opacity near zero
+with nothing left to clean them up afterward -- they sit there forever,
+still costing full projection/rasterization compute every step while
+contributing ~nothing to the image, and each subsequent reset adds
+another batch. Two things fix it here: `OPACITY_STOP_RESET` retires the
+resets while densification is still running, and `prune_low_opacity_2dgs`
+runs on its own schedule through `NUM_ITERS` -- the same standalone-prune
+answer `train_garden.py` already uses for 3DGS.
 
 Usage: uv run python examples/train_garden_2dgs.py
 """
@@ -176,9 +187,12 @@ PRUNE_OPACITY_THRESH = 0.05  # paper: opacity_cull
 OPACITY_RESET_INTERVAL = (
     3000  # paper default (reset_opacity()'s own 0.01 cap matches too)
 )
-OPACITY_STOP_RESET = (
-    7000  # paper: densify_until_iter + 3000 (last reset after last densify)
-)
+# Last reset therefore lands at 6000, ~3000 steps before DENSIFY_STOP, so
+# every reset is still followed by densify/prune rounds that can clean up
+# the gaussians it caps. The paper has no explicit equivalent: there,
+# resets live inside the densification block and so stop at
+# densify_until_iter by construction.
+OPACITY_STOP_RESET = 9000
 # --- end paper defaults ---
 
 # Calibrated on the first densification round, then frozen -- see module
@@ -426,10 +440,11 @@ def main() -> None:
         # Paper's exact iteration-gated regularizer weights. A zero-weighted
         # term is skipped outright rather than multiplied by 0.0: building it
         # anyway still runs its forward and drags its whole subgraph through
-        # backward for a contribution that is identically zero. With the
-        # paper's schedule that is most of a run: the normal term is inactive
-        # for the first 7000 steps and LAMBDA_DIST is 0.0 throughout, and
-        # building both anyway measured ~1.9ms of a ~40ms step.
+        # backward for a contribution that is identically zero. Both terms
+        # are gated on by the paper's schedule (distortion from step 3000,
+        # normal from 7000), so this only pays off early -- but that early
+        # stretch is where the step count is highest, and building both
+        # unconditionally measured ~1.9ms of a ~40ms step.
         lambda_normal = LAMBDA_NORMAL if step > LAMBDA_NORMAL_START_ITER else 0.0
         lambda_dist = LAMBDA_DIST if step > LAMBDA_DIST_START_ITER else 0.0
 

@@ -204,9 +204,11 @@ genuinely isn't planar, and a flat disk is the wrong primitive for it.
 That is the trade-off visible in a single frame.
 
 Trained by `examples/train_garden_2dgs.py` and rendered by
-`examples/render_video_2dgs.py`: 15000 iterations at half resolution,
-reaching **24.8 dB PSNR / 0.719 SSIM** on the 24 held-out views with 812k
-surfels. That figure is *not* comparable to the 3DGS one at the top of this
+`examples/render_video_2dgs.py`: 15000 iterations at half resolution
+(`RESOLUTION_DOWNSCALE = 2.0`; the script now ships `4.0`, so a default
+run today is a quarter-resolution one and will not reproduce these
+numbers), reaching **24.8 dB PSNR / 0.719 SSIM** on the 24 held-out views
+with 812k surfels. That figure is *not* comparable to the 3DGS one at the top of this
 README -- that run is at full resolution with 330k gaussians, and PSNR
 rises as resolution falls, so the two differ by more than the method. No
 like-for-like comparison has been run.
@@ -334,14 +336,14 @@ docstring:
   first densification round, because this repo's AbsGS-style gradient
   signal lives on a different numeric scale than the plain gradient norm
   the paper's literal `0.0002` assumes.
-- **Initial splat scale** targets a 10px screen radius rather than
-  `train_garden.py`'s 3px. At 3px almost nothing exceeded the
-  split-vs-clone size threshold, so densification degenerated into
-  near-pure cloning and complex overlapping regions stayed blurry.
-- **`lambda_dist` defaults to 0.0**, matching the reference repo rather
-  than the paper's 100 (unbounded) / 1000 (bounded). Those values do
-  transfer directly if you want them -- the distortion map is normalized
-  the same way the official CUDA rasterizer normalizes it.
+- **`lambda_dist` defaults to 100**, the paper's own weight for unbounded
+  scenes (1000 for bounded), rather than the reference repo's shipped
+  0.0. It transfers directly because the distortion map is normalized the
+  same way the official CUDA rasterizer normalizes it.
+- **Iteration budget** is shortened: 15000 steps against the paper's
+  30000, and densification stops at 9000 against its 15000. A budget
+  choice for a laptop-scale run, not a claim about the paper -- every
+  rate and weight is still the published one.
 
 `RESOLUTION_DOWNSCALE` at the top of either training script trades detail
 for speed (step time is linear in pixel count); intrinsics are rescaled
