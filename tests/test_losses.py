@@ -276,3 +276,33 @@ def test_normal_consistency_depth_gradient_bounded_at_uncovered_pixels():
     assert depth.grad.abs().max() < 1.0
     # Uncovered pixels contribute no depth gradient at all.
     assert torch.count_nonzero(depth.grad[:, : w // 2]) == 0
+
+
+def test_ray_cache_is_bounded_and_still_caches():
+    """The cache holds full-frame GPU tensors for the process lifetime, so
+    a loop over many distinct camera geometries must not grow it without
+    bound. The single-geometry case it exists for still has to hit.
+    """
+    from metalsplat import losses
+
+    saved = losses._RAY_CACHE.copy()
+    losses._RAY_CACHE.clear()
+    try:
+        camera, depth, normal, alpha = _fronto_parallel_scene()
+        normal_consistency_loss(normal, depth, alpha, camera)
+        assert len(losses._RAY_CACHE) == 1
+        cached = next(iter(losses._RAY_CACHE.values()))
+
+        # Same geometry again: the identical tensor, not a rebuilt one.
+        normal_consistency_loss(normal, depth, alpha, camera)
+        assert len(losses._RAY_CACHE) == 1
+        assert next(iter(losses._RAY_CACHE.values())) is cached
+
+        # A distinct intrinsic per iteration, more than the cache holds.
+        for i in range(losses._RAY_CACHE_MAXSIZE + 5):
+            other, d, nrm, a = _fronto_parallel_scene(fx=40.0 + i, fy=40.0 + i)
+            normal_consistency_loss(nrm, d, a, other)
+        assert len(losses._RAY_CACHE) == losses._RAY_CACHE_MAXSIZE
+    finally:
+        losses._RAY_CACHE.clear()
+        losses._RAY_CACHE.update(saved)

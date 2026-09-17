@@ -13,6 +13,7 @@ own O(N) accumulation, already happened inside `rasterize_2dgs.metal`).
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import torch
@@ -100,7 +101,14 @@ def distortion_loss(distortion_map: torch.Tensor) -> torch.Tensor:
 
 ALPHA_EPS = 1e-6  # floor for the depth/alpha division below
 
-_RAY_CACHE: dict[tuple, torch.Tensor] = {}
+# Bounded because the entries are full-frame GPU tensors ((H, W, 3) float)
+# held for the process lifetime: a multi-resolution or multi-rig eval loop
+# visits a new key per geometry and would otherwise accumulate one such
+# tensor for each, unfreeable. The intended case needs a single entry (one
+# intrinsic matrix for a whole training run), so a handful of slots keeps
+# every realistic working set resident while making the worst case finite.
+_RAY_CACHE_MAXSIZE = 8
+_RAY_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 
 
 def _camera_rays(h, w, camera: Camera, device, dtype) -> torch.Tensor:
@@ -111,10 +119,15 @@ def _camera_rays(h, w, camera: Camera, device, dtype) -> torch.Tensor:
     shares one intrinsic matrix across every view, making this a single
     cached tensor for a whole training run. Rebuilding it each step costs
     four extra kernel launches on MPS for a result that never changes.
+
+    Least-recently-used beyond `_RAY_CACHE_MAXSIZE` entries; see the note
+    there for why it is bounded at all.
     """
     key = (h, w, camera.fx, camera.fy, camera.cx, camera.cy, device, dtype)
     rays = _RAY_CACHE.get(key)
-    if rays is None:
+    if rays is not None:
+        _RAY_CACHE.move_to_end(key)
+    else:
         ys, xs = torch.meshgrid(
             torch.arange(h, device=device, dtype=dtype) + 0.5,
             torch.arange(w, device=device, dtype=dtype) + 0.5,
@@ -129,6 +142,8 @@ def _camera_rays(h, w, camera: Camera, device, dtype) -> torch.Tensor:
             dim=-1,
         )
         _RAY_CACHE[key] = rays
+        if len(_RAY_CACHE) > _RAY_CACHE_MAXSIZE:
+            _RAY_CACHE.popitem(last=False)
     return rays
 
 
