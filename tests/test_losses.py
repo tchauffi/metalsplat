@@ -115,12 +115,15 @@ def test_normal_consistency_near_zero_for_consistent_tilted_plane(n_true):
     """The fronto-parallel case above can't see most of this function.
 
     There the pseudo-normal is (0, 0, +-1) whatever the finite differences
-    do, so a swapped dx/dy (which flips the cross product's handedness), a
-    dropped `abs()` sign alignment, or an fx/fy mix-up in the ray
-    construction would all still pass it. A *tilted* plane -- which is what
-    a real ground plane or table top is -- pins all three: its pseudo-normal
-    has to come out parallel to the plane's true normal, and only does if
-    the unprojection and the cross product are both right.
+    do, so an fx/fy mix-up in the ray construction would still pass it. A
+    *tilted* plane -- which is what a real ground plane or table top is --
+    pins the unprojection and the cross product together: its pseudo-normal
+    has to come out parallel to the plane's true (camera-facing) normal,
+    and only does if both are right.
+
+    The cross product's argument order is pinned here too, now that the
+    loss is signed: swapping the row and column differences mirrors the
+    surface, which turns this assertion's ~0 into ~2.
 
     fx != fy deliberately, so an fx-for-fy substitution can't cancel out.
     """
@@ -147,6 +150,41 @@ def test_normal_consistency_near_zero_for_consistent_tilted_plane(n_true):
     normal = n.expand(h, w, 3).contiguous()
     alpha = torch.ones(h, w)
     assert normal_consistency_loss(normal, depth, alpha, camera).item() < 1e-5
+
+
+def test_normal_consistency_penalizes_a_surface_facing_the_wrong_way():
+    """The sign of the dot product is the regularizer, so an inverted
+    surface must cost the full 2 -- not ~0.
+
+    Geometry and depth are the consistent fronto-parallel plane; only the
+    rendered normal is flipped, which is the same disagreement a needle or
+    a spike produces from the other side (there it is the depth map whose
+    local winding flips, since project_2dgs_ref keeps every rendered normal
+    camera-facing). An `abs()` here scores this exactly as well as the
+    correct surface, and its gradient then drives the disagreement further
+    rather than back -- a regularizer that grows needles instead of
+    flattening them.
+    """
+    camera, depth, normal, alpha = _fronto_parallel_scene()
+    assert normal_consistency_loss(normal, depth, alpha, camera).item() < 1e-4
+    assert normal_consistency_loss(
+        -normal, depth, alpha, camera
+    ).item() == pytest.approx(2.0, abs=1e-4)
+
+
+def test_normal_consistency_gradient_pushes_an_inverted_normal_back():
+    """...and the gradient on that inverted normal points back toward the
+    depth surface. Under `abs()` it points the other way, deepening the
+    fold, which is the mechanism rather than just the score.
+    """
+    camera, depth, normal, alpha = _fronto_parallel_scene()
+    inverted = (-normal).clone().requires_grad_()
+    normal_consistency_loss(inverted, depth, alpha, camera).backward()
+
+    # The true normal is (0, 0, -1); the inverted one is (0, 0, +1). A step
+    # against the gradient has to move z back toward -1.
+    step = -inverted.grad[1:-1, 1:-1, 2]
+    assert (step < 0).all()
 
 
 def test_normal_consistency_gradients_flow_to_both_normal_and_depth():

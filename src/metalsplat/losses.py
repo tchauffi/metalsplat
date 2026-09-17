@@ -221,21 +221,40 @@ def normal_consistency_loss(
     rays = _camera_rays(h, w, camera, rendered_depth.device, rendered_depth.dtype)
     points_cam = rays * expected_depth[..., None]  # (H, W, 3)
 
-    dx = points_cam[1:-1, 2:, :] - points_cam[1:-1, :-2, :]
-    dy = points_cam[2:, 1:-1, :] - points_cam[:-2, 1:-1, :]
-    pseudo_normal = F.normalize(torch.linalg.cross(dx, dy, dim=-1), dim=-1)
+    # Row difference first, column difference second. `cross(d_row, d_col)`
+    # is the order whose result comes out *facing the camera*, which is the
+    # convention project_2dgs_ref already puts the rendered normal in (and
+    # the order the official implementation's `depth_to_normal` uses, where
+    # its `dx` is likewise the row difference). Swapping the two mirrors the
+    # surface, and the sign of `dot` below is exactly what tells a surface
+    # from its mirror image -- so this order is load-bearing, not cosmetic.
+    d_row = points_cam[2:, 1:-1, :] - points_cam[:-2, 1:-1, :]
+    d_col = points_cam[1:-1, 2:, :] - points_cam[1:-1, :-2, :]
+    pseudo_normal = F.normalize(torch.linalg.cross(d_row, d_col, dim=-1), dim=-1)
 
     normal_interior = rendered_normal[1:-1, 1:-1, :]
     normal_cam = normal_interior @ camera.R_wc.T  # world -> camera
 
-    # `abs()` is the sign alignment: the finite-difference cross product's
-    # orientation depends on pixel-grid handedness, not scene geometry, so
-    # the pseudo-normal is flipped to agree with the (already camera-facing)
-    # rendered normal. Folding that into the dot product is exactly the old
-    # `pseudo * where(dot < 0, -1, 1)` -- sign(dot)*dot == |dot| -- with the
-    # same subgradient, minus three full-size elementwise passes.
+    # Signed, as upstream -- deliberately not `abs()`. The sign carries the
+    # entire regularizer: `dot` is +1 where the depth surface faces the
+    # camera the way the rendered normal says it does, and -1 where the
+    # depth map folds back on itself, which is what a spike or a needle
+    # poking out of a surface looks like in the depth map. Only the signed
+    # form charges for that fold (up to 2 per pixel). `|dot|` scores a
+    # fully folded pixel exactly as well as a correct one, and -- the part
+    # that actually destroys geometry -- its gradient pushes `dot` toward
+    # whichever end it already sits nearest, so a surface that has begun to
+    # fold is driven to fold *harder*. That is a regularizer that grows
+    # needles instead of flattening them, and it is what tore this scene
+    # apart the step LAMBDA_NORMAL switched on: measured 11k steps into a
+    # garden run, 22% of well-covered pixels had already flipped past
+    # dot < 0, at no cost under `abs()`.
+    #
+    # `abs()` was standing in for a fixed *global* handedness (the pixel
+    # grid's, not the scene's); the cross product's argument order above is
+    # where that belongs, and it costs nothing per pixel.
     dot = (pseudo_normal * normal_cam).sum(-1)
     # `alpha` matches the rendered normal's own alpha weighting; detached,
     # as upstream. It is already gradient-free here (final_T is forward-only)
     # but the detach keeps that intent explicit.
-    return (1.0 - alpha[1:-1, 1:-1].detach() * dot.abs()).mean()
+    return (1.0 - alpha[1:-1, 1:-1].detach() * dot).mean()

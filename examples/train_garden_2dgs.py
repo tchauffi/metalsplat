@@ -2,7 +2,8 @@
 data/garden, using the 2D Gaussian Splatting paper's (Huang et al. 2024)
 own hyperparameters: per-group learning rates (feature/opacity/scaling/
 rotation held constant, only position decayed), lambda_dssim=0.2,
-lambda_normal=0.05 (active after iteration 7000), lambda_dist=100 (active
+lambda_normal (active after iteration 7000; 0.01 here rather
+than the paper's 0.05 -- see the constant), lambda_dist=100 (active
 after iteration 3000; the paper's own weight for unbounded scenes, which
 garden is -- 1000 for bounded ones -- rather than the reference repo's
 shipped 0.0 default) and SH degree 3 grown by one band every 1000 steps --
@@ -94,10 +95,16 @@ reset past that point caps a fresh batch of gaussians' opacity near zero
 with nothing left to clean them up afterward -- they sit there forever,
 still costing full projection/rasterization compute every step while
 contributing ~nothing to the image, and each subsequent reset adds
-another batch. Two things fix it here: `OPACITY_STOP_RESET` retires the
-resets while densification is still running, and `prune_low_opacity_2dgs`
-runs on its own schedule through `NUM_ITERS` -- the same standalone-prune
-answer `train_garden.py` already uses for 3DGS.
+another batch. `OPACITY_STOP_RESET` fixes that by retiring the resets
+while densification is still running, so every reset is still followed by
+rounds that can rebuild what it dissolves -- see that constant for why its
+bound has to be exclusive, and what one reset landing exactly on
+`DENSIFY_STOP` costs once the normal-consistency term is active.
+
+`prune_low_opacity_2dgs` also runs on its own schedule rather than only
+inside `densify_and_prune_2dgs` (the same standalone-prune answer
+`train_garden.py` uses for 3DGS), but it stops at `DENSIFY_STOP` here
+rather than running to `NUM_ITERS` -- see `PRUNE_STOP`.
 
 Usage: uv run python examples/train_garden_2dgs.py
 """
@@ -138,7 +145,35 @@ OPACITY_LR = 0.05
 SCALING_LR = 0.005
 ROTATION_LR = 0.001
 LAMBDA_DSSIM = 0.2
-LAMBDA_NORMAL = 0.05
+# The paper's value is 0.05. Measured deviation, for the same reason as
+# the position learning rate above: the paper's weight is calibrated
+# against its own scene normalization, and the term's *gradient* here is
+# not on the scale that weight assumes. On this scene at the 11k-gaussian
+# checkpoint, 0.05 makes the regularizer outweigh the photometric loss on
+# every geometric parameter -- gradient on means 1.6e-5 against 1.2e-5,
+# on quats 1.5e-6 against 1.0e-6, on opacity 1.5x the photometric median.
+# A term that dominates the data term steers the geometry rather than
+# regularizing it, and the surfaces visibly break up shortly after
+# LAMBDA_NORMAL_START_ITER.
+#
+# Measured over matched 3000-step runs (term on at 1500, both of this
+# file's opacity-schedule fixes in place), against a no-regularizer
+# control at 22.8% folded / 24.49 dB:
+#
+#   0.05  8.6% folded, 23.21 dB -- best surface coherence, but the normal
+#         map keeps a needle structure and scale-ratio p99 rises to 16.4
+#         against the control's 11.5
+#   0.01 18.0% folded, 25.93 dB -- smooth normal map, scale ratio p99
+#         11.4 (i.e. no needles), and the best PSNR of any arm including
+#         the control
+#
+# Ramping 0.05 in over 500 steps instead of switching it on was also
+# measured (9.2% folded, 23.38 dB): indistinguishable from the step
+# change, so the breakup is the term's sustained strength, not a shock at
+# switch-on. Raise this back toward 0.05 if surface quality for meshing
+# matters more than the render, and watch the normal map rather than PSNR
+# when you do.
+LAMBDA_NORMAL = 0.01
 LAMBDA_NORMAL_START_ITER = 7000  # paper: `lambda_normal if iteration > 7000 else 0`
 # The reference repo ships 0.0; the paper uses 100 (unbounded, which garden
 # is) / 1000 (bounded). Those values transfer directly now that the
@@ -187,11 +222,23 @@ PRUNE_OPACITY_THRESH = 0.05  # paper: opacity_cull
 OPACITY_RESET_INTERVAL = (
     3000  # paper default (reset_opacity()'s own 0.01 cap matches too)
 )
-# Last reset therefore lands at 6000, ~3000 steps before DENSIFY_STOP, so
-# every reset is still followed by densify/prune rounds that can clean up
-# the gaussians it caps. The paper has no explicit equivalent: there,
-# resets live inside the densification block and so stop at
-# densify_until_iter by construction.
+# Exclusive, and that is the whole point: the last reset lands at 6000,
+# ~3000 steps before DENSIFY_STOP, so every reset is still followed by
+# densify rounds that can rebuild what it dissolves. An inclusive bound
+# here would fire one final reset at 9000 -- the exact step densification
+# retires -- which caps every gaussian at 0.01 with nothing left to grow
+# the model back, while PRUNE_INTERVAL keeps culling everything that
+# drifts under STANDALONE_PRUNE_OPACITY_THRESH. Measured on a shortened
+# run with the normal-consistency term active: that one reset cost 10.4k
+# gaussians at the very next prune round and ~2-3k every round after, a
+# fifth of the model, monotonically, with no densification left to answer
+# (the same schedule without the normal term recovers in ~300 steps, so
+# this only bites once LAMBDA_NORMAL is on -- which is why it reads as
+# "the normal loss broke the splats").
+#
+# The paper has no explicit equivalent: there, resets live inside the
+# densification block and so stop at densify_until_iter by construction --
+# i.e. upstream's bound is exclusive of the no-densification regime too.
 OPACITY_STOP_RESET = 9000
 # --- end paper defaults ---
 
@@ -199,11 +246,23 @@ OPACITY_STOP_RESET = 9000
 # docstring for why this replaces the paper's literal densify_grad_threshold.
 DENSIFY_GRAD_PERCENTILE = 0.9
 
-# Standalone prune schedule, matching train_garden.py's identical one: unlike
-# densify_and_prune_2dgs's own inline prune (which only runs during the
-# DENSIFY_START..DENSIFY_STOP window), this keeps running for the rest of
-# training -- see module docstring for why that gap matters once
-# OPACITY_RESET_INTERVAL keeps firing past DENSIFY_STOP.
+# Standalone prune schedule, matching train_garden.py's identical one: it
+# runs on its own interval rather than only inside densify_and_prune_2dgs.
+#
+# It stops at DENSIFY_STOP, though, which train_garden.py's does not: a
+# prune with no densification behind it is a one-way drain. It existed to
+# clean up the gaussians that post-DENSIFY_STOP opacity resets stranded,
+# and OPACITY_STOP_RESET's exclusive bound now means no reset ever lands
+# there, so the reason is gone -- while the cost is not. With the
+# normal-consistency term active, that term demotes the opacity of the
+# gaussians whose normals disagree with the depth surface (measured: it
+# flips 16% of gaussians from "the photometric loss wants more opacity" to
+# "the total wants less"), so a prune running past DENSIFY_STOP deletes
+# ~2k of them per round, monotonically, for the rest of the run with
+# nothing able to replace them. Measured on a shortened run: stopping it
+# at DENSIFY_STOP keeps 21k more gaussians (163k vs 142k) and gains 0.5 dB
+# for identical surface coherence. This is also what the paper does --
+# there, pruning only ever runs inside the densification block.
 #
 # Deliberately its own, *lower* threshold rather than reusing
 # PRUNE_OPACITY_THRESH (0.05): OPACITY_RESET_INTERVAL and PRUNE_INTERVAL can
@@ -214,7 +273,7 @@ DENSIFY_GRAD_PERCENTILE = 0.9
 # for the identical reason, safely below its own 0.01 reset cap.
 STANDALONE_PRUNE_OPACITY_THRESH = 0.005
 PRUNE_START = 100
-PRUNE_STOP = NUM_ITERS
+PRUNE_STOP = DENSIFY_STOP
 PRUNE_INTERVAL = 100
 
 EVAL_EVERY = 1000
@@ -515,7 +574,7 @@ def main() -> None:
         if (
             OPACITY_RESET_INTERVAL
             and step % OPACITY_RESET_INTERVAL == 0
-            and step <= OPACITY_STOP_RESET
+            and step < OPACITY_STOP_RESET
         ):
             reset_opacity(model)
             print(f"  opacity reset @ step {step}", flush=True)
