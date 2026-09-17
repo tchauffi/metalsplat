@@ -103,11 +103,14 @@ def project_gaussians_2dgs(
         img_height,
         near=near,
         eps2d=eps2d,
-    )
-    radii = torch.where(
-        culling.valid,
-        torch.ceil(culling.radii * RADIUS_SAFETY_MARGIN),
-        culling.radii,
+        # Inflate *inside* the culling test rather than afterwards: a splat
+        # whose un-margined footprint falls outside the frame but whose
+        # margined one reaches back in has to stay valid, or the margin
+        # would be doing nothing for exactly the frame-edge splats it
+        # exists to keep. kernels/project_2dgs.metal tests `in_bounds`
+        # against the inflated radius for the same reason, and the two
+        # must agree gaussian-for-gaussian.
+        radius_margin=RADIUS_SAFETY_MARGIN,
     )
     # ops.tiling/kernels/tiling.metal derive the actual per-tile bounding
     # box from `conics` (via the 2D covariance's diagonal), not from
@@ -159,7 +162,7 @@ def project_gaussians_2dgs(
         means2d=culling.means2d,
         depths=culling.depths,
         conics=conics,
-        radii=radii,
+        radii=culling.radii,
         valid=culling.valid,
         compensation=culling.compensation,
         transform=transform,

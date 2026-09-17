@@ -92,6 +92,59 @@ def test_forward_matches_reference(n):
     assert torch.allclose(normal[mask], ref.normal[mask], atol=1e-3, rtol=1e-3)
 
 
+def test_border_culling_matches_reference():
+    """Splats straddling the frame edge, which `_random_scene` never produces.
+
+    Its centers are clamped to the middle half of the frame, so every
+    gaussian there is comfortably in bounds and the culling test is never
+    exercised near a border -- exactly where `RADIUS_SAFETY_MARGIN` decides
+    whether a splat lives. The margin has to be applied before the bounds
+    test on both sides, or the reference drops frame-edge splats the kernel
+    keeps.
+    """
+    R_wc, t_wc = torch.eye(3), torch.zeros(3)
+    z = 3.0
+    # Centers from well off the left edge to well off the right edge, in
+    # pixels; the ones within ~a margined radius of the frame must survive.
+    offsets = torch.tensor(
+        [-200.0, -46.0, -45.0, -20.0, -14.0, -10.0, 10.0, 40.0, 70.0, 300.0]
+    )
+    n = offsets.numel()
+    means = torch.stack(
+        [(offsets - CX) / FX * z, torch.zeros(n), torch.full((n,), z)], dim=-1
+    )
+    scales = torch.full((n, 2), 0.1)
+    quats = torch.zeros(n, 4)
+    quats[:, 0] = 1.0
+
+    ref = project_gaussians_2dgs_ref(
+        means, scales, quats, R_wc, t_wc, FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D
+    )
+    out = project_gaussians_2dgs(
+        means.to("mps"),
+        scales.to("mps"),
+        quats.to("mps"),
+        R_wc.to("mps"),
+        t_wc.to("mps"),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    torch.mps.synchronize()
+    _, _, _, radii, valid, _, _, _ = (t.cpu() for t in out)
+
+    assert torch.equal(valid, ref.valid)
+    assert torch.allclose(radii, ref.radii, atol=1e-3)
+    # Both ends of the range are covered, so this is a real boundary test
+    # rather than an all-valid or all-culled one.
+    assert bool(ref.valid.any()) and not bool(ref.valid.all())
+
+
 @pytest.mark.parametrize("n", [1, 8, 37])
 def test_backward_matches_reference(n):
     R_wc, t_wc = _random_camera(seed=100)

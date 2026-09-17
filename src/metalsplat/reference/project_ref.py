@@ -35,7 +35,8 @@ class ProjectionResult:
     means2d: torch.Tensor  # (N, 2) pixel-space centers
     depths: torch.Tensor  # (N,) camera-space z
     conics: torch.Tensor  # (N, 3) inverse-2D-covariance entries (a, b, c)
-    radii: torch.Tensor  # (N,) integer pixel radius (3-sigma extent), 0 if culled
+    radii: torch.Tensor  # (N,) integer pixel radius (3-sigma extent, times
+    # `radius_margin`), 0 if culled
     valid: torch.Tensor  # (N,) bool, False for culled gaussians
     compensation: torch.Tensor  # (N,) anti-aliasing opacity scale in [0, 1]
 
@@ -54,6 +55,7 @@ def project_gaussians(
     img_height: int,
     near: float = 0.2,
     eps2d: float = 0.3,
+    radius_margin: float = 1.0,  # tile-culling radius inflation, see `radii` below
 ) -> ProjectionResult:
     means_cam = means @ R_wc.T + t_wc  # (N, 3)
     x, y, z = means_cam.unbind(-1)
@@ -129,6 +131,15 @@ def project_gaussians(
     disc = (mid * mid - det).clamp_min(0.0)
     lambda_max = mid + disc.sqrt()
     radii = torch.ceil(3.0 * lambda_max.clamp_min(0.0).sqrt())
+    # `radius_margin` (>1 only for the 2DGS caller, see
+    # reference.project_2dgs_ref) inflates the culling radius *before* the
+    # bounds test below, not after: a splat whose un-inflated footprint
+    # misses the frame but whose inflated one doesn't must survive, which
+    # is the entire point of having a margin. Ceiling twice -- once on the
+    # raw 3-sigma extent, once after the margin -- rather than folding the
+    # margin in before a single ceil, so kernels/project_2dgs.metal can
+    # reproduce it bit-for-bit.
+    radii = torch.ceil(radii * radius_margin)
 
     means2d_x = fx * x / z_safe + cx
     means2d_y = fy * y / z_safe + cy
