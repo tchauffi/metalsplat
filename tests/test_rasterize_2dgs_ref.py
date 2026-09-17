@@ -4,6 +4,7 @@ import torch
 from metalsplat.reference.project_2dgs_ref import project_gaussians_2dgs
 from metalsplat.reference.project_ref import project_gaussians
 from metalsplat.reference.rasterize_2dgs_ref import (
+    DEFAULT_FILTER_SIZE,
     DISTORTION_FAR,
     rasterize_gaussians_2dgs,
 )
@@ -261,7 +262,9 @@ def test_distortion_uses_normalized_depth_not_metric_depth():
     assert abs(metric / expected) > 100.0
 
 
-def _per_gaussian_weights_and_depths(proj, opacities, near=0.2, eps2d=0.3):
+def _per_gaussian_weights_and_depths(
+    proj, opacities, near=0.2, filter_size=DEFAULT_FILTER_SIZE
+):
     """Replays the reference rasterizer's compositing loop, but keeps each
     contributing gaussian's per-pixel `(weight, normalized depth)` instead
     of accumulating them -- so a test can brute-force the distortion's
@@ -297,7 +300,7 @@ def _per_gaussian_weights_and_depths(proj, opacities, near=0.2, eps2d=0.3):
             degenerate, torch.full_like(w_local, float("inf")), u * u + v * v
         )
         d2d = torch.stack([xs, ys], dim=-1) - proj.means2d[i]
-        rho_screen = (d2d[..., 0] ** 2 + d2d[..., 1] ** 2) / eps2d
+        rho_screen = (d2d[..., 0] ** 2 + d2d[..., 1] ** 2) / (filter_size**2)
         uv_active = rho_uv <= rho_screen
         rho = torch.where(uv_active, rho_uv, rho_screen)
         z_hit = torch.where(

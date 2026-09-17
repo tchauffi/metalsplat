@@ -15,6 +15,7 @@ from metalsplat.ops.project_2dgs import project_gaussians_2dgs
 from metalsplat.ops.rasterize import rasterize_gaussians
 from metalsplat.ops.rasterize_2dgs import rasterize_gaussians_2dgs
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE
+from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 
 
 class RenderAux(NamedTuple):
@@ -184,6 +185,7 @@ def render_2dgs(
     camera: Camera,
     near: float = 0.2,
     eps2d: float = 0.3,
+    filter_size: float = DEFAULT_FILTER_SIZE,
     tile_size: int = DEFAULT_TILE_SIZE,
     background: torch.Tensor | None = None,
     return_aux: bool = False,
@@ -207,6 +209,13 @@ def render_2dgs(
     accumulated opacity `1 - final_T` -- `depth` and `normal` are both
     alpha-weighted *sums*, so neither can be interpreted without it (see
     that function's docstring).
+
+    `eps2d` and `filter_size` are two different low-pass widths and are
+    deliberately separate knobs: `eps2d` dilates the projected 2D
+    covariance (px^2) for the EWA/tile-culling bound, while `filter_size`
+    is the pixel standard deviation of the rasterizer's own screen-space
+    fallback for near-edge-on splats. See
+    `metalsplat.reference.rasterize_2dgs_ref.DEFAULT_FILTER_SIZE`.
 
     `abs_grad_accum`, if given, is passed through to
     `rasterize_gaussians_2dgs`: an (N,) tensor that backward() atomically
@@ -256,7 +265,7 @@ def render_2dgs(
         camera.img_height,
         tile_size=tile_size,
         near=near,
-        eps2d=eps2d,
+        filter_size=filter_size,
         background=background,
         abs_grad_accum=abs_grad_accum,
         pixel_count_accum=pixel_count_accum,

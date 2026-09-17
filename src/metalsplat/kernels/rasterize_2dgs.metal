@@ -40,7 +40,7 @@ inline float d_normalized_depth_dz(float z, float near) {
 inline float ray_splat_alpha(
     float3 row0, float3 row1, float3 row2,
     float2 mean2d, float px, float py,
-    float opacity, float near, float eps2d, float depth_fallback,
+    float opacity, float near, float filter_size, float depth_fallback,
     thread float3& hu_out, thread float3& hv_out, thread float& wloc_out,
     thread float& u_out, thread float& v_out, thread bool& degenerate_out,
     thread bool& uv_active_out, thread float& z_hit_out, thread float& raw_out,
@@ -58,8 +58,20 @@ inline float ray_splat_alpha(
         v = cr.y / wloc;
     }
 
+    // Screen-space low-pass fallback, the 2DGS paper's own anti-aliasing
+    // compromise for near-edge-on splats. `filter_size` is the filter's
+    // standard deviation in pixels, matching diff-surfel-rasterization's
+    // `FilterSize = 0.707106 // sqrt(2)/2` / `FilterInvSquare = 2.0f`.
+    // Sub-pixel by design -- and since `rho` below is a min(), it is a
+    // lower bound on every splat's footprint, so widening it stops the
+    // optimizer sharpening detail by shrinking a splat. Deliberately
+    // *not* the projection's covariance dilation, a px^2 quantity for the
+    // EWA/tile-culling bound: sharing one number made neither tunable
+    // without breaking the other. See rasterize_2dgs_ref's
+    // DEFAULT_FILTER_SIZE.
     float dx = px - mean2d.x, dy = py - mean2d.y;
-    float rho_screen = (dx * dx + dy * dy) / eps2d;
+    float filter_var = filter_size * filter_size;
+    float rho_screen = (dx * dx + dy * dy) / filter_var;
     float rho_uv = degenerate ? (rho_screen + 1.0) : (u * u + v * v);
     bool uv_active = rho_uv <= rho_screen;
     float rho = uv_active ? rho_uv : rho_screen;
@@ -98,7 +110,7 @@ kernel void rasterize_2dgs_forward(
     constant int& img_height,
     constant int& tile_size,
     constant float& near,
-    constant float& eps2d,
+    constant float& filter_size,
     constant float* background,
     device float* out_image,                          // (H,W,3)
     device float* out_depth,                            // (H,W)
@@ -141,7 +153,7 @@ kernel void rasterize_2dgs_forward(
 
         float3 hu, hv; float wloc, u, v, z_hit, raw, rho; bool degenerate, uv_active;
         float alpha = ray_splat_alpha(
-            row0, row1, row2, mean2d, pcx, pcy, opacities[gid], near, eps2d, depths[gid],
+            row0, row1, row2, mean2d, pcx, pcy, opacities[gid], near, filter_size, depths[gid],
             hu, hv, wloc, u, v, degenerate, uv_active, z_hit, raw, rho);
 
         if (alpha < (1.0 / 255.0)) continue;
@@ -277,7 +289,7 @@ kernel void rasterize_2dgs_backward(
     constant int& img_height,
     constant int& tile_size,
     constant float& near,
-    constant float& eps2d,
+    constant float& filter_size,
     constant float* background,
     device const float* final_T,                       // (H,W), from forward
     device const float* dist_m1,                         // (H,W), from forward, sum of weight*m
@@ -294,6 +306,7 @@ kernel void rasterize_2dgs_backward(
     device atomic_float* d_colors,                                   // (N,3)
     device atomic_float* d_means2d_abs,                               // (N,) AbsGS-style densification signal
     device atomic_float* d_pixel_count,                                // (N,) pixels this gaussian contributed to
+    device atomic_float* d_depths,                                      // (N,) via the degenerate/screen-space fallback only
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint2 local_pos [[thread_position_in_threadgroup]],
     uint local_idx [[thread_index_in_threadgroup]],
@@ -368,6 +381,13 @@ kernel void rasterize_2dgs_backward(
             float2 g_mean2d = float2(0.0);
             float g_opacity = 0.0;
             float g_abs = 0.0;
+            // The mean's own depth is a real input to the per-pixel math,
+            // not just a sort key: `ray_splat_alpha` falls back to it for
+            // z_hit wherever the ray-splat intersection is unusable (a
+            // degenerate transform, or a pixel where the screen-space
+            // gaussian wins). On those pixels -- and only those -- the
+            // depth map's gradient flows here instead of into row2.
+            float g_depth = 0.0;
             // 1.0 for each pixel this gaussian actually composited into, so
             // the host can turn the summed |screen gradient| into a *per
             // pixel* mean. Counted on exactly the same condition that adds
@@ -381,7 +401,7 @@ kernel void rasterize_2dgs_backward(
 
                 float3 hu, hv; float wloc, u, v, z_hit, raw, rho; bool degenerate, uv_active;
                 float alpha = ray_splat_alpha(
-                    row0, row1, row2, mean2d, pcx, pcy, opacity, near, eps2d, sh_depth_fallback[j],
+                    row0, row1, row2, mean2d, pcx, pcy, opacity, near, filter_size, sh_depth_fallback[j],
                     hu, hv, wloc, u, v, degenerate, uv_active, z_hit, raw, rho);
 
                 if (alpha >= (1.0 / 255.0)) {
@@ -430,8 +450,9 @@ kernel void rasterize_2dgs_backward(
                     float d_rho_screen = uv_active ? 0.0 : d_rho;
 
                     float dx = pcx - mean2d.x, dy = pcy - mean2d.y;
-                    float d_dx = d_rho_screen * 2.0 * dx / eps2d;
-                    float d_dy = d_rho_screen * 2.0 * dy / eps2d;
+                    float filter_var = filter_size * filter_size;
+                    float d_dx = d_rho_screen * 2.0 * dx / filter_var;
+                    float d_dy = d_rho_screen * 2.0 * dy / filter_var;
                     g_mean2d = float2(-d_dx, -d_dy);
 
                     // z_hit only depends on (u, v, row2) when the ray-splat
@@ -440,6 +461,8 @@ kernel void rasterize_2dgs_backward(
                     // non-degeneracy, or a near-boundary z_hit gradient
                     // would leak into row0/row1/row2 via an unstable u/v
                     // that forward's output never actually depended on.
+                    g_depth = (degenerate || !uv_active) ? g_zhit_total : 0.0;
+
                     if (!degenerate && uv_active) {
                         float d_u = d_rho_uv * 2.0 * u + g_zhit_total * row2.x;
                         float d_v = d_rho_uv * 2.0 * v + g_zhit_total * row2.y;
@@ -464,15 +487,30 @@ kernel void rasterize_2dgs_backward(
                     // gaussian's *screen-projected* center, recovered from
                     // g_row0.z/g_row1.z (the mean-column entries of
                     // d_transform, i.e. d(row0[2])/d(row1[2])) via the
-                    // exact identity row0[2] = means2d.x * z_hit (row0[2]
-                    // is the pixel-x numerator, row2[2] the depth -- see
-                    // project_2dgs_ref), so d(means2d.x) = g_row0.z *
-                    // z_hit at fixed z_hit. This mirrors the official
-                    // 2DGS CUDA rasterizer's dL_dmean2D, which is
-                    // likewise derived from dL_dtransMat's mean-column
-                    // entries scaled by depth (diff-surfel-rasterization's
-                    // backward.cu), not from a screen-fallback-only term.
-                    float2 g_mean2d_equiv = g_mean2d + float2(g_row0.z, g_row1.z) * z_hit;
+                    // exact identity row0[2] = means2d.x * z_mean, so
+                    // d(means2d.x) = g_row0.z * z_mean at fixed depth.
+                    //
+                    // The scale factor is the *mean's* camera-space depth
+                    // (sh_depth_fallback, the projection stage's `depths`
+                    // output), not the per-pixel intersection depth
+                    // z_hit. row0 is the pixel-x numerator evaluated at
+                    // the mean column of M: row0[2] = fx*mean_cam.x +
+                    // cx*mean_cam.z = means2d.x * mean_cam.z (see
+                    // project_2dgs_ref), and mean_cam.z is the same for
+                    // every pixel this gaussian covers. Using z_hit here
+                    // scaled each pixel's contribution by z_hit/z_mean,
+                    // which is 1 only for a splat parallel to the image
+                    // plane and drifts with the intersection across a
+                    // tilted one -- biasing the densification signal by
+                    // splat orientation.
+                    //
+                    // This mirrors the official 2DGS CUDA rasterizer's
+                    // dL_dmean2D, which is likewise derived from
+                    // dL_dtransMat's mean-column entries scaled by depth
+                    // (diff-surfel-rasterization's backward.cu), not from
+                    // a screen-fallback-only term.
+                    float z_mean = sh_depth_fallback[j];
+                    float2 g_mean2d_equiv = g_mean2d + float2(g_row0.z, g_row1.z) * z_mean;
                     g_abs = length(g_mean2d_equiv);
                     g_pixels = 1.0;
 
@@ -498,6 +536,7 @@ kernel void rasterize_2dgs_backward(
             float r_op = simd_sum(g_opacity);
             float r_abs = simd_sum(g_abs);
             float r_pixels = simd_sum(g_pixels);
+            float r_depth = simd_sum(g_depth);
 
             if (lane == 0) {
                 bool any = (r_row0x!=0.0)||(r_row0y!=0.0)||(r_row0z!=0.0)
@@ -506,7 +545,7 @@ kernel void rasterize_2dgs_backward(
                         || (r_abs!=0.0) || (r_pixels!=0.0)
                         || (r_nx!=0.0)||(r_ny!=0.0)||(r_nz!=0.0)
                         || (r_colx!=0.0)||(r_coly!=0.0)||(r_colz!=0.0)
-                        || (r_mx!=0.0)||(r_my!=0.0)||(r_op!=0.0);
+                        || (r_mx!=0.0)||(r_my!=0.0)||(r_op!=0.0)||(r_depth!=0.0);
                 if (any) {
                     int gid = sh_gid[j];
                     atomic_fetch_add_explicit(&d_transform[gid*9+0], r_row0x, memory_order_relaxed);
@@ -529,6 +568,7 @@ kernel void rasterize_2dgs_backward(
                     atomic_fetch_add_explicit(&d_opacities[gid], r_op, memory_order_relaxed);
                     atomic_fetch_add_explicit(&d_means2d_abs[gid], r_abs, memory_order_relaxed);
                     atomic_fetch_add_explicit(&d_pixel_count[gid], r_pixels, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&d_depths[gid], r_depth, memory_order_relaxed);
                 }
             }
         }

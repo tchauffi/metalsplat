@@ -5,6 +5,7 @@ from metalsplat.ops.rasterize_2dgs import rasterize_gaussians_2dgs
 from metalsplat.reference.project_2dgs_ref import (
     project_gaussians_2dgs as project_gaussians_2dgs_ref,
 )
+from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 from metalsplat.reference.rasterize_2dgs_ref import (
     rasterize_gaussians_2dgs as rasterize_gaussians_2dgs_ref,
 )
@@ -17,7 +18,8 @@ FX = FY = 50.0
 CX = CY = 32.0
 W = H = 64
 NEAR = 0.1
-EPS2D = 0.3
+EPS2D = 0.3  # projection: 2D covariance dilation, px^2
+FILTER_SIZE = DEFAULT_FILTER_SIZE  # rasterizer: screen-space fallback sigma, px
 
 
 def _random_scene(n, seed=0):
@@ -62,7 +64,7 @@ def test_forward_matches_reference(n):
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
     )
 
     out = rasterize_gaussians_2dgs(
@@ -78,7 +80,7 @@ def test_forward_matches_reference(n):
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
     )
     torch.mps.synchronize()
     image, depth, normal, distortion, final_T = (t.cpu() for t in out)
@@ -115,10 +117,11 @@ def test_backward_matches_reference(n):
     normal_ref = proj.normal.clone().requires_grad_()
     opacities_ref = opacities.clone().requires_grad_()
     colors_ref = colors.clone().requires_grad_()
+    depths_ref = proj.depths.clone().requires_grad_()
 
     ref = rasterize_gaussians_2dgs_ref(
         means2d_ref,
-        proj.depths,
+        depths_ref,
         transform_ref,
         normal_ref,
         opacities_ref,
@@ -127,7 +130,7 @@ def test_backward_matches_reference(n):
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
     )
 
     g = torch.Generator().manual_seed(11)
@@ -149,6 +152,7 @@ def test_backward_matches_reference(n):
     normal_mps = proj.normal.to("mps").requires_grad_()
     opacities_mps = opacities.to("mps").requires_grad_()
     colors_mps = colors.to("mps").requires_grad_()
+    depths_mps = proj.depths.to("mps").requires_grad_()
 
     out = rasterize_gaussians_2dgs(
         means2d_mps,
@@ -156,14 +160,14 @@ def test_backward_matches_reference(n):
         normal_mps,
         opacities_mps,
         colors_mps,
-        proj.depths.to("mps"),
+        depths_mps,
         proj.radii.to("mps"),
         proj.valid.to("mps"),
         proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
     )
     image, depth, normal, distortion, _final_T = out
     loss = (
@@ -193,6 +197,9 @@ def test_backward_matches_reference(n):
         opacities_mps.grad.cpu(), opacities_ref.grad, atol=1e-1, rtol=5e-2
     )
     assert torch.allclose(colors_mps.grad.cpu(), colors_ref.grad, atol=1e-1, rtol=5e-2)
+    # `depths` is differentiable too, via the z_hit fallback the per-pixel
+    # math takes wherever the ray-splat intersection is unusable.
+    assert torch.allclose(depths_mps.grad.cpu(), depths_ref.grad, atol=1e-1, rtol=5e-2)
 
 
 def test_abs_grad_accum_mutates_in_place_and_nonzero():
@@ -223,7 +230,7 @@ def test_abs_grad_accum_mutates_in_place_and_nonzero():
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
         abs_grad_accum=abs_accum,
     )
     out[0].sum().backward()
@@ -263,7 +270,7 @@ def test_distortion_backward_matches_reference_in_isolation(n):
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
     )
     g = torch.Generator().manual_seed(11)
     up_dist = torch.randn(H, W, generator=g)
@@ -286,7 +293,7 @@ def test_distortion_backward_matches_reference_in_isolation(n):
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
     )
     (out[3] * up_dist.to("mps")).sum().backward()
     torch.mps.synchronize()
@@ -336,7 +343,7 @@ def _reference_pixel_counts(proj, opacities):
         u, v = cross[..., 0] / safe, cross[..., 1] / safe
         rho_uv = torch.where(degen, torch.full_like(wloc, float("inf")), u * u + v * v)
         d = torch.stack([xs, ys], dim=-1) - proj.means2d[i]
-        rho_screen = (d[..., 0] ** 2 + d[..., 1] ** 2) / EPS2D
+        rho_screen = (d[..., 0] ** 2 + d[..., 1] ** 2) / (FILTER_SIZE**2)
         uv_active = rho_uv <= rho_screen
         rho = torch.where(uv_active, rho_uv, rho_screen)
         z_hit = torch.where(
@@ -380,7 +387,7 @@ def test_pixel_count_accum_counts_covered_pixels():
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
         abs_grad_accum=absgrad,
         pixel_count_accum=counts,
     )
@@ -424,7 +431,7 @@ def test_pixel_count_accum_matches_a_brute_force_count():
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
+        filter_size=FILTER_SIZE,
         pixel_count_accum=counts,
     )
     out[0].sum().backward()
@@ -438,3 +445,341 @@ def test_pixel_count_accum_matches_a_brute_force_count():
     assert diff.max() <= 0.02 * expected.clamp_min(1.0).max(), (
         f"max |diff| {diff.max()} against counts up to {expected.max()}"
     )
+
+
+def test_abs_grad_uses_the_mean_depth_not_the_hit_depth():
+    """The AbsGS signal recovers d(means2d) from the transform's mean
+    column via `row0[2] = means2d.x * z_mean`, so the scale factor is the
+    *mean's* camera-space depth -- the same value for every pixel the
+    gaussian covers -- not the per-pixel intersection depth `z_hit`.
+
+    The two coincide for a splat parallel to the image plane, which is why
+    a random scene barely distinguishes them. This pins a single pixel
+    against a steeply tilted disk, where the ray hits ~25% deeper than the
+    mean, and checks the accumulated signal against the identity computed
+    from the reference's own `transform` gradient. One pixel and one
+    gaussian, so the kernel's per-pixel term is the whole sum and the
+    reference's summed gradient is directly comparable.
+    """
+    fx = fy = 50.0
+    cx = cy = 0.5
+    w = h = 1  # exactly one pixel, at (0.5, 0.5)
+    ang = torch.tensor(1.0)  # ~57 degrees about the y axis
+    quats = torch.tensor([[torch.cos(ang / 2), 0.0, torch.sin(ang / 2), 0.0]])
+    z = 3.0
+    means = torch.tensor([[8.0 / fx * z, 0.0, z]])  # center ~8px off the pixel
+    scales = torch.tensor([[0.6, 0.6]])
+    opacities = torch.tensor([0.8])
+    colors = torch.tensor([[0.4, 0.6, 0.9]])
+
+    proj = project_gaussians_2dgs_ref(
+        means,
+        scales,
+        quats,
+        torch.eye(3),
+        torch.zeros(3),
+        fx,
+        fy,
+        cx,
+        cy,
+        w,
+        h,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    assert bool(proj.valid[0]), "scene setup: the splat must survive culling"
+
+    transform_ref = proj.transform.clone().requires_grad_()
+    means2d_ref = proj.means2d.clone().requires_grad_()
+    ref = rasterize_gaussians_2dgs_ref(
+        means2d_ref,
+        proj.depths,
+        transform_ref,
+        proj.normal,
+        opacities,
+        colors,
+        proj.valid,
+        w,
+        h,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+    )
+    ref["image"].sum().backward()
+
+    absgrad = torch.zeros(1, device="mps")
+    out = rasterize_gaussians_2dgs(
+        proj.means2d.to("mps"),
+        proj.transform.reshape(1, 9).to("mps").requires_grad_(),
+        proj.normal.to("mps"),
+        opacities.to("mps").requires_grad_(),
+        colors.to("mps").requires_grad_(),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        w,
+        h,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+        abs_grad_accum=absgrad,
+    )
+    out[0].sum().backward()
+    torch.mps.synchronize()
+
+    z_mean = proj.depths[0]
+    mean_col = transform_ref.grad[0, :2, 2]  # d(row0[2]), d(row1[2])
+    g_mean2d = means2d_ref.grad[0]  # screen-space fallback term, 0 when uv_active
+    expected = torch.linalg.norm(g_mean2d + mean_col * z_mean)
+    assert torch.allclose(absgrad.cpu()[0], expected, rtol=2e-3, atol=1e-7)
+
+    # The setup has to actually separate the two depths, or this test would
+    # pass against the z_hit scaling it exists to rule out.
+    row0, row1, row2 = proj.transform[0]
+    hu = 0.5 * row2 - row0
+    hv = 0.5 * row2 - row1
+    wloc = hu[0] * hv[1] - hu[1] * hv[0]
+    u = (hu[1] * hv[2] - hu[2] * hv[1]) / wloc
+    v = (hu[2] * hv[0] - hu[0] * hv[2]) / wloc
+    z_hit = row2[0] * u + row2[1] * v + row2[2]
+    assert z_hit > 1.2 * z_mean
+
+
+def test_depth_gradient_flows_through_the_fallback():
+    """An edge-on disk, where every pixel takes the z_hit fallback.
+
+    `test_backward_matches_reference` covers this only by accident -- its
+    random scenes need ~40 gaussians before any of them produces a
+    degenerate or screen-space-winning pixel, and at n=1 the depth
+    gradient is identically zero on both sides, so the comparison passes
+    whether or not the kernel emits one. A disk rotated 90 degrees about
+    the y axis has its plane containing the view direction, so the
+    ray-splat intersection is unusable everywhere and `depths` is the
+    *only* thing the depth map depends on.
+    """
+    ang = torch.tensor(torch.pi / 2)  # edge-on
+    quats = torch.tensor([[torch.cos(ang / 2), 0.0, torch.sin(ang / 2), 0.0]])
+    means = torch.tensor([[0.0, 0.0, 3.0]])
+    scales = torch.tensor([[0.5, 0.5]])
+    opacities = torch.tensor([0.9])
+    colors = torch.tensor([[0.5, 0.4, 0.3]])
+
+    proj = project_gaussians_2dgs_ref(
+        means,
+        scales,
+        quats,
+        torch.eye(3),
+        torch.zeros(3),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    assert bool(proj.valid[0]), "scene setup: the splat must survive culling"
+
+    depths_ref = proj.depths.clone().requires_grad_()
+    ref = rasterize_gaussians_2dgs_ref(
+        proj.means2d,
+        depths_ref,
+        proj.transform,
+        proj.normal,
+        opacities,
+        colors,
+        proj.valid,
+        W,
+        H,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+    )
+    ref["depth"].sum().backward()
+
+    depths_mps = proj.depths.to("mps").requires_grad_()
+    out = rasterize_gaussians_2dgs(
+        proj.means2d.to("mps"),
+        proj.transform.reshape(1, 9).to("mps"),
+        proj.normal.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        depths_mps,
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+    )
+    out[1].sum().backward()
+    torch.mps.synchronize()
+
+    assert depths_ref.grad.abs().max() > 0.1, "scene setup: no fallback pixels"
+    assert torch.allclose(depths_mps.grad.cpu(), depths_ref.grad, atol=1e-3, rtol=1e-3)
+
+
+def test_screen_space_fallback_uses_the_paper_filter_width():
+    """The screen-space fallback's width is `filter_size` pixels.
+
+    The official rasterizer's `FilterSize = 0.707106` / `FilterInvSquare
+    = 2.0f` makes this a sub-pixel anti-aliasing floor (variance 0.5px^2).
+    Because `rho = min(rho_uv, rho_screen)`, it is also a lower bound on
+    every splat's footprint, so the exact width decides how small a splat
+    can usefully get -- worth pinning rather than leaving to whichever
+    constant happened to be in scope.
+
+    An edge-on disk is degenerate at every pixel, so `rho` is the fallback
+    term everywhere and alpha is a pure function of the pixel's distance
+    from the projected center.
+    """
+    ang = torch.tensor(torch.pi / 2)  # edge-on: the ray-splat solve degenerates
+    quats = torch.tensor([[torch.cos(ang / 2), 0.0, torch.sin(ang / 2), 0.0]])
+    means = torch.tensor([[0.0, 0.0, 3.0]])
+    scales = torch.tensor([[0.5, 0.5]])
+    opacity = 0.5
+    opacities = torch.tensor([opacity])
+    colors = torch.tensor([[1.0, 1.0, 1.0]])
+
+    proj = project_gaussians_2dgs_ref(
+        means,
+        scales,
+        quats,
+        torch.eye(3),
+        torch.zeros(3),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    out = rasterize_gaussians_2dgs(
+        proj.means2d.to("mps"),
+        proj.transform.reshape(1, 9).to("mps"),
+        proj.normal.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+    )
+    torch.mps.synchronize()
+    alpha = (1.0 - out[4]).cpu()  # single gaussian, so this is its alpha
+
+    cx_px, cy_px = proj.means2d[0].tolist()
+
+    # means2d lands on CX/CY (integers) while pixel centers sit at n+0.5,
+    # so the nearest pixel is already sqrt(0.5) away -- compute each
+    # pixel's true distance rather than assuming the offset is the radius.
+    # Past ~2px the fallback is below the 1/255 compositing cutoff at this
+    # opacity, alpha is exactly 0, and the sample pins nothing.
+    def _sample(offset):
+        col, row = int(cx_px - 0.5 + offset), int(cy_px - 0.5)
+        d2 = (col + 0.5 - cx_px) ** 2 + (row + 0.5 - cy_px) ** 2
+        return alpha[row, col], d2
+
+    for offset in (0.0, 1.0, 2.0):
+        observed, d2 = _sample(offset)
+        expected = opacity * torch.exp(torch.tensor(-0.5 * d2 / FILTER_SIZE**2))
+        assert torch.allclose(observed, expected, atol=2e-3), (
+            f"offset {offset}px (d^2={d2}): {observed.item()} != {expected.item()}"
+        )
+
+    # And that this pins *this* width rather than passing for any filter.
+    # At the nearest pixel (d^2 = 0.5) the three candidates are far apart:
+    # 0.707px (variance 0.5) -> 0.303, eps2d=0.3 read as a variance -> 0.217,
+    # a 2px filter -> 0.470. The atol above is 2e-3.
+    observed, d2 = _sample(0.0)
+    assert abs(d2 - 0.5) < 1e-6, d2
+    for rejected in (0.3**0.5, 2.0):
+        other = opacity * torch.exp(torch.tensor(-0.5 * d2 / rejected**2))
+        assert abs(observed - other) > 0.05, (rejected, observed.item(), other.item())
+
+
+def test_transmittance_cutoff_drops_the_same_gaussian_as_the_kernel():
+    """The oracle and the kernel must agree on the *boundary* gaussian.
+
+    The kernel computes `test_T = T * (1 - alpha)` and breaks before
+    compositing when that falls below 1e-4, so the gaussian that would
+    exhaust the pixel contributes nothing. Gating on the pre-update
+    transmittance instead composites it. Four stacked alpha-0.99 disks put
+    a pixel exactly on that boundary: T runs 1 -> 1e-2 -> 1e-4, and the
+    third disk is the one the two rules disagree about.
+    """
+    n = 4
+    quats = torch.zeros(n, 4)
+    quats[:, 0] = 1.0  # identity: fronto-parallel disks, normal along +z
+    means = torch.stack(
+        [torch.zeros(n), torch.zeros(n), torch.linspace(3.0, 3.3, n)], dim=-1
+    )
+    scales = torch.full((n, 2), 0.5)
+    opacities = torch.full((n,), 0.999)  # alpha clamps to 0.99 at the center
+    colors = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]]
+    )
+
+    proj = project_gaussians_2dgs_ref(
+        means,
+        scales,
+        quats,
+        torch.eye(3),
+        torch.zeros(3),
+        FX,
+        FY,
+        CX,
+        CY,
+        W,
+        H,
+        near=NEAR,
+        eps2d=EPS2D,
+    )
+    assert bool(proj.valid.all()), "scene setup: every disk must survive culling"
+
+    ref = rasterize_gaussians_2dgs_ref(
+        proj.means2d,
+        proj.depths,
+        proj.transform,
+        proj.normal,
+        opacities,
+        colors,
+        proj.valid,
+        W,
+        H,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+    )
+    out = rasterize_gaussians_2dgs(
+        proj.means2d.to("mps"),
+        proj.transform.reshape(n, 9).to("mps"),
+        proj.normal.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        proj.depths.to("mps"),
+        proj.radii.to("mps"),
+        proj.valid.to("mps"),
+        proj.conics.to("mps"),
+        W,
+        H,
+        near=NEAR,
+        filter_size=FILTER_SIZE,
+    )
+    torch.mps.synchronize()
+    image, _depth, _normal, _distortion, final_T = (t.cpu() for t in out)
+
+    # Far tighter than test_backward_matches_reference's tolerance, which
+    # is loose enough to hide a whole dropped-vs-kept gaussian.
+    assert torch.allclose(image, ref["image"], atol=1e-6, rtol=1e-4)
+    assert torch.allclose(final_T, ref["final_T"], atol=1e-6, rtol=1e-4)
+
+    # The third disk is blue; the rule the kernel uses drops it entirely,
+    # so no blue reaches the center pixel.
+    center = image[int(CY), int(CX)]
+    assert center[2] < 1e-7, f"blue leaked into the center pixel: {center.tolist()}"

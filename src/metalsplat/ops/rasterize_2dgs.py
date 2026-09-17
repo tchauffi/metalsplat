@@ -10,6 +10,7 @@ import torch
 
 from metalsplat.kernels import load as load_kernel
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE, bin_and_sort_gaussians
+from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 
 
 class _Rasterize2DGSImpl(torch.autograd.Function):
@@ -21,7 +22,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         normal: torch.Tensor,  # (N, 3)
         opacities: torch.Tensor,  # (N,)
         colors: torch.Tensor,  # (N, 3)
-        depths: torch.Tensor,  # (N,) gaussian mean depth, forward-only degenerate fallback
+        depths: torch.Tensor,  # (N,) gaussian mean depth, z_hit fallback (differentiable)
         sorted_ids: torch.Tensor,  # (M,) int32
         tile_bins: torch.Tensor,  # (num_tiles, 2) int32
         tiles_x: int,
@@ -29,7 +30,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         img_height: int,
         tile_size: int,
         near: float,
-        eps2d: float,
+        filter_size: float,
         background: torch.Tensor,  # (3,) float32
         abs_grad_accum: torch.Tensor
         | None,  # (N,), mutated in place by backward -- see below
@@ -44,7 +45,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         normal_c = normal.contiguous()
         opacities_c = opacities.contiguous()
         colors_c = colors.contiguous()
-        depths_c = depths.detach().contiguous()
+        depths_c = depths.contiguous()
         sorted_ids_i32 = sorted_ids.to(torch.int32).contiguous()
         if sorted_ids_i32.numel() == 0:
             sorted_ids_i32 = torch.zeros(1, dtype=torch.int32, device=device)
@@ -99,7 +100,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 int(img_height),
                 int(tile_size),
                 float(near),
-                float(eps2d),
+                float(filter_size),
                 background,
                 out_image,
                 out_depth,
@@ -134,7 +135,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         ctx.img_height = img_height
         ctx.tile_size = tile_size
         ctx.near = near
-        ctx.eps2d = eps2d
+        ctx.filter_size = filter_size
         ctx.n = n
         ctx.abs_grad_accum = abs_grad_accum
         ctx.pixel_count_accum = pixel_count_accum
@@ -185,6 +186,11 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         pixel_count_accum = ctx.pixel_count_accum
         if pixel_count_accum is None:
             pixel_count_accum = torch.zeros(n, device=device, dtype=torch.float32)
+        # `depths` is a genuine differentiable input, not just a sort key:
+        # the per-pixel math falls back to it for z_hit wherever the
+        # ray-splat intersection is unusable, so the depth map depends on
+        # it directly on those pixels. See the kernel's `g_depth`.
+        d_depths = torch.zeros(n, device=device, dtype=torch.float32)
 
         width_padded = ctx.tiles_x * ctx.tile_size
         height_padded = ctx.tiles_y * ctx.tile_size
@@ -205,7 +211,7 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 int(ctx.img_height),
                 int(ctx.tile_size),
                 float(ctx.near),
-                float(ctx.eps2d),
+                float(ctx.filter_size),
                 background,
                 final_T,
                 dist_m1,
@@ -222,21 +228,22 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
                 d_colors,
                 abs_grad_accum,
                 pixel_count_accum,
+                d_depths,
                 threads=(width_padded, height_padded),
                 group_size=(ctx.tile_size, ctx.tile_size),
             )
 
         # One gradient per forward() input: means2d, transform, normal,
-        # opacities, colors get real gradients; depths, sorted_ids,
+        # opacities, colors, depths get real gradients; sorted_ids,
         # tile_bins, tiles_x, img_width, img_height, tile_size, near,
-        # eps2d, background, abs_grad_accum, pixel_count_accum don't.
+        # filter_size, background, abs_grad_accum, pixel_count_accum don't.
         return (
             d_means2d,
             d_transform,
             d_normal,
             d_opacities,
             d_colors,
-            None,
+            d_depths,
             None,
             None,
             None,
@@ -265,19 +272,27 @@ def rasterize_gaussians_2dgs(
     img_height: int,
     tile_size: int = DEFAULT_TILE_SIZE,
     near: float = 0.2,
-    eps2d: float = 0.3,
+    filter_size: float = DEFAULT_FILTER_SIZE,
     background: torch.Tensor | None = None,
     abs_grad_accum: torch.Tensor | None = None,
     pixel_count_accum: torch.Tensor | None = None,
 ):
     """Tile-based differentiable ray-splat rasterization of 2D gaussians.
 
-    `means2d`, `transform`, `normal`, `opacities`, `colors` are the
-    differentiable per-gaussian tensors (from `project_gaussians_2dgs`);
-    `depths`, `radii`, `valid`, `conics` are used only for (non-
-    differentiable) tile binning -- `conics`/`radii` are the tile-culling
-    approximation project_gaussians_2dgs derives via the reused 3DGS EWA
-    path, not used for shading.
+    `means2d`, `transform`, `normal`, `opacities`, `colors` and `depths`
+    are the differentiable per-gaussian tensors (from
+    `project_gaussians_2dgs`). `depths` is differentiable because the
+    per-pixel math falls back to the mean's depth for the intersection
+    depth wherever the ray-splat solution is unusable -- it is a real
+    input on those pixels, not only a sort key. `radii`, `valid` and
+    `conics` are used only for (non-differentiable) tile binning --
+    `conics`/`radii` are the tile-culling approximation
+    project_gaussians_2dgs derives via the reused 3DGS EWA path, not used
+    for shading.
+
+    `filter_size` is the standard deviation, in pixels, of the
+    screen-space low-pass fallback (see `DEFAULT_FILTER_SIZE`); it is a
+    different quantity from the projection's `eps2d`.
 
     Returns `(image, depth, normal, distortion, final_T)`. Unlike 3DGS's
     `rasterize_gaussians`, `depth` and `normal` here carry real gradients
@@ -337,7 +352,7 @@ def rasterize_gaussians_2dgs(
         img_height,
         tile_size,
         near,
-        eps2d,
+        filter_size,
         background,
         abs_grad_accum,
         pixel_count_accum,

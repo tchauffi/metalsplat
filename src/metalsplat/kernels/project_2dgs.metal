@@ -176,6 +176,7 @@ kernel void project_2dgs_backward(
     constant float& eps2d,
     device const float* valid_in,       // (N,) from forward
     device const float* d_means2d,       // (N,2)
+    device const float* d_depths,         // (N,) camera-space z of the mean
     device const float* d_conics,         // (N,3) a,b,c
     device const float* d_compensations,   // (N,)
     device const float* d_transform,        // (N,9) row-major 3x3
@@ -318,7 +319,11 @@ kernel void project_2dgs_backward(
 
     float3 d_normal_up = float3(d_normal[gid * 3 + 0], d_normal[gid * 3 + 1], d_normal[gid * 3 + 2]);
 
-    float3 d_mean_cam = d_mean_cam_cov + d_meancam_from_transform;
+    // out_depths = mean_cam.z straight out of the forward (the *raw* z, not
+    // z_safe -- a culled-by-`near` gaussian returns early above), so its
+    // upstream gradient lands on that component and nowhere else.
+    float3 d_mean_cam = d_mean_cam_cov + d_meancam_from_transform
+                      + float3(0.0, 0.0, d_depths[gid]);
     float3 d_mean = RwcT * d_mean_cam;
     d_means[gid * 3 + 0] = d_mean.x;
     d_means[gid * 3 + 1] = d_mean.y;

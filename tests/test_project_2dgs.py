@@ -174,9 +174,16 @@ def test_backward_matches_reference(n):
     up_means2d = torch.randn(n, 2, generator=g) * ref.valid[:, None]
     up_transform = torch.randn(n, 3, 3, generator=g) * ref.valid[:, None, None]
     up_normal = torch.randn(n, 3, generator=g) * ref.valid[:, None]
+    # `depths` is the camera-space z of the mean -- a differentiable
+    # output, not just a sort key, since rasterize_2dgs falls back to it
+    # for z_hit. Masked by `valid` like the rest: the kernel returns a
+    # zero gradient for a culled gaussian, where the reference would still
+    # differentiate z through to `means`.
+    up_depths = torch.randn(n, generator=g) * ref.valid
 
     loss_ref = (
         (ref.means2d * up_means2d).sum()
+        + (ref.depths * up_depths).sum()
         + (ref.transform * up_transform).sum()
         + (ref.normal * up_normal).sum()
     )
@@ -201,9 +208,10 @@ def test_backward_matches_reference(n):
         near=NEAR,
         eps2d=EPS2D,
     )
-    means2d, _depths, _conics, _radii, _valid, _comp, transform, normal = out
+    means2d, depths, _conics, _radii, _valid, _comp, transform, normal = out
     loss = (
         (means2d * up_means2d.to("mps")).sum()
+        + (depths * up_depths.to("mps")).sum()
         + (transform.reshape(n, 3, 3) * up_transform.to("mps")).sum()
         + (normal * up_normal.to("mps")).sum()
     )

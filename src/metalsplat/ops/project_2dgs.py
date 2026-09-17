@@ -118,6 +118,7 @@ class Project2DGSGaussians(torch.autograd.Function):
                 float(ctx.eps2d),
                 valid,
                 grad_means2d.contiguous(),
+                grad_depths.contiguous(),
                 grad_conics.contiguous(),
                 grad_compensations.contiguous(),
                 grad_transform.contiguous(),

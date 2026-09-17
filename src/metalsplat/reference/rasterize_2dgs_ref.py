@@ -64,6 +64,32 @@ import torch
 # Matches diff-surfel-rasterization's `__device__ const float far_n = 100.0`.
 DISTORTION_FAR = 100.0
 
+# Standard deviation, in pixels, of the screen-space low-pass fallback
+# below. Matches the official rasterizer verbatim (auxiliary.h in
+# diff-surfel-rasterization):
+#
+#     __device__ const float FilterSize = 0.707106; // sqrt(2) / 2
+#     __device__ const float FilterInvSquare = 2.0f;
+#
+# i.e. `rho_screen = 2 * d^2`, a variance of 0.5 px^2. Sub-pixel by
+# design: this is an anti-aliasing floor that keeps a splat from falling
+# between sample points, not a blur.
+#
+# The width matters more than it looks, because `rho = min(rho_uv,
+# rho_screen)` makes this a *lower bound* on every splat's screen
+# footprint -- no splat can render smaller than this filter, however small
+# its disk is. Widening it takes away the optimizer's ability to sharpen
+# detail by shrinking a splat, and densification answers with overlapping
+# larger splats instead; 2.0 here (8x this variance) visibly does that.
+#
+# Deliberately separate from the projection's `eps2d`: that one dilates
+# the 2D *covariance* (px^2) for the EWA/tile-culling bound, this one is a
+# filter width (px) for an isotropic screen-space gaussian. They were the
+# same number here once -- eps2d = 0.3 read as a variance is sigma
+# ~0.548px against this 0.707px, so the old behaviour was slightly tight
+# rather than wildly off, and neither knob could move without the other.
+DEFAULT_FILTER_SIZE = 0.707106  # sqrt(2) / 2
+
 
 def rasterize_gaussians_2dgs(
     means2d: torch.Tensor,  # (N, 2) -- depth-sort ordering & the screen-space low-pass term
@@ -76,7 +102,7 @@ def rasterize_gaussians_2dgs(
     img_width: int,
     img_height: int,
     near: float = 0.2,
-    eps2d: float = 0.3,
+    filter_size: float = DEFAULT_FILTER_SIZE,
     background: torch.Tensor | None = None,  # (3,)
 ):
     """Returns a dict with `image`, `depth`, `normal`, `distortion`, `final_T`.
@@ -110,6 +136,13 @@ def rasterize_gaussians_2dgs(
     normal_map = torch.zeros(img_height, img_width, 3, device=device, dtype=dtype)
     distortion_map = torch.zeros(img_height, img_width, device=device, dtype=dtype)
     trans = torch.ones(img_height, img_width, device=device, dtype=dtype)
+    # Sticky per-pixel "this pixel is finished" flag, standing in for the
+    # kernel's `break`. Needed because this loop is vectorized over pixels
+    # and cannot break per pixel: without it, a pixel that stopped could be
+    # revived by a later gaussian whose alpha is small enough to satisfy the
+    # transmittance test again, which the kernel -- having left the loop --
+    # would never do.
+    stopped = torch.zeros(img_height, img_width, device=device, dtype=torch.bool)
 
     # Running prefix sums for the distortion expansion (see module
     # docstring): the zeroth/first/second moments of the weight
@@ -145,7 +178,7 @@ def rasterize_gaussians_2dgs(
         # compromise for near-edge-on views): take the larger of the two
         # Gaussian responses, i.e. the smaller exponent.
         d2d = pixels - means2d[i]
-        rho_screen = (d2d[..., 0] ** 2 + d2d[..., 1] ** 2) / eps2d
+        rho_screen = (d2d[..., 0] ** 2 + d2d[..., 1] ** 2) / (filter_size**2)
         uv_active = rho_uv <= rho_screen
         rho = torch.where(uv_active, rho_uv, rho_screen)
 
@@ -176,10 +209,20 @@ def rasterize_gaussians_2dgs(
         # in project_2dgs_ref only guards the mean.
         alpha = torch.where(z_hit <= near, torch.zeros_like(alpha), alpha)
 
-        active = trans >= 1e-4
-        alpha_eff = torch.where(
-            active & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha)
-        )
+        # Matches kernels/rasterize_2dgs.metal exactly, including which
+        # gaussian the transmittance cutoff drops. The kernel computes
+        # `test_T = T * (1 - alpha)` and breaks *before* compositing when
+        # that falls below 1e-4, so the gaussian that would exhaust the
+        # pixel contributes nothing. Gating on the pre-update `trans`
+        # instead would composite it (at T = 9e-3 and alpha = 0.99, a
+        # weight of ~8.9e-3 the kernel never adds) and leave the oracle
+        # ~1% off the code it certifies on that pixel.
+        #
+        # A too-faint gaussian is skipped but does *not* finish the pixel,
+        # again as in the kernel (`continue`, not `break`).
+        visible = (alpha >= 1.0 / 255.0) & ~stopped
+        exhausts = visible & (trans * (1.0 - alpha) < 1e-4)
+        alpha_eff = torch.where(visible & ~exhausts, alpha, torch.zeros_like(alpha))
         weight = trans * alpha_eff
 
         # Normalized depth for the distortion regularizer only -- `depth_map`
@@ -198,6 +241,7 @@ def rasterize_gaussians_2dgs(
         dist_M1 = dist_M1 + weight * m
         dist_M2 = dist_M2 + weight * m * m
         trans = trans * (1 - alpha_eff)
+        stopped = stopped | exhausts
 
     image = image + trans[..., None] * background
 
