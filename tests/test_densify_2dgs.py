@@ -345,3 +345,68 @@ def test_split_quantile_shifts_the_partition_but_not_the_count():
     assert len({a for _, _, a in counts}) == 1, f"gaussian count moved: {counts}"
     # ...while the partition itself really did shift across that range.
     assert counts[0][0] > counts[-1][0], counts
+
+
+def test_pixel_count_all_zero_is_a_no_op():
+    """`pixel_count` supplied but never accumulated must do nothing, not raise.
+
+    It's wired up independently of `grad_count` (it needs
+    `pixel_count_accum=` on `render_2dgs`), so passing one without the
+    other is an easy mistake. The top-of-function visibility early-out
+    can't catch it: `grad_count` is non-zero, and the selection only
+    empties when `visible` is narrowed to the covered gaussians. With
+    `grad_threshold=None` -- the self-calibrating first round -- that used
+    to reach `torch.quantile` with an empty tensor.
+    """
+    n = 10
+    model = _model(n)
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+
+    new_model, stats = densify_and_prune_2dgs(
+        model,
+        grad_accum,
+        grad_count,
+        grad_percentile=0.8,
+        pixel_count=torch.zeros(n),
+    )
+
+    assert stats.n_before == n
+    assert (stats.n_split, stats.n_cloned, stats.n_pruned) == (0, 0, 0)
+    assert stats.n_after == n
+    assert new_model.num_points == n
+
+
+def test_no_op_round_reports_no_threshold():
+    """A round that did nothing must report `grad_threshold=None`, not 0.0.
+
+    `train_garden_2dgs.py` freezes the *first* round's bar as an absolute
+    threshold for the rest of training. A placeholder 0.0 would be frozen
+    just as readily as a real calibration, and every gradient clears 0, so
+    every visible gaussian would split or clone every round from then on --
+    unbounded growth. None is the signal to recalibrate on a later round.
+    """
+    n = 10
+    model = _model(n)
+    grad_accum = torch.full((n,), 1.0)
+
+    # Nothing visible at all: the top-of-function early-out.
+    _, stats = densify_and_prune_2dgs(model, grad_accum, torch.zeros(n))
+    assert stats.grad_threshold is None
+
+    # Visible, but no gaussian covered a pixel: the post-narrowing one.
+    _, stats = densify_and_prune_2dgs(
+        model, grad_accum, torch.ones(n), pixel_count=torch.zeros(n)
+    )
+    assert stats.grad_threshold is None
+
+    # A frozen bar passed in is still reported back unchanged, so a caller
+    # that already calibrated keeps its value across a no-op round.
+    _, stats = densify_and_prune_2dgs(
+        model, grad_accum, torch.zeros(n), grad_threshold=7.5
+    )
+    assert stats.grad_threshold == 7.5
+
+    # A round that actually ran reports the bar it used.
+    _, stats = densify_and_prune_2dgs(model, grad_accum, torch.ones(n))
+    assert stats.grad_threshold is not None

@@ -350,7 +350,13 @@ def main() -> None:
                 max_points=DENSIFY_MAX_POINTS,
                 grad_threshold=densify_threshold,
             )
-            if densify_threshold is None:
+            # `stats.grad_threshold` is None when the round did nothing and
+            # so never computed a bar. Freezing that would leave the
+            # threshold at a placeholder for the rest of training, and
+            # since every gradient clears a placeholder of 0, *every*
+            # visible gaussian would split or clone every round. Skip the
+            # freeze and recalibrate on the next round that does work.
+            if densify_threshold is None and stats.grad_threshold is not None:
                 densify_threshold = stats.grad_threshold
                 print(
                     f"  densify threshold calibrated to {densify_threshold:.3e} "

@@ -136,7 +136,7 @@ def densify_and_prune_2dgs(
             0,
             0,
             n_before,
-            float(grad_threshold or 0.0),
+            grad_threshold,
             unchanged,
             unchanged,
         )
@@ -150,6 +150,25 @@ def densify_and_prune_2dgs(
         covered = visible & (pixel_count > 0)
         avg_grad[covered] = grad_accum[covered] / pixel_count[covered]
         visible = covered
+    if not bool(visible.any()):
+        # Re-checked after the narrowing above, not just at the top of the
+        # function: `pixel_count` is wired up independently of
+        # `grad_count` (it needs `pixel_count_accum=` on `render_2dgs`),
+        # so a caller who passes one and forgets the other arrives here
+        # with every gaussian narrowed away. Without this, the
+        # self-calibrating first round hits `torch.quantile` with an empty
+        # tensor and raises instead of simply doing nothing.
+        unchanged = torch.arange(n, device=device)
+        return model, DensifyStats(
+            n_before,
+            0,
+            0,
+            0,
+            n_before,
+            grad_threshold,
+            unchanged,
+            unchanged,
+        )
     if grad_threshold is None:
         threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
     else:

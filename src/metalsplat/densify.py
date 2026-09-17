@@ -30,9 +30,14 @@ class DensifyStats:
     n_cloned: int  # gaussians duplicated in place
     n_pruned: int  # gaussians removed (low opacity)
     n_after: int
-    # The absolute screen-space gradient bar used this round. Pass it back in
-    # as `grad_threshold` to freeze it; see densify_and_prune.
-    grad_threshold: float = 0.0
+    # The absolute screen-space gradient bar used this round, or None if the
+    # round did nothing (no visible gaussians, or already at `max_points`)
+    # and so never computed one. Pass it back in as `grad_threshold` to
+    # freeze it; see densify_and_prune. The None matters: a caller that
+    # freezes the *first* round's bar has to be able to tell a real
+    # calibration from a no-op, or it would freeze a placeholder and select
+    # every visible gaussian forever after.
+    grad_threshold: float | None = None
     # (n_after,) int64: where each surviving gaussian came from in the old
     # model, or NEW_GAUSSIAN (-1) if it was just created. Feed this to
     # metalsplat.optim.migrate_optimizer_state -- rebuilding the optimizer
@@ -87,7 +92,7 @@ def densify_and_prune(
             0,
             0,
             n_before,
-            float(grad_threshold or 0.0),
+            grad_threshold,
             unchanged,
             unchanged,
         )
