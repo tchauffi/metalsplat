@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-21
+
+### Added
+
+- 2D Gaussian Splatting pipeline (Huang et al. 2024): `Gaussian2DModel`,
+  `render_2dgs`, and hand-written Metal kernels for projection and
+  rasterization, parallel to the existing 3DGS pipeline.
+- Exact per-pixel ray-splat intersection (no EWA/affine approximation),
+  yielding genuinely differentiable depth and normal outputs.
+- Depth distortion and normal-consistency regularizers
+  (`distortion_loss`, `normal_consistency_loss`), gated to activate
+  partway through training.
+- AbsGS-style densification and adaptive density control for
+  `Gaussian2DModel` (`densify_and_prune_2dgs`, `prune_low_opacity_2dgs`).
+- Loss-driven gaussian seeding for regions with little or no initial
+  coverage.
+- `.ply` export/import for `Gaussian2DModel`, matching the official 2DGS
+  reference implementation's layout, plus viewer-compatible synthetic
+  `scale_2` output.
+- Real-scene training example (`examples/train_garden_2dgs.py`) using the
+  paper's own hyperparameters, and an image-fitting smoke test
+  (`examples/fit_image_2dgs.py`).
+- Orbit video rendering with RGB and surface-normal panes
+  (`examples/render_video_2dgs.py`).
+- Pure-PyTorch reference implementations for every new kernel-backed
+  stage, used as the numerical oracle in tests and as a CPU-compatible
+  fallback.
+
 ## [0.1.0] - 2026-09-09
 
 Initial release.
@@ -38,5 +66,6 @@ Initial release.
 - Ruff-based linting/formatting with pre-commit hooks.
 - MIT license, PyPI classifiers, keywords, and project URLs.
 
-[Unreleased]: https://github.com/tchauffi/metalsplat/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tchauffi/metalsplat/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/tchauffi/metalsplat/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/tchauffi/metalsplat/releases/tag/v0.1.0
