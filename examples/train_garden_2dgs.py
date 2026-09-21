@@ -135,7 +135,7 @@ OUT_DIR = Path(__file__).parent
 # render/backward pays for H*W pixels), at the cost of fine detail. See
 # metalsplat.data.colmap.load_colmap_scene's docstring; intrinsics are
 # rescaled automatically, no other change needed.
-RESOLUTION_DOWNSCALE = 4.0
+RESOLUTION_DOWNSCALE = 2.0
 
 # --- 2DGS paper defaults (arguments/__init__.py's OptimizationParams) ---
 NUM_ITERS = 15_000
@@ -434,10 +434,20 @@ def main() -> None:
                     save_image(
                         aux.image, OUT_DIR / f"garden_2dgs_eval_{k}_step{step}.png"
                     )
-                    # World-space normal in [-1, 1] -> [0, 1] for display,
-                    # the standard normal-map visualization convention.
+                    # aux.normal is an alpha-weighted *sum* (magnitude ~alpha),
+                    # not a unit vector -- divide by alpha and renormalize
+                    # before mapping to [0, 1], same correction
+                    # normal_consistency_loss and render_video_2dgs.py's
+                    # normal_to_rgb make, or semi-transparent regions (edges,
+                    # foliage) wash out toward grey instead of showing their
+                    # actual orientation.
+                    alpha = (1.0 - aux.final_T).clamp_min(1e-6)
+                    unit_normal = torch.nn.functional.normalize(
+                        aux.normal / alpha.unsqueeze(-1), dim=-1
+                    )
+                    covered = (1.0 - aux.final_T) > 0.1
                     save_image(
-                        aux.normal * 0.5 + 0.5,
+                        (unit_normal * 0.5 + 0.5) * covered[..., None],
                         OUT_DIR / f"garden_2dgs_normal_{k}_step{step}.png",
                     )
             mean_psnr = sum(psnrs) / len(psnrs)
