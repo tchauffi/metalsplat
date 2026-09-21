@@ -27,6 +27,10 @@ from metalsplat.seed import seed_uncovered_regions
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
 OUT_DIR = Path(__file__).parent
+# >1.0 resizes every loaded image by 1/RESOLUTION_DOWNSCALE (2.0 = half
+# resolution) before training -- fewer pixels means faster steps, at the
+# cost of fine detail. See metalsplat.data.colmap.load_colmap_scene.
+RESOLUTION_DOWNSCALE = 2.0
 NUM_ITERS = 30_000
 EVAL_EVERY = 1000
 LR_OTHER_INIT = 0.01
@@ -162,12 +166,15 @@ def main() -> None:
         raise FileNotFoundError(f"Expected COLMAP scene at {DATA_ROOT}")
 
     print("Loading COLMAP scene...", flush=True)
-    scene = load_colmap_scene(DATA_ROOT, device=DEVICE)
+    scene = load_colmap_scene(DATA_ROOT, device=DEVICE, downscale=RESOLUTION_DOWNSCALE)
     n_images = len(scene.cameras)
     eval_idx = list(range(0, n_images, EVAL_HOLDOUT_STRIDE))
     train_idx = [i for i in range(n_images) if i not in set(eval_idx)]
+    cam0 = scene.cameras[0]
     print(
-        f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval", flush=True
+        f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval "
+        f"({cam0.img_width}x{cam0.img_height}, downscale={RESOLUTION_DOWNSCALE})",
+        flush=True,
     )
     print(f"{scene.points.shape[0]} sparse points", flush=True)
 
@@ -343,7 +350,13 @@ def main() -> None:
                 max_points=DENSIFY_MAX_POINTS,
                 grad_threshold=densify_threshold,
             )
-            if densify_threshold is None:
+            # `stats.grad_threshold` is None when the round did nothing and
+            # so never computed a bar. Freezing that would leave the
+            # threshold at a placeholder for the rest of training, and
+            # since every gradient clears a placeholder of 0, *every*
+            # visible gaussian would split or clone every round. Skip the
+            # freeze and recalibrate on the next round that does work.
+            if densify_threshold is None and stats.grad_threshold is not None:
                 densify_threshold = stats.grad_threshold
                 print(
                     f"  densify threshold calibrated to {densify_threshold:.3e} "

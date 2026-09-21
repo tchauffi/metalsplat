@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from metalsplat.gaussians import GaussianModel, logit
+from metalsplat.gaussians_2dgs import Gaussian2DModel
 from metalsplat.optim import NEW_GAUSSIAN
 from metalsplat.utils.quaternion import quat_to_rotmat
 
@@ -29,9 +30,14 @@ class DensifyStats:
     n_cloned: int  # gaussians duplicated in place
     n_pruned: int  # gaussians removed (low opacity)
     n_after: int
-    # The absolute screen-space gradient bar used this round. Pass it back in
-    # as `grad_threshold` to freeze it; see densify_and_prune.
-    grad_threshold: float = 0.0
+    # The absolute screen-space gradient bar used this round, or None if the
+    # round did nothing (no visible gaussians, or already at `max_points`)
+    # and so never computed one. Pass it back in as `grad_threshold` to
+    # freeze it; see densify_and_prune. The None matters: a caller that
+    # freezes the *first* round's bar has to be able to tell a real
+    # calibration from a no-op, or it would freeze a placeholder and select
+    # every visible gaussian forever after.
+    grad_threshold: float | None = None
     # (n_after,) int64: where each surviving gaussian came from in the old
     # model, or NEW_GAUSSIAN (-1) if it was just created. Feed this to
     # metalsplat.optim.migrate_optimizer_state -- rebuilding the optimizer
@@ -86,7 +92,7 @@ def densify_and_prune(
             0,
             0,
             n_before,
-            float(grad_threshold or 0.0),
+            grad_threshold,
             unchanged,
             unchanged,
         )
@@ -215,7 +221,7 @@ def densify_and_prune(
 
 
 @torch.no_grad()
-def reset_opacity(model: GaussianModel, value: float = 0.01) -> None:
+def reset_opacity(model: GaussianModel | Gaussian2DModel, value: float = 0.01) -> None:
     """Caps every gaussian's opacity at `value`, in place. Standard 3DGS
     trick: periodically forces all gaussians back to near-transparent, so
     ones that only got high opacity by occluding/compensating for a
@@ -225,6 +231,11 @@ def reset_opacity(model: GaussianModel, value: float = 0.01) -> None:
     `model.raw_opacities.data` in place (same Parameter object, same
     Adam momentum buffers) rather than rebuilding the model, since no
     gaussian is added or removed.
+
+    Works for both `GaussianModel` and `Gaussian2DModel` unchanged -- it
+    only touches `.opacities`/`.raw_opacities`, never means/scales/quats,
+    so nothing here is 3D-vs-2D-specific. `metalsplat.densify2dgs` reuses
+    this directly rather than duplicating it.
     """
     new_opacities = torch.clamp(model.opacities, max=value)
     model.raw_opacities.data = logit(new_opacities)

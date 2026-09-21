@@ -9,9 +9,13 @@ import torch
 from metalsplat.camera import Camera
 from metalsplat.filter3d import apply_3d_filter
 from metalsplat.gaussians import GaussianModel
+from metalsplat.gaussians_2dgs import Gaussian2DModel
 from metalsplat.ops.project import project_gaussians
+from metalsplat.ops.project_2dgs import project_gaussians_2dgs
 from metalsplat.ops.rasterize import rasterize_gaussians
+from metalsplat.ops.rasterize_2dgs import rasterize_gaussians_2dgs
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE
+from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 
 
 class RenderAux(NamedTuple):
@@ -153,3 +157,127 @@ def render(
             image=image, means2d=means2d, valid=valid, final_T=final_T, depth=depth
         )
     return result
+
+
+class Render2DGSAux(NamedTuple):
+    """Auxiliary render outputs for `render_2dgs(..., return_aux=True)`.
+
+    Unlike `RenderAux.depth` (3DGS, forward-only/no gradient), `depth` and
+    `normal` here are genuinely differentiable -- 2DGS's normal-consistency
+    and distortion losses need real gradients through them.
+    """
+
+    image: torch.Tensor  # (H, W, 3)
+    means2d: torch.Tensor  # (N, 2), with retain_grad() called
+    valid: torch.Tensor  # (N,)
+    final_T: torch.Tensor  # (H, W) per-pixel transmittance, forward-only
+    depth: (
+        torch.Tensor
+    )  # (H, W) alpha-weighted ray-splat-intersection depth, differentiable
+    normal: torch.Tensor  # (H, W, 3) alpha-weighted world-space normal, differentiable
+    distortion: (
+        torch.Tensor
+    )  # (H, W) per-pixel Mip-NeRF-360/2DGS regularizer map, differentiable
+
+
+def render_2dgs(
+    model: Gaussian2DModel,
+    camera: Camera,
+    near: float = 0.2,
+    eps2d: float = 0.3,
+    filter_size: float = DEFAULT_FILTER_SIZE,
+    tile_size: int = DEFAULT_TILE_SIZE,
+    background: torch.Tensor | None = None,
+    return_aux: bool = False,
+    abs_grad_accum: torch.Tensor | None = None,
+    pixel_count_accum: torch.Tensor | None = None,
+):
+    """Renders `model` (a `Gaussian2DModel`) from `camera`'s viewpoint.
+
+    A separate function from `render()` rather than a dispatch inside it:
+    `render()`'s signature carries 3DGS-specific concepts that don't apply
+    here (`filter_3d`/Mip-Splatting's `antialias` compensation -- 2DGS's
+    own screen-space low-pass fallback, in `rasterize_2dgs.metal`, is a
+    different mechanism), and this codebase has one concrete function per
+    concern (one per kernel) rather than isinstance dispatch anywhere.
+
+    Returns an (H, W, 3) image, or (if `return_aux`) a `Render2DGSAux` --
+    see that NamedTuple's docstring for which fields carry real gradients.
+    `distortion.mean()`-style reductions feed `metalsplat.losses.
+    distortion_loss`; `depth`/`normal` feed
+    `metalsplat.losses.normal_consistency_loss`, which also needs the
+    accumulated opacity `1 - final_T` -- `depth` and `normal` are both
+    alpha-weighted *sums*, so neither can be interpreted without it (see
+    that function's docstring).
+
+    `eps2d` and `filter_size` are two different low-pass widths and are
+    deliberately separate knobs: `eps2d` dilates the projected 2D
+    covariance (px^2) for the EWA/tile-culling bound, while `filter_size`
+    is the pixel standard deviation of the rasterizer's own screen-space
+    fallback for near-edge-on splats. See
+    `metalsplat.reference.rasterize_2dgs_ref.DEFAULT_FILTER_SIZE`.
+
+    `abs_grad_accum`, if given, is passed through to
+    `rasterize_gaussians_2dgs`: an (N,) tensor that backward() atomically
+    adds each gaussian's AbsGS-style densification signal into -- see
+    that function's docstring and `metalsplat.densify2dgs` for how it's
+    used. Pass `pixel_count_accum` alongside it to also collect the
+    covered-pixel counts that normalize that signal per pixel rather
+    than per screen area.
+    """
+    means2d, depths, conics, radii, valid, _compensation, transform, normal = (
+        project_gaussians_2dgs(
+            model.means,
+            model.scales,
+            model.quats,
+            camera.R_wc,
+            camera.t_wc,
+            camera.fx,
+            camera.fy,
+            camera.cx,
+            camera.cy,
+            camera.img_width,
+            camera.img_height,
+            near=near,
+            eps2d=eps2d,
+        )
+    )
+    if return_aux and means2d.requires_grad:
+        means2d.retain_grad()
+
+    if model.sh_degree == 0:
+        colors = model.colors
+    else:
+        view_dirs = torch.nn.functional.normalize(model.means - camera.position, dim=-1)
+        colors = model.colors_from_view(view_dirs)
+
+    image, depth, out_normal, distortion, final_T = rasterize_gaussians_2dgs(
+        means2d,
+        transform,
+        normal,
+        model.opacities,
+        colors,
+        depths,
+        radii,
+        valid,
+        conics,
+        camera.img_width,
+        camera.img_height,
+        tile_size=tile_size,
+        near=near,
+        filter_size=filter_size,
+        background=background,
+        abs_grad_accum=abs_grad_accum,
+        pixel_count_accum=pixel_count_accum,
+    )
+    if return_aux:
+        return Render2DGSAux(
+            image=image,
+            means2d=means2d,
+            valid=valid,
+            final_T=final_T,
+            depth=depth,
+            normal=out_normal,
+            distortion=distortion,
+        )
+    return image
