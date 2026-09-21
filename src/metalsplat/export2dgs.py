@@ -19,6 +19,22 @@ these fields either; downstream tools (e.g. mesh extraction) recompute it
 from the loaded rotation quaternion instead. This module does the same,
 rather than "fixing" the vestigial zero fields to be more accurate than
 the format they're meant to interchange with.
+
+The 2-scale layout is faithful to the reference toolchain but not to the
+much larger ecosystem of generic 3DGS viewers/tools (SuperSplat, the
+various three.js/WebGL viewers, etc.), which hardcode the standard 3DGS
+property set -- including exactly 3 `scale_*` entries -- and misread the
+vertex stride when one is missing (everything from `opacity` onward
+shifts by a field, so a splat can render as if its opacity, size, and
+rotation are all wrong at once, when the actual per-field values are
+fine). `save_ply(..., viewer_compatible=True)` trades reference-format
+purity for that broader interop: it adds a synthetic `scale_2`, sized a
+fixed log-ratio below each splat's thinner in-plane axis so it always
+reads as "flat" relative to the splat's own size rather than in absolute
+units (which would be wrong for scenes at a different scale). `load_ply`
+already ignores any `scale_2` it finds -- it only ever looks up
+`scale_0`/`scale_1` by name -- so both layouts round-trip back into a
+`Gaussian2DModel` without extra handling.
 """
 
 from __future__ import annotations
@@ -31,8 +47,16 @@ import torch
 from metalsplat.gaussians_2dgs import Gaussian2DModel
 from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
 
+# log-space gap below a splat's thinner in-plane axis used for the synthetic
+# scale_2 in viewer_compatible mode -- exp(-4) ~ 1.8% of that axis, thin
+# enough to read as flat without being degenerate (zero) for viewers that
+# build a full 3x3 covariance and need it invertible.
+_VIEWER_COMPAT_LOG_MARGIN = 4.0
 
-def save_ply(model: Gaussian2DModel, path: str | Path) -> None:
+
+def save_ply(
+    model: Gaussian2DModel, path: str | Path, viewer_compatible: bool = False
+) -> None:
     path = Path(path)
     n = model.num_points
 
@@ -62,6 +86,11 @@ def save_ply(model: Gaussian2DModel, path: str | Path) -> None:
     scale = (
         model.raw_scales.detach().cpu().numpy().astype(np.float32)
     )  # (N, 2), log-space
+    if viewer_compatible:
+        thin_axis = (
+            np.minimum(scale[:, 0], scale[:, 1]) - _VIEWER_COMPAT_LOG_MARGIN
+        ).reshape(n, 1)
+        scale = np.concatenate([scale, thin_axis], axis=1)  # (N, 3)
     rot = model.quats.detach().cpu().numpy().astype(np.float32)  # (N, 4), unit, w x y z
 
     data = np.concatenate([xyz, normals, dc, rest, opacity, scale, rot], axis=1).astype(
@@ -73,7 +102,7 @@ def save_ply(model: Gaussian2DModel, path: str | Path) -> None:
         + [f"f_dc_{i}" for i in range(3)]
         + [f"f_rest_{i}" for i in range(rest.shape[1])]
         + ["opacity"]
-        + [f"scale_{i}" for i in range(2)]
+        + [f"scale_{i}" for i in range(scale.shape[1])]
         + [f"rot_{i}" for i in range(4)]
     )
     assert data.shape[1] == len(names)

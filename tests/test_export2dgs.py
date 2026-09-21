@@ -164,3 +164,42 @@ def test_scale_shape_is_two_not_three(tmp_path):
     loaded = load_ply(path)
     assert loaded.scales.shape == (3, 2)
     assert loaded.raw_scales.shape == (3, 2)
+
+
+def test_viewer_compatible_adds_scale_2_thinner_than_in_plane_axes(tmp_path):
+    torch.manual_seed(2)
+    n = 6
+    model = Gaussian2DModel(
+        torch.randn(n, 3),
+        scales=torch.rand(n, 2) * 0.1 + 0.01,
+        colors=torch.rand(n, 3),
+    )
+    path = tmp_path / "compat.ply"
+    save_ply(model, path, viewer_compatible=True)
+
+    names, rows = _read_ply(path)
+    # standard 3DGS layout now: exactly 3 scale_* properties
+    assert names.count("scale_0") == 1
+    assert names.count("scale_1") == 1
+    assert names.count("scale_2") == 1
+    s0i, s1i, s2i = (names.index(f"scale_{i}") for i in range(3))
+
+    for row in rows:
+        # scale_2 is log-space; it should be strictly thinner than both
+        # in-plane axes, never equal/larger (that would render as a ball,
+        # not a flat disk, in a generic 3D viewer).
+        assert row[s2i] < min(row[s0i], row[s1i])
+
+    # load_ply ignores the synthetic scale_2 -- round-trips back to 2D
+    loaded = load_ply(path)
+    assert loaded.scales.shape == (n, 2)
+    assert torch.allclose(loaded.scales, model.scales, atol=1e-4)
+
+
+def test_viewer_compatible_default_is_false(tmp_path):
+    model = Gaussian2DModel(torch.randn(2, 3), colors=torch.rand(2, 3))
+    path = tmp_path / "default.ply"
+    save_ply(model, path)
+
+    names, _rows = _read_ply(path)
+    assert "scale_2" not in names
