@@ -1,9 +1,12 @@
 # MetalSplat
 
-A differentiable 3D Gaussian Splatting rasterizer for PyTorch, targeting
-Apple Silicon via Metal instead of CUDA -- a `gsplat`-equivalent that runs
+A differentiable Gaussian Splatting rasterizer for PyTorch, targeting Apple
+Silicon via Metal instead of CUDA -- a `gsplat`-equivalent that runs
 entirely on the MPS backend, with real hand-written Metal compute kernels
-for the performance-critical stages.
+for the performance-critical stages. Two pipelines: classic **3D Gaussian
+Splatting** (best novel-view quality) and **[2D Gaussian
+Splatting](#2d-gaussian-splatting)** (flat oriented surfels with exact,
+differentiable depth and normals, for when the geometry itself matters).
 
 ![RGB and depth renders of the garden scene, over a full orbit](docs/garden_orbit.webp)
 
@@ -205,9 +208,8 @@ That is the trade-off visible in a single frame.
 
 Trained by `examples/train_garden_2dgs.py` and rendered by
 `examples/render_video_2dgs.py`: 15000 iterations at half resolution
-(`RESOLUTION_DOWNSCALE = 2.0`; the script now ships `4.0`, so a default
-run today is a quarter-resolution one and will not reproduce these
-numbers), reaching **24.8 dB PSNR / 0.719 SSIM** on the 24 held-out views
+(`RESOLUTION_DOWNSCALE = 2.0`, the script's current default), reaching
+**24.8 dB PSNR / 0.719 SSIM** on the 24 held-out views
 with 812k surfels. That figure is *not* comparable to the 3DGS one at the top of this
 README -- that run is at full resolution with 330k gaussians, and PSNR
 rises as resolution falls, so the two differ by more than the method. No
