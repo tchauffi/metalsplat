@@ -124,6 +124,7 @@ from metalsplat.losses import (
     distortion_loss,
     gaussian_splatting_loss,
     normal_consistency_loss,
+    psnr,
 )
 from metalsplat.optim import SparseAdam, migrate_optimizer_state
 
@@ -289,13 +290,6 @@ def _as_float(x: torch.Tensor | float) -> float:
     return x.item() if torch.is_tensor(x) else float(x)
 
 
-def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    mse = (pred - target).pow(2).mean().item()
-    if mse <= 0:
-        return float("inf")
-    return -10.0 * torch.log10(torch.tensor(mse)).item()
-
-
 def save_image(tensor: torch.Tensor, path: Path) -> None:
     import numpy as np
     from PIL import Image
@@ -429,7 +423,7 @@ def main() -> None:
                     model, scene.cameras[idx], background=background, return_aux=True
                 )
                 torch.mps.synchronize()
-                psnrs.append(psnr(aux.image, scene.images[idx]))
+                psnrs.append(psnr(aux.image, scene.images[idx]).item())
                 if k < EVAL_IMAGES_SAVED:
                     save_image(
                         aux.image, OUT_DIR / f"garden_2dgs_eval_{k}_step{step}.png"

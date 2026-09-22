@@ -20,7 +20,7 @@ from metalsplat import GaussianModel, render, save_ply
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
 from metalsplat.filter3d import carry_filter_3d, compute_3d_filter
-from metalsplat.losses import gaussian_splatting_loss
+from metalsplat.losses import gaussian_splatting_loss, psnr
 from metalsplat.optim import SparseAdam, migrate_optimizer_state, sh_lr_scale
 from metalsplat.seed import seed_uncovered_regions
 
@@ -106,13 +106,6 @@ PRUNE_START = 100
 PRUNE_STOP = NUM_ITERS
 PRUNE_INTERVAL = 100
 PRUNE_OPACITY_THRESH = 0.005
-
-
-def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    mse = (pred - target).pow(2).mean().item()
-    if mse <= 0:
-        return float("inf")
-    return -10.0 * torch.log10(torch.tensor(mse)).item()
 
 
 def save_image(tensor: torch.Tensor, path: Path) -> None:
@@ -287,7 +280,7 @@ def main() -> None:
                     filter_3d=filter_3d,
                 )
                 torch.mps.synchronize()
-                psnrs.append(psnr(pred, scene.images[idx]))
+                psnrs.append(psnr(pred, scene.images[idx]).item())
                 if k < EVAL_IMAGES_SAVED:
                     save_image(pred, OUT_DIR / f"garden_eval_{k}_step{step}.png")
             mean_psnr = sum(psnrs) / len(psnrs)
