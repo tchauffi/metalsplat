@@ -288,3 +288,36 @@ def test_backward_matches_reference_with_many_gaussians_per_tile(n):
         assert torch.allclose(got.cpu(), want, atol=2e-3, rtol=2e-2), (
             f"{name} gradient disagrees"
         )
+
+
+@pytest.mark.parametrize("tile_size", [4, 8])
+def test_backward_independent_of_tile_size(tile_size):
+    # Enough gaussians that a tile's list is longer than the tile_size^2
+    # threads of a small threadgroup, so the backward's shared-memory
+    # staging has to cover more slots than there are threads.
+    n = 1500
+    means2d, depths, conics, opacities, colors, radii, valid = _random_scene(n)
+    opacities = opacities * 0.1  # keep T from saturating before the tail
+
+    def grads(ts):
+        inputs = [
+            t.to("mps").requires_grad_() for t in (means2d, conics, opacities, colors)
+        ]
+        image = rasterize_gaussians(
+            inputs[0],
+            depths.to("mps"),
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            radii.to("mps"),
+            valid.to("mps"),
+            W,
+            H,
+            tile_size=ts,
+        )
+        (image * torch.linspace(0, 1, 3, device="mps")).sum().backward()
+        torch.mps.synchronize()
+        return [t.grad.cpu() for t in inputs]
+
+    for got, expected in zip(grads(tile_size), grads(16)):
+        assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3)

@@ -26,11 +26,26 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from metalsplat.filter3d import apply_3d_filter
 from metalsplat.gaussians import GaussianModel
 from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
 
 
-def save_ply(model: GaussianModel, path: str | Path) -> None:
+def save_ply(
+    model: GaussianModel, path: str | Path, filter_3d: torch.Tensor | None = None
+) -> None:
+    """Writes `model` to `path` in the reference 3DGS .ply layout.
+
+    Pass the `filter_3d` the model was trained and evaluated with (see
+    metalsplat.filter3d) to bake it into the written scales and opacities,
+    the way Mip-Splatting exports. Other viewers know nothing about the
+    filter, so without this they render every gaussian thinner and the
+    small ones denser than training ever saw them. A baked file must then
+    be rendered *without* `filter_3d`, or the filter is applied twice.
+
+    The screen-space anti-aliasing compensation (`render(antialias=True)`)
+    depends on the view and cannot be baked.
+    """
     path = Path(path)
     n = model.num_points
 
@@ -55,12 +70,16 @@ def save_ply(model: GaussianModel, path: str | Path) -> None:
             .astype(np.float32)
         )
 
-    opacity = (
-        model.raw_opacities.detach().cpu().numpy().astype(np.float32).reshape(n, 1)
-    )
-    scale = (
-        model.raw_scales.detach().cpu().numpy().astype(np.float32)
-    )  # (N, 3), log-space
+    raw_opacities = model.raw_opacities.detach()
+    raw_scales = model.raw_scales.detach()
+    if filter_3d is not None:
+        scales, opacities = apply_3d_filter(
+            model.scales.detach(), model.opacities.detach(), filter_3d.detach()
+        )
+        raw_scales = scales.log()
+        raw_opacities = torch.logit(opacities, eps=1e-6)
+    opacity = raw_opacities.cpu().numpy().astype(np.float32).reshape(n, 1)
+    scale = raw_scales.cpu().numpy().astype(np.float32)  # (N, 3), log-space
     rot = model.quats.detach().cpu().numpy().astype(np.float32)  # (N, 4), unit, w x y z
 
     data = np.concatenate([xyz, normals, dc, rest, opacity, scale, rot], axis=1).astype(

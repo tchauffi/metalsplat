@@ -6,10 +6,10 @@ scale = exp(raw_scale) (positive), quat = normalize(raw_quat) (unit),
 opacity = sigmoid(raw_opacity) (in [0, 1]).
 
 Color is either plain per-gaussian RGB (`sh_degree=0`, the default: color =
-sigmoid(raw_color), in [0, 1]) or degree<=2 spherical harmonics
-(`sh_degree=1..3`: view-dependent color = eval_sh(raw_sh, view_dir) + 0.5,
-matching standard 3DGS convention -- unconstrained/unclamped internally,
-consumers clamp to [0, 1] for display). SH needs a view direction so it
+sigmoid(raw_color), in [0, 1]) or degree<=3 spherical harmonics
+(`sh_degree=1..3`: view-dependent color = max(eval_sh(raw_sh, view_dir) +
+0.5, 0), matching standard 3DGS convention -- clamped below at 0 but not
+above, consumers clamp to [0, 1] for display). SH needs a view direction so it
 can't be a plain property; use `colors_from_view(view_dirs)`.
 """
 
@@ -93,7 +93,7 @@ class GaussianModel(nn.Module):
         return torch.sigmoid(self.raw_colors)
 
     def colors_from_view(self, view_dirs: torch.Tensor) -> torch.Tensor:
-        """view_dirs: (N, 3) unit vectors from each gaussian to the camera."""
+        """view_dirs: (N, 3) unit vectors from the camera to each gaussian."""
         if self.sh_degree == 0:
             raise AttributeError(
                 "This model has sh_degree=0; use the `colors` property instead."

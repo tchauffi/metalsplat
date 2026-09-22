@@ -155,13 +155,16 @@ kernel void rasterize_backward(
         int count = batch_end - batch_start;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((int)local_idx < count) {
-            int gid = sorted_ids[batch_start + int(local_idx)];
-            sh_gid[local_idx] = gid;
-            sh_mean[local_idx] = float2(means2d[gid * 2 + 0], means2d[gid * 2 + 1]);
-            sh_conic[local_idx] = float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]);
-            sh_opacity[local_idx] = opacities[gid];
-            sh_color[local_idx] = float3(colors[gid * 3 + 0], colors[gid * 3 + 1], colors[gid * 3 + 2]);
+        // Strided: the threadgroup has tile_size^2 threads, which is fewer
+        // than BACKWARD_BATCH for tile_size < 16, so one slot per thread
+        // would leave the tail of the batch uninitialised.
+        for (int s = int(local_idx); s < count; s += tile_size * tile_size) {
+            int gid = sorted_ids[batch_start + s];
+            sh_gid[s] = gid;
+            sh_mean[s] = float2(means2d[gid * 2 + 0], means2d[gid * 2 + 1]);
+            sh_conic[s] = float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]);
+            sh_opacity[s] = opacities[gid];
+            sh_color[s] = float3(colors[gid * 3 + 0], colors[gid * 3 + 1], colors[gid * 3 + 2]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

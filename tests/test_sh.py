@@ -165,3 +165,27 @@ def test_degree_3_uses_all_sixteen_coefficients():
     assert (per_coeff > 0).all(), (
         f"coefficients with no gradient: {(per_coeff == 0).nonzero().flatten().tolist()}"
     )
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
+def test_colors_from_view_clamped_at_zero():
+    # Reference 3DGS clamps SH colour at 0 (with no gradient through the
+    # clamp); external viewers do the same, so negative colours must never
+    # reach the rasterizer during training.
+    from metalsplat.gaussians import GaussianModel
+
+    n = 4
+    model = GaussianModel(
+        torch.randn(n, 3, device="mps"),
+        colors=torch.zeros(n, 3, device="mps"),
+        sh_degree=1,
+    ).to("mps")
+    with torch.no_grad():
+        model.raw_sh[:, 2, :] = 5.0  # strongly z-dependent
+    dirs = torch.tensor([[0.0, 0.0, -1.0]] * n, device="mps")
+    colors = model.colors_from_view(dirs)
+    colors.sum().backward()
+    torch.mps.synchronize()
+
+    assert (colors == 0).all()
+    assert (model.raw_sh.grad == 0).all()

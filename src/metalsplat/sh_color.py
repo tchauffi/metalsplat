@@ -2,10 +2,10 @@
 
 Used by both `GaussianModel` (3D) and `Gaussian2DModel` (2D): color is
 either plain per-gaussian RGB (`sh_degree=0`: color = sigmoid(raw_color),
-in [0, 1]) or degree<=2 spherical harmonics (`sh_degree=1..3`:
-view-dependent color = eval_sh(raw_sh, view_dir) + 0.5, matching standard
-3DGS convention -- unconstrained/unclamped internally, consumers clamp to
-[0, 1] for display).
+in [0, 1]) or degree<=3 spherical harmonics (`sh_degree=1..3`:
+view-dependent color = max(eval_sh(raw_sh, view_dir) + 0.5, 0), matching
+standard 3DGS convention -- clamped below at 0 but not above, consumers
+clamp to [0, 1] for display).
 
 Extracted out of `GaussianModel` so the two model classes share one
 implementation instead of two copies that can drift; both classes register
@@ -68,8 +68,14 @@ def init_color_param(
 def colors_from_view(
     raw_sh: torch.Tensor, active_sh_degree: int, view_dirs: torch.Tensor
 ) -> torch.Tensor:
-    """view_dirs: (N, 3) unit vectors from each gaussian to the camera."""
-    return eval_sh(raw_sh, view_dirs, active_sh_degree) + 0.5
+    """view_dirs: (N, 3) unit vectors from the camera to each gaussian.
+
+    Clamped at 0 like the reference rasterizer: without it training can use
+    negative colours to subtract light, which every external viewer clamps
+    away, so an exported scene would render differently there. The clamp
+    also blocks gradient on clamped channels, as the reference does.
+    """
+    return (eval_sh(raw_sh, view_dirs, active_sh_degree) + 0.5).clamp_min(0.0)
 
 
 def increase_sh_degree(sh_degree: int, active_sh_degree: int) -> int:

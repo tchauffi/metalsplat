@@ -268,7 +268,7 @@ def main() -> None:
         nonlocal best
         if mean_psnr > best[0]:
             best = (mean_psnr, step)
-            save_ply(model, OUT_DIR / "garden_best.ply")
+            save_ply(model, OUT_DIR / "garden_best.ply", filter_3d=filter_3d)
 
     best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
 
@@ -447,7 +447,7 @@ def main() -> None:
 
     eval_and_save(NUM_ITERS)
     ply_path = OUT_DIR / "garden.ply"
-    save_ply(model, ply_path)
+    save_ply(model, ply_path, filter_3d=filter_3d)
     print(
         f"Done. Renders saved to {OUT_DIR}, final scene saved to {ply_path}", flush=True
     )

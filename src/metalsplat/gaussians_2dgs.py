@@ -104,7 +104,7 @@ class Gaussian2DModel(nn.Module):
         return torch.sigmoid(self.raw_colors)
 
     def colors_from_view(self, view_dirs: torch.Tensor) -> torch.Tensor:
-        """view_dirs: (N, 3) unit vectors from each gaussian to the camera."""
+        """view_dirs: (N, 3) unit vectors from the camera to each gaussian."""
         if self.sh_degree == 0:
             raise AttributeError(
                 "This model has sh_degree=0; use the `colors` property instead."
