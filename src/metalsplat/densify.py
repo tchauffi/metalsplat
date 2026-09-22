@@ -55,7 +55,7 @@ def densify_and_prune(
     model: GaussianModel,
     grad_accum: torch.Tensor,  # (N,) accumulated means2d-grad norms since last call
     grad_count: torch.Tensor,  # (N,) number of steps each gaussian was visible
-    scene_scale: float,
+    scene_scale: float,  # split/clone boundary: largest scale above it -> split
     grad_percentile: float = 0.8,
     grad_threshold: float | None = None,
     prune_opacity_thresh: float = 0.005,
@@ -66,6 +66,10 @@ def densify_and_prune(
     max_world_size: float | None = None,
 ) -> tuple[GaussianModel, DensifyStats]:
     """Splits, clones and prunes, returning the new model and stats.
+
+    A candidate whose largest scale exceeds `scene_scale` is split into two
+    smaller children; any other candidate is cloned. The reference sets this
+    boundary to `percent_dense` (0.01) x the camera extent.
 
     `grad_threshold`, if given, is an *absolute* bar on the average
     screen-space gradient: a gaussian is a split/clone candidate only if it

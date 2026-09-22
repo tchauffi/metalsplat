@@ -98,6 +98,12 @@ SEED_MAX_PER_CALL = 300
 # densification_postfix zeroes max_radii2D before the check, so it never
 # fires there; enforcing it here deleted the foreground near the cameras.
 PRUNE_MAX_WORLD_FRACTION = 0.1
+# Split vs clone boundary, as in the reference (`percent_dense`): a
+# densify candidate whose largest scale exceeds this fraction of the camera
+# extent is split in two, anything smaller is cloned. This used to be the
+# median nearest-neighbour spacing of the sparse points, which has nothing
+# to do with how large a gaussian can be before it is under-resolving.
+PERCENT_DENSE = 0.01
 
 OPACITY_RESET_INTERVAL = 1500  # 0/None disables
 OPACITY_RESET_STOP = 3000
@@ -236,8 +242,10 @@ def main() -> None:
 
     extent = camera_extent(scene.cameras)
     max_world_size = PRUNE_MAX_WORLD_FRACTION * extent
+    split_scale = PERCENT_DENSE * extent
     print(
-        f"camera extent {extent:.3f}: pruning scales > {max_world_size:.3f}",
+        f"camera extent {extent:.3f}: splitting scales > {split_scale:.4f}, "
+        f"pruning scales > {max_world_size:.3f}",
         flush=True,
     )
 
@@ -372,7 +380,7 @@ def main() -> None:
                 model,
                 grad_accum,
                 grad_count,
-                scene_scale=scene_scale,
+                scene_scale=split_scale,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 max_points=DENSIFY_MAX_POINTS,
                 grad_threshold=densify_threshold,
