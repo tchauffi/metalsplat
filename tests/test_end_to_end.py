@@ -142,3 +142,89 @@ def test_near_fade_keeps_gradients_flowing():
     assert model.raw_opacities.grad is not None
     assert torch.isfinite(model.raw_opacities.grad).all()
     assert model.means.grad is not None and torch.isfinite(model.means.grad).all()
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
+def test_opaque_gaussians_just_outside_the_frame_still_reach_it():
+    # Opaque gaussians centred a little left of the image, at increasing
+    # distances. Their alpha stays above 1/255 out to ~3.33 sigma, so the
+    # nearer ones still colour the first columns -- but a 3-sigma culling
+    # radius in projection dropped them, cutting the image border clean.
+    # Compared against a brute-force rasterization of the same projected
+    # gaussians with no culling at all.
+    from metalsplat.ops.project import project_gaussians
+    from metalsplat.reference.project_ref import (
+        project_gaussians as project_ref,
+    )
+    from metalsplat.reference.rasterize_ref import rasterize_gaussians as raster_ref
+
+    size, f, z = 128, 200.0, 2.0
+    k = 16
+    # Fine steps: the gap between a 3-sigma radius (rounded up) and the true
+    # reach is under a pixel wide.
+    u = torch.linspace(-14.0, -18.0, k)  # pixel x of each centre, off-frame
+    v = torch.arange(k) * 8.0 + 4.0
+    depth = z + torch.arange(k) * 1e-3  # distinct, for a stable order
+    means = torch.stack(
+        [(u - size / 2) * depth / f, (v - size / 2) * depth / f, depth], dim=-1
+    )
+    model = GaussianModel(
+        means,
+        scales=torch.full((k, 3), 0.05),
+        opacities=torch.full((k,), 0.99),
+        colors=torch.ones(k, 3),
+    ).to("mps")
+    camera = Camera.identity(
+        fx=f, fy=f, cx=size / 2, cy=size / 2, img_width=size, img_height=size
+    ).to("mps")
+
+    with torch.no_grad():
+        image = render(model, camera, antialias=False).cpu()
+        proj = project_gaussians(
+            model.means,
+            model.scales,
+            model.quats,
+            camera.R_wc,
+            camera.t_wc,
+            f,
+            f,
+            size / 2,
+            size / 2,
+            size,
+            size,
+        )
+        means2d, depths, conics = proj[0].cpu(), proj[1].cpu(), proj[2].cpu()
+        expected = raster_ref(
+            means2d,
+            depths,
+            conics,
+            model.opacities.cpu(),
+            torch.ones(k, 3),
+            torch.ones(k),
+            size,
+            size,
+        )
+        old_valid = project_ref(
+            model.means.cpu(),
+            model.scales.cpu(),
+            model.quats.cpu(),
+            camera.R_wc.cpu(),
+            camera.t_wc.cpu(),
+            f,
+            f,
+            size / 2,
+            size / 2,
+            size,
+            size,
+            radius_sigmas=3.0,
+        ).valid
+
+    # Which gaussians put alpha >= 1/255 on the nearest first-column pixel.
+    d = torch.stack([0.5 - means2d[:, 0], (v.floor() + 0.5) - means2d[:, 1]], -1)
+    a, b, c = conics.unbind(-1)
+    power = -0.5 * (a * d[:, 0] ** 2 + 2 * b * d[:, 0] * d[:, 1] + c * d[:, 1] ** 2)
+    reaches = 0.99 * torch.exp(power) >= 1.0 / 255.0
+    # The case is only meaningful if some gaussian the old radius culled
+    # really does reach the frame.
+    assert (reaches & ~old_valid).any()
+    assert torch.allclose(image, expected, atol=1e-5)

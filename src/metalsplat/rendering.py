@@ -26,6 +26,7 @@ class RenderAux(NamedTuple):
     valid: torch.Tensor  # (N,)
     final_T: torch.Tensor  # (H, W) per-pixel transmittance
     depth: torch.Tensor  # (H, W) alpha-weighted expected depth, forward-only
+    radii: torch.Tensor  # (N,) projected 3-sigma pixel radius, 0 if culled
 
 
 def render(
@@ -49,7 +50,9 @@ def render(
     loops to count how many steps each gaussian was visible for; `final_T`
     (per-pixel transmittance, close to 1 where ~no gaussian contributed) is
     used by metalsplat.seed to find uncovered regions; `depth` is the
-    alpha-weighted expected depth (forward-only, no gradient).
+    alpha-weighted expected depth (forward-only, no gradient); `radii` is
+    each gaussian's projected pixel radius, which training tracks the
+    maximum of for densify_and_prune's screen-size pruning.
 
     `abs_grad_accum`, if given, is passed through to rasterize_gaussians:
     an (N,) tensor that backward() atomically adds each gaussian's
@@ -154,7 +157,12 @@ def render(
     if return_aux:
         image, depth, final_T = result
         return RenderAux(
-            image=image, means2d=means2d, valid=valid, final_T=final_T, depth=depth
+            image=image,
+            means2d=means2d,
+            valid=valid,
+            final_T=final_T,
+            depth=depth,
+            radii=radii,
         )
     return result
 

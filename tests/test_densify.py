@@ -284,3 +284,91 @@ def test_reported_threshold_round_trips():
         grad_threshold=stats.grad_threshold,
     )
     assert again.n_split + again.n_cloned == stats.n_split + stats.n_cloned
+
+
+def test_pruning_runs_after_split_and_clone_like_the_reference():
+    n = 4
+    model = _model(n)
+    with torch.no_grad():
+        # 0: too big in world but a split candidate -> split, and its
+        #    children (3.0 / 1.6 = 1.875) fit under the bar, so they survive.
+        model.raw_scales[0] = torch.log(torch.tensor(3.0))
+        # 1: too big in world and *not* a candidate -> pruned.
+        model.raw_scales[1] = torch.log(torch.tensor(3.0))
+        # 2: low opacity but a clone candidate -> the clone is pruned too.
+        model.raw_opacities[2] = -10.0
+    grad_accum = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+    new_model, stats = densify_and_prune(
+        model,
+        grad_accum,
+        torch.ones(n),
+        scene_scale=SCENE_SCALE,
+        grad_threshold=0.5,
+        max_world_size=2.0,
+    )
+
+    assert stats.n_split == 1 and stats.n_cloned == 1
+    # Removed after densification: 1 (world size), 2 and its clone (opacity).
+    assert stats.n_pruned == 3
+    assert new_model.num_points == 3  # gaussian 3 + two children of 0
+    assert sorted(stats.parent_index.tolist()) == [0, 0, 3]
+    assert (new_model.scales.max(dim=-1).values <= 2.0).all()
+
+
+def test_screen_size_pruning_spares_new_rows():
+    n = 3
+    model = _model(n)
+    max_radii2d = torch.tensor([50.0, 50.0, 5.0])
+    grad_accum = torch.tensor([1.0, 0.0, 0.0])  # 0 is cloned
+
+    _, stats = densify_and_prune(
+        model,
+        grad_accum,
+        torch.ones(n),
+        scene_scale=SCENE_SCALE,
+        grad_threshold=0.5,
+        max_radii2d=max_radii2d,
+        max_screen_size=20.0,
+    )
+
+    # Originals 0 and 1 are over the bar; 0's fresh clone has no history.
+    assert stats.n_pruned == 2
+    assert stats.parent_index.tolist() == [2, 0]
+    assert stats.source_index.tolist() == [2, -1]
+
+
+def test_oversized_pruning_is_off_by_default():
+    n = 4
+    model = _model(n)
+    max_radii2d = torch.full((n,), 1000.0)
+    _, stats = densify_and_prune(
+        model,
+        torch.zeros(n),
+        torch.ones(n),
+        scene_scale=SCENE_SCALE,
+        grad_threshold=1.0,
+        max_radii2d=max_radii2d,
+    )
+    assert stats.n_pruned == 0
+
+
+def test_reset_opacity_zeroes_opacity_adam_moments_only():
+    from metalsplat.optim import SparseAdam
+
+    model = _model(4)
+    optimizer = SparseAdam(
+        [{"params": [model.raw_opacities]}, {"params": [model.raw_scales]}]
+    )
+    for _ in range(3):
+        optimizer.zero_grad()
+        (model.opacities.sum() + model.scales.sum()).backward()
+        optimizer.step(torch.ones(4, dtype=torch.bool))
+
+    reset_opacity(model, value=0.01, optimizer=optimizer)
+
+    op_state = optimizer.state[model.raw_opacities]
+    assert (op_state["exp_avg"] == 0).all() and (op_state["exp_avg_sq"] == 0).all()
+    assert op_state["step"].item() == 3  # bias correction keeps elapsed steps
+    assert (optimizer.state[model.raw_scales]["exp_avg"] != 0).all()
+    assert (model.opacities <= 0.01 + 1e-6).all()

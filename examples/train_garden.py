@@ -17,11 +17,12 @@ from pathlib import Path
 import torch
 
 from metalsplat import GaussianModel, render, save_ply
+from metalsplat.camera import camera_extent
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
 from metalsplat.filter3d import carry_filter_3d, compute_3d_filter
-from metalsplat.losses import gaussian_splatting_loss
-from metalsplat.optim import SparseAdam, migrate_optimizer_state
+from metalsplat.losses import gaussian_splatting_loss, psnr
+from metalsplat.optim import SparseAdam, migrate_optimizer_state, sh_lr_scale
 from metalsplat.seed import seed_uncovered_regions
 
 DEVICE = "mps"
@@ -33,8 +34,14 @@ OUT_DIR = Path(__file__).parent
 RESOLUTION_DOWNSCALE = 2.0
 NUM_ITERS = 30_000
 EVAL_EVERY = 1000
-LR_OTHER_INIT = 0.01
-LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # color/scale/rotation are decayed, like means
+# Reference 3DGS learning rates, held constant like the reference. The SH
+# rate applies to the DC coefficient; the higher bands get 1/20 of it (see
+# metalsplat.optim.sh_lr_scale). These used to be a single decayed 0.01 for
+# all three groups -- 80x the reference on the higher SH bands, which let
+# them overfit view-dependent colour.
+LR_SH = 0.0025
+LR_SCALES = 0.005
+LR_QUATS = 0.001
 LR_OPACITY = 0.05
 SH_DEGREE = 3  # 0 = plain RGB; 1..3 = spherical harmonics (3 = the 3DGS default)
 SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
@@ -85,6 +92,20 @@ SEED_RESIDUAL_THRESH = 0.15
 SEED_COVERAGE_THRESH = 0.8
 SEED_MAX_PER_CALL = 300
 
+# Oversized-gaussian pruning, as in the reference: during the densify window
+# and once the first opacity reset has happened, densify rounds also drop
+# gaussians whose largest scale exceeds PRUNE_MAX_WORLD_FRACTION x the
+# camera extent. The reference also passes a 20px screen-size limit, but its
+# densification_postfix zeroes max_radii2D before the check, so it never
+# fires there; enforcing it here deleted the foreground near the cameras.
+PRUNE_MAX_WORLD_FRACTION = 0.1
+# Split vs clone boundary, as in the reference (`percent_dense`): a
+# densify candidate whose largest scale exceeds this fraction of the camera
+# extent is split in two, anything smaller is cloned. This used to be the
+# median nearest-neighbour spacing of the sparse points, which has nothing
+# to do with how large a gaussian can be before it is under-resolving.
+PERCENT_DENSE = 0.01
+
 OPACITY_RESET_INTERVAL = 1500  # 0/None disables
 OPACITY_RESET_STOP = 3000
 OPACITY_RESET_VALUE = 0.01
@@ -92,13 +113,6 @@ PRUNE_START = 100
 PRUNE_STOP = NUM_ITERS
 PRUNE_INTERVAL = 100
 PRUNE_OPACITY_THRESH = 0.005
-
-
-def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    mse = (pred - target).pow(2).mean().item()
-    if mse <= 0:
-        return float("inf")
-    return -10.0 * torch.log10(torch.tensor(mse)).item()
 
 
 def save_image(tensor: torch.Tensor, path: Path) -> None:
@@ -170,6 +184,10 @@ def main() -> None:
     n_images = len(scene.cameras)
     eval_idx = list(range(0, n_images, EVAL_HOLDOUT_STRIDE))
     train_idx = [i for i in range(n_images) if i not in set(eval_idx)]
+    # Everything derived from the cameras (initial scale, extent, 3D filter)
+    # uses the training views only: the held-out views must not shape the
+    # model they are used to score.
+    train_cameras = [scene.cameras[i] for i in train_idx]
     cam0 = scene.cameras[0]
     print(
         f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval "
@@ -179,7 +197,7 @@ def main() -> None:
     print(f"{scene.points.shape[0]} sparse points", flush=True)
 
     scene_scale = estimate_scene_scale(scene.points)
-    init_scale = calibrate_initial_scale(scene.points, scene.cameras, scene_scale)
+    init_scale = calibrate_initial_scale(scene.points, train_cameras, scene_scale)
     print(
         f"Scene scale (median NN spacing): {scene_scale:.4f}, calibrated initial gaussian scale: {init_scale:.5f}",
         flush=True,
@@ -215,26 +233,42 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"other lr: {LR_OTHER_INIT:.5f} -> {LR_OTHER_FINAL:.5f} (exponential decay)",
+        f"constant lr: sh {LR_SH} (rest /20), scales {LR_SCALES}, "
+        f"quats {LR_QUATS}, opacity {LR_OPACITY}",
         flush=True,
     )
-    print(f"opacity lr: {LR_OPACITY:.5f} (constant, see LR_OPACITY)", flush=True)
 
-    # Param group order matters: the training loop updates groups 0 and 1's
-    # LR each step and deliberately leaves group 2 (opacity) alone.
-    def make_optimizer(
-        m: GaussianModel, lr_means: float, lr_other: float
-    ) -> torch.optim.Optimizer:
-        color_param = m.raw_colors if m.sh_degree == 0 else m.raw_sh
+    extent = camera_extent(train_cameras)
+    max_world_size = PRUNE_MAX_WORLD_FRACTION * extent
+    split_scale = PERCENT_DENSE * extent
+    print(
+        f"camera extent {extent:.3f}: splitting scales > {split_scale:.4f}, "
+        f"pruning scales > {max_world_size:.3f}",
+        flush=True,
+    )
+
+    # Param group order matters: the training loop updates group 0's LR
+    # (means) each step; the others are constant.
+    def make_optimizer(m: GaussianModel, lr_means: float) -> torch.optim.Optimizer:
+        if m.sh_degree == 0:
+            color_group = {"params": [m.raw_colors], "lr": LR_SH}
+        else:
+            color_group = {
+                "params": [m.raw_sh],
+                "lr": LR_SH,
+                "lr_scale": sh_lr_scale(m.raw_sh),
+            }
         return SparseAdam(
             [
                 {"params": [m.means], "lr": lr_means},
-                {"params": [m.raw_scales, m.raw_quats, color_param], "lr": lr_other},
+                {"params": [m.raw_scales], "lr": LR_SCALES},
+                {"params": [m.raw_quats], "lr": LR_QUATS},
+                color_group,
                 {"params": [m.raw_opacities], "lr": LR_OPACITY},
             ]
         )
 
-    optimizer = make_optimizer(model, lr_means_init, LR_OTHER_INIT)
+    optimizer = make_optimizer(model, lr_means_init)
     background = torch.zeros(3, device=DEVICE)
 
     def eval_and_save(step: int) -> None:
@@ -252,7 +286,7 @@ def main() -> None:
                     filter_3d=filter_3d,
                 )
                 torch.mps.synchronize()
-                psnrs.append(psnr(pred, scene.images[idx]))
+                psnrs.append(psnr(pred, scene.images[idx]).item())
                 if k < EVAL_IMAGES_SAVED:
                     save_image(pred, OUT_DIR / f"garden_eval_{k}_step{step}.png")
             mean_psnr = sum(psnrs) / len(psnrs)
@@ -268,7 +302,7 @@ def main() -> None:
         nonlocal best
         if mean_psnr > best[0]:
             best = (mean_psnr, step)
-            save_ply(model, OUT_DIR / "garden_best.ply")
+            save_ply(model, OUT_DIR / "garden_best.ply", filter_3d=filter_3d)
 
     best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
 
@@ -279,7 +313,7 @@ def main() -> None:
         if not FILTER_3D_SCALE:
             return None
         return compute_3d_filter(
-            model.means.detach(), scene.cameras, sampling_scale=FILTER_3D_SCALE
+            model.means.detach(), train_cameras, sampling_scale=FILTER_3D_SCALE
         )
 
     # Calibrated on the first densification round, then held fixed.
@@ -305,9 +339,7 @@ def main() -> None:
     for step in range(1, NUM_ITERS + 1):
         t = step / NUM_ITERS
         lr_means = lr_means_init * (lr_means_final / lr_means_init) ** t
-        lr_other = LR_OTHER_INIT * (LR_OTHER_FINAL / LR_OTHER_INIT) ** t
         optimizer.param_groups[0]["lr"] = lr_means
-        optimizer.param_groups[1]["lr"] = lr_other
 
         idx = train_idx[int(torch.randint(len(train_idx), (1,)).item())]
         cam = scene.cameras[idx]
@@ -341,14 +373,16 @@ def main() -> None:
             )
 
         if DENSIFY_START <= step <= DENSIFY_STOP and step % DENSIFY_INTERVAL == 0:
+            prune_large = bool(OPACITY_RESET_INTERVAL) and step > OPACITY_RESET_INTERVAL
             model, stats = densify_and_prune(
                 model,
                 grad_accum,
                 grad_count,
-                scene_scale=scene_scale,
+                scene_scale=split_scale,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 max_points=DENSIFY_MAX_POINTS,
                 grad_threshold=densify_threshold,
+                max_world_size=max_world_size if prune_large else None,
             )
             # `stats.grad_threshold` is None when the round did nothing and
             # so never computed a bar. Freezing that would leave the
@@ -364,7 +398,7 @@ def main() -> None:
                     flush=True,
                 )
             optimizer = migrate_optimizer_state(
-                optimizer, make_optimizer(model, lr_means, lr_other), stats.source_index
+                optimizer, make_optimizer(model, lr_means), stats.source_index
             )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
@@ -392,7 +426,7 @@ def main() -> None:
             if seed_stats.n_seeded > 0:
                 optimizer = migrate_optimizer_state(
                     optimizer,
-                    make_optimizer(model, lr_means, lr_other),
+                    make_optimizer(model, lr_means),
                     seed_stats.source_index,
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
@@ -409,7 +443,7 @@ def main() -> None:
             and step <= OPACITY_RESET_STOP
             and step % OPACITY_RESET_INTERVAL == 0
         ):
-            reset_opacity(model, value=OPACITY_RESET_VALUE)
+            reset_opacity(model, value=OPACITY_RESET_VALUE, optimizer=optimizer)
             print(
                 f"  opacity reset @ step {step} (cap {OPACITY_RESET_VALUE})", flush=True
             )
@@ -420,7 +454,7 @@ def main() -> None:
             )
             if n_pruned > 0:
                 optimizer = migrate_optimizer_state(
-                    optimizer, make_optimizer(model, lr_means, lr_other), prune_index
+                    optimizer, make_optimizer(model, lr_means), prune_index
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
@@ -447,7 +481,7 @@ def main() -> None:
 
     eval_and_save(NUM_ITERS)
     ply_path = OUT_DIR / "garden.ply"
-    save_ply(model, ply_path)
+    save_ply(model, ply_path, filter_3d=filter_3d)
     print(
         f"Done. Renders saved to {OUT_DIR}, final scene saved to {ply_path}", flush=True
     )

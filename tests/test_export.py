@@ -151,3 +151,27 @@ def test_degree_3_ply_has_the_reference_45_f_rest_entries(tmp_path):
     header = path.read_bytes().split(b"end_header")[0].decode()
     assert sum(1 for line in header.splitlines() if "f_rest_" in line) == 45
     assert "f_rest_44" in header and "f_rest_45" not in header
+
+
+def test_save_ply_bakes_3d_filter(tmp_path):
+    from metalsplat.filter3d import apply_3d_filter
+
+    scales = torch.tensor([[0.01, 0.02, 0.03], [0.1, 0.1, 0.1]])
+    opacities = torch.tensor([0.8, 0.4])
+    model = GaussianModel(
+        torch.zeros(2, 3), scales=scales, opacities=opacities, sh_degree=1
+    )
+    filter_3d = torch.tensor([0.02, 0.0])
+
+    path = tmp_path / "baked.ply"
+    save_ply(model, path, filter_3d=filter_3d)
+    loaded = load_ply(path)
+
+    expected_scales, expected_opacities = apply_3d_filter(
+        model.scales.detach(), model.opacities.detach(), filter_3d
+    )
+    assert torch.allclose(loaded.scales, expected_scales, rtol=1e-5)
+    assert torch.allclose(loaded.opacities, expected_opacities, atol=1e-5)
+    # An unobserved gaussian (radius 0) is written unchanged.
+    assert torch.allclose(loaded.scales[1], scales[1], rtol=1e-5)
+    assert torch.allclose(loaded.opacities[1], opacities[1], atol=1e-5)

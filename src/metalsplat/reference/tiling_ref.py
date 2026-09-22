@@ -17,11 +17,37 @@ structural, matching gsplat), so it deliberately operates outside autograd.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
 
 DEFAULT_TILE_SIZE = 16
+# The rasterizer skips any gaussian whose alpha at a pixel is below this.
+ALPHA_THRESHOLD = 1.0 / 255.0
+# Bounding-box half-extent in sigmas when no opacity is given.
+DEFAULT_SIGMA_EXTENT = 3.0
+# The farthest any gaussian can reach before alpha falls below the cutoff:
+# sigma_extent at opacity 1, sqrt(2 ln 255) ~= 3.33.
+MAX_SIGMA_EXTENT = math.sqrt(2.0 * math.log(1.0 / ALPHA_THRESHOLD))
+
+
+def sigma_extent(opacities: torch.Tensor | None, n: int, device) -> torch.Tensor:
+    """(N,) half-extent of each gaussian's bounding box, in sigmas.
+
+    Without opacities this is a fixed 3 sigma. With them it is the exact
+    distance at which the rasterizer stops compositing the gaussian:
+    alpha = opacity * exp(-d^2 / 2) falls below ALPHA_THRESHOLD at
+    d = sqrt(2 ln(opacity / ALPHA_THRESHOLD)). A fixed 3 sigma is too short
+    for anything more opaque than ~0.35 (up to 3.33 sigma at opacity 1), so
+    a gaussian that still contributes stops dead at a tile border -- a
+    visible hard edge -- and it is needlessly long for faint ones. A
+    gaussian that never reaches the threshold gets 0 and is culled.
+    """
+    if opacities is None:
+        return torch.full((n,), DEFAULT_SIGMA_EXTENT, device=device)
+    ratio = opacities.float() / ALPHA_THRESHOLD
+    return torch.where(ratio > 1.0, (2.0 * torch.log(ratio.clamp_min(1.0))).sqrt(), 0.0)
 
 
 @dataclass
@@ -45,6 +71,7 @@ def bin_and_sort_gaussians(
     img_width: int,
     img_height: int,
     tile_size: int = DEFAULT_TILE_SIZE,
+    opacities: torch.Tensor | None = None,  # (N,), see sigma_extent
 ) -> TileBinningResult:
     device = means2d.device
     n = means2d.shape[0]
@@ -53,7 +80,8 @@ def bin_and_sort_gaussians(
     num_tiles = tiles_x * tiles_y
 
     valid_mask = valid > 0.5 if valid.dtype != torch.bool else valid
-    valid_mask = valid_mask & (radii > 0)
+    extent = sigma_extent(opacities, n, device)
+    valid_mask = valid_mask & (radii > 0) & (extent > 0)
 
     if n == 0 or not bool(valid_mask.any()):
         return TileBinningResult(
@@ -68,16 +96,18 @@ def bin_and_sort_gaussians(
     means2d_v = means2d[idx]
     depths_v = depths[idx]
 
-    # Per-axis 3-sigma half-extents from the conic (the inverse 2D
-    # covariance), not a circle of radius 3*sqrt(lambda_max). Bounding an
+    # Per-axis half-extents (extent sigmas, see sigma_extent) from the conic
+    # (the inverse 2D covariance), not a circle of radius
+    # extent*sqrt(lambda_max). Bounding an
     # elongated gaussian by its circumscribed circle gives a box as wide as
     # the splat is long; on the garden scene the tight box produces 43%
     # fewer (gaussian, tile) pairs.
     conics_v = conics[idx]
     det = conics_v[:, 0] * conics_v[:, 2] - conics_v[:, 1] * conics_v[:, 1]
     det_safe = det.clamp_min(1e-12)
-    half_w = 3.0 * (conics_v[:, 2] / det_safe).clamp_min(0.0).sqrt()
-    half_h = 3.0 * (conics_v[:, 0] / det_safe).clamp_min(0.0).sqrt()
+    extent_v = extent[idx]
+    half_w = extent_v * (conics_v[:, 2] / det_safe).clamp_min(0.0).sqrt()
+    half_h = extent_v * (conics_v[:, 0] / det_safe).clamp_min(0.0).sqrt()
     degenerate = det <= 0
     half_w = torch.where(degenerate, torch.zeros_like(half_w), half_w)
     half_h = torch.where(degenerate, torch.zeros_like(half_h), half_h)

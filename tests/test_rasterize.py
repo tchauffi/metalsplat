@@ -288,3 +288,72 @@ def test_backward_matches_reference_with_many_gaussians_per_tile(n):
         assert torch.allclose(got.cpu(), want, atol=2e-3, rtol=2e-2), (
             f"{name} gradient disagrees"
         )
+
+
+@pytest.mark.parametrize("tile_size", [4, 8])
+def test_backward_independent_of_tile_size(tile_size):
+    # Enough gaussians that a tile's list is longer than the tile_size^2
+    # threads of a small threadgroup, so the backward's shared-memory
+    # staging has to cover more slots than there are threads.
+    n = 1500
+    means2d, depths, conics, opacities, colors, radii, valid = _random_scene(n)
+    opacities = opacities * 0.1  # keep T from saturating before the tail
+
+    def grads(ts):
+        inputs = [
+            t.to("mps").requires_grad_() for t in (means2d, conics, opacities, colors)
+        ]
+        image = rasterize_gaussians(
+            inputs[0],
+            depths.to("mps"),
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            radii.to("mps"),
+            valid.to("mps"),
+            W,
+            H,
+            tile_size=ts,
+        )
+        (image * torch.linspace(0, 1, 3, device="mps")).sum().backward()
+        torch.mps.synchronize()
+        return [t.grad.cpu() for t in inputs]
+
+    for got, expected in zip(grads(tile_size), grads(16)):
+        assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_opaque_gaussian_is_not_cut_at_a_tile_border():
+    # sigma 2.6 at x=8: the 3-sigma box stops at x=15.8, inside tile 0, but
+    # at opacity 0.99 alpha stays above 1/255 out to ~3.33 sigma, so pixel
+    # column 16 (tile 1, 3.27 sigma out) still receives colour. A fixed
+    # 3-sigma box left that pixel black: a hard edge along the tile border.
+    sigma = 2.6
+    means2d = torch.tensor([[8.0, 8.0]])
+    depths = torch.tensor([2.0])
+    conics = torch.tensor([[1.0 / sigma**2, 0.0, 1.0 / sigma**2]])
+    opacities = torch.tensor([0.99])
+    colors = torch.ones(1, 3)
+    radii = torch.tensor([9.0])
+    valid = torch.ones(1)
+
+    ref = rasterize_gaussians_ref(
+        means2d, depths, conics, opacities, colors, valid, W, H
+    )
+    got = rasterize_gaussians(
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        opacities.to("mps"),
+        colors.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
+        tile_size=16,
+    ).cpu()
+    torch.mps.synchronize()
+
+    assert ref[8, 16, 0] > 0.0
+    assert got[8, 16, 0] == pytest.approx(ref[8, 16, 0].item(), rel=1e-4)
+    assert torch.allclose(got, ref, atol=1e-5)

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import torch
 
+from metalsplat.reference.tiling_ref import MAX_SIGMA_EXTENT
 from metalsplat.utils.quaternion import quat_to_rotmat
 
 
@@ -56,6 +57,7 @@ def project_gaussians(
     near: float = 0.2,
     eps2d: float = 0.3,
     radius_margin: float = 1.0,  # tile-culling radius inflation, see `radii` below
+    radius_sigmas: float = MAX_SIGMA_EXTENT,  # culling radius in sigmas, see below
 ) -> ProjectionResult:
     means_cam = means @ R_wc.T + t_wc  # (N, 3)
     x, y, z = means_cam.unbind(-1)
@@ -130,13 +132,20 @@ def project_gaussians(
     mid = 0.5 * (a + c)
     disc = (mid * mid - det).clamp_min(0.0)
     lambda_max = mid + disc.sqrt()
-    radii = torch.ceil(3.0 * lambda_max.clamp_min(0.0).sqrt())
+    # The culling radius covers the farthest any gaussian can still draw:
+    # MAX_SIGMA_EXTENT (~3.33) sigmas, where an opaque gaussian's alpha
+    # drops below the rasterizer's 1/255 cutoff. A 3-sigma radius culled
+    # opaque gaussians sitting just outside the frame whose tails still
+    # reach into it, cutting them off at the image border. Opacity isn't
+    # known here (compensation and fades are applied afterwards), so this
+    # is the conservative bound; tiling tightens it per gaussian.
+    radii = torch.ceil(radius_sigmas * lambda_max.clamp_min(0.0).sqrt())
     # `radius_margin` (>1 only for the 2DGS caller, see
     # reference.project_2dgs_ref) inflates the culling radius *before* the
     # bounds test below, not after: a splat whose un-inflated footprint
     # misses the frame but whose inflated one doesn't must survive, which
     # is the entire point of having a margin. Ceiling twice -- once on the
-    # raw 3-sigma extent, once after the margin -- rather than folding the
+    # raw extent, once after the margin -- rather than folding the
     # margin in before a single ceil, so kernels/project_2dgs.metal can
     # reproduce it bit-for-bit.
     radii = torch.ceil(radii * radius_margin)

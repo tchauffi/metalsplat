@@ -38,6 +38,7 @@ def densify_and_prune_2dgs(
     split_scale_quantile: float = 0.5,
     max_points: int | None = None,
     pixel_count: torch.Tensor | None = None,  # (N,) covered pixels, see below
+    max_world_size: float | None = None,
 ) -> tuple[Gaussian2DModel, DensifyStats]:
     """Splits, clones and prunes a `Gaussian2DModel`, returning the new
     model and stats. See `metalsplat.densify.densify_and_prune` for the
@@ -122,6 +123,15 @@ def densify_and_prune_2dgs(
     `grad_count` is still what defines visibility, so a gaussian that was
     in frustum but composited into no pixel is skipped rather than
     dividing by zero.
+
+    Pruning follows the reference's order, as in
+    `metalsplat.densify.densify_and_prune`: split and clone first, then
+    prune the result -- rows with opacity at most `prune_opacity_thresh`,
+    or (if given) a larger scale axis above `max_world_size` (the reference
+    uses 0.1 x the camera extent). A large high-gradient splat is therefore
+    split rather than dropped, and a clone of a low-opacity splat is pruned
+    with it. The reference's 20px screen-size check is not reproduced: its
+    densification_postfix zeroes max_radii2D first, so it never fires.
     """
     device = model.means.device
     n = model.num_points
@@ -228,17 +238,40 @@ def densify_and_prune_2dgs(
     clone_opacities = opacities[clone_idx]
     clone_color_like = color_like[clone_idx]
 
-    keep_mask = ~is_large & (opacities > prune_opacity_thresh)
+    # Split removes the original (replaced by 2 new); clone keeps the
+    # original as well as adding a duplicate.
+    unsplit = ~is_large
+    unsplit_idx = unsplit.nonzero(as_tuple=True)[0]
 
-    final_means = torch.cat([means[keep_mask], split_means, clone_means], dim=0)
-    final_scales = torch.cat([scales[keep_mask], split_scales, clone_scales], dim=0)
-    final_quats = torch.cat([quats[keep_mask], split_quats, clone_quats], dim=0)
-    final_opacities = torch.cat(
-        [opacities[keep_mask], split_opacities, clone_opacities], dim=0
+    rows_means = torch.cat([means[unsplit], split_means, clone_means], dim=0)
+    rows_scales = torch.cat([scales[unsplit], split_scales, clone_scales], dim=0)
+    rows_quats = torch.cat([quats[unsplit], split_quats, clone_quats], dim=0)
+    rows_opacities = torch.cat(
+        [opacities[unsplit], split_opacities, clone_opacities], dim=0
     )
-    final_color_like = torch.cat(
-        [color_like[keep_mask], split_color_like, clone_color_like], dim=0
+    rows_color_like = torch.cat(
+        [color_like[unsplit], split_color_like, clone_color_like], dim=0
     )
+    n_new = 2 * split_idx.numel() + clone_idx.numel()
+    rows_source = torch.cat(
+        [
+            unsplit_idx,
+            torch.full((n_new,), NEW_GAUSSIAN, dtype=torch.int64, device=device),
+        ]
+    )
+    rows_parent = torch.cat([unsplit_idx, split_idx, split_idx, clone_idx])
+
+    # Prune the densified set, as the reference does (see docstring).
+    prune = rows_opacities <= prune_opacity_thresh
+    if max_world_size is not None:
+        prune |= rows_scales.max(dim=-1).values > max_world_size
+    keep = ~prune
+
+    final_means = rows_means[keep]
+    final_scales = rows_scales[keep]
+    final_quats = rows_quats[keep]
+    final_opacities = rows_opacities[keep]
+    final_color_like = rows_color_like[keep]
 
     if model.sh_degree == 0:
         new_model = Gaussian2DModel(
@@ -259,18 +292,11 @@ def densify_and_prune_2dgs(
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 
-    keep_idx = keep_mask.nonzero(as_tuple=True)[0]
-    fresh = torch.full(
-        (2 * split_idx.numel() + clone_idx.numel(),),
-        NEW_GAUSSIAN,
-        dtype=torch.int64,
-        device=device,
-    )
-    source_index = torch.cat([keep_idx, fresh])
-    parent_index = torch.cat([keep_idx, split_idx, split_idx, clone_idx])
+    source_index = rows_source[keep]
+    parent_index = rows_parent[keep]
 
     n_after = final_means.shape[0]
-    n_pruned = int((~keep_mask & ~is_large).sum().item())
+    n_pruned = int(prune.sum().item())  # rows removed after densification
     stats = DensifyStats(
         n_before=n_before,
         n_split=int(split_idx.numel()),

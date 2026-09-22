@@ -8,6 +8,12 @@ using namespace metal;
 // Builds a float3x3 from a row-major flat 9-element buffer, i.e. flat[i*3+j]
 // is (row i, col j). Metal's float3x3(c0, c1, c2) constructor takes column
 // vectors, so column k is (flat[k], flat[3+k], flat[6+k]).
+// Culling radius in sigmas: sqrt(2 ln 255), the farthest an opaque
+// gaussian reaches before its alpha falls below the rasterizer's 1/255
+// cutoff. Matches reference/tiling_ref.py MAX_SIGMA_EXTENT; see
+// reference/project_ref.py for why 3 sigma was not enough.
+constant float RADIUS_SIGMAS = 3.3290429;
+
 inline float3x3 mat3_from_rowmajor(constant float* flat) {
     return float3x3(float3(flat[0], flat[3], flat[6]),
                      float3(flat[1], flat[4], flat[7]),
@@ -110,7 +116,7 @@ kernel void project_forward(
     float mid = 0.5 * (a + c);
     float disc = max(mid * mid - det, 0.0);
     float lambda_max = mid + sqrt(disc);
-    float radius = ceil(3.0 * sqrt(max(lambda_max, 0.0)));
+    float radius = ceil(RADIUS_SIGMAS * sqrt(max(lambda_max, 0.0)));
 
     float u = fx * x / z_safe + cx;
     float v = fy * y / z_safe + cy;

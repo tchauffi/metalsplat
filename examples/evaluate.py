@@ -22,17 +22,12 @@ from metalsplat import render
 from metalsplat.cleanup import damp_view_dependence, prune_isolated
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.export import load_ply
-from metalsplat.losses import ssim
+from metalsplat.losses import psnr, ssim
 
 DEVICE = "mps"
 DEFAULT_DATA = Path(__file__).parent.parent / "data" / "garden"
 DEFAULT_PLY = Path(__file__).parent / "garden.ply"
 HOLDOUT_STRIDE = 8
-
-
-def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    mse = (pred - target).pow(2).mean().item()
-    return float("inf") if mse <= 0 else -10.0 * torch.log10(torch.tensor(mse)).item()
 
 
 def score(
@@ -43,7 +38,7 @@ def score(
         for i in indices:
             pred = render(model, scene.cameras[i], background=background)
             torch.mps.synchronize()
-            psnrs.append(psnr(pred, scene.images[i]))
+            psnrs.append(psnr(pred, scene.images[i]).item())
             ssims.append(ssim(pred.clamp(0, 1), scene.images[i]).item())
     return sum(psnrs) / len(psnrs), sum(ssims) / len(ssims)
 

@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -783,3 +785,33 @@ def test_transmittance_cutoff_drops_the_same_gaussian_as_the_kernel():
     # so no blue reaches the center pixel.
     center = image[int(CY), int(CX)]
     assert center[2] < 1e-7, f"blue leaked into the center pixel: {center.tolist()}"
+
+
+@pytest.mark.parametrize("tile_size", [4, 8])
+def test_backward_independent_of_tile_size(tile_size):
+    # A tile list longer than the tile_size^2 threads of a small threadgroup:
+    # the backward's shared-memory staging must still cover every slot.
+    from metalsplat import Camera, Gaussian2DModel, render_2dgs
+
+    torch.manual_seed(0)
+    model = Gaussian2DModel.random(n=600, bound=1.0, device="mps")
+    with torch.no_grad():
+        model.means[:, 2] += 3.0
+        model.raw_scales.fill_(math.log(0.08))
+        model.raw_opacities.fill_(-2.0)
+    camera = Camera.identity(
+        fx=40, fy=40, cx=16, cy=16, img_width=32, img_height=32
+    ).to("mps")
+
+    def grads(ts):
+        model.zero_grad()
+        aux = render_2dgs(model, camera, tile_size=ts, return_aux=True)
+        loss = (
+            aux.image.sum() + aux.depth.sum() + aux.normal.sum() + aux.distortion.sum()
+        )
+        loss.backward()
+        torch.mps.synchronize()
+        return [p.grad.cpu().clone() for p in model.parameters()]
+
+    for got, expected in zip(grads(tile_size), grads(16)):
+        assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3)

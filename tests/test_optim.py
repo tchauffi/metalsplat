@@ -259,3 +259,19 @@ def test_sparse_adam_state_migrates_like_dense_adam():
 
     keep = [i for i in range(10) if i != 3]
     assert torch.allclose(after, before[keep])
+
+
+def test_sparse_adam_lr_scale_scales_the_update_per_coefficient():
+    from metalsplat.optim import sh_lr_scale
+
+    sh = torch.nn.Parameter(torch.zeros(3, 4, 3))
+    scale = sh_lr_scale(sh)
+    assert torch.allclose(scale.squeeze(-1), torch.tensor([1.0, 0.05, 0.05, 0.05]))
+
+    opt = SparseAdam([{"params": [sh], "lr": 0.1, "lr_scale": scale}])
+    sh.grad = torch.ones_like(sh)
+    opt.step(torch.ones(3, dtype=torch.bool))
+
+    # First Adam step moves every element by ~lr, times its scale.
+    assert torch.allclose(sh[:, 0], torch.full((3, 3), -0.1), atol=1e-6)
+    assert torch.allclose(sh[:, 1:], torch.full((3, 3, 3), -0.005), atol=1e-6)

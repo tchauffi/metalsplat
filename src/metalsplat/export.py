@@ -15,8 +15,10 @@ so a degree-3 model writes the reference implementation's full 45 and a
 degree-2 model writes 24. Viewers that read the SH degree from the
 header's property count (most modern ones do) render either correctly;
 older viewers that hardcode degree 3 may not render a lower-degree file. A
-flat-RGB model (sh_degree=0) is exported as degree-0-only SH (f_rest all
-zero), via the standard RGB2SH formula.
+flat-RGB model (sh_degree=0) is exported with its colour as the DC term
+(via the standard RGB2SH formula) and 24 all-zero f_rest entries, i.e. the
+degree-2 layout carrying no view dependence; load_ply reads such a file back
+as a flat-RGB model.
 """
 
 from __future__ import annotations
@@ -26,11 +28,26 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from metalsplat.filter3d import apply_3d_filter
 from metalsplat.gaussians import GaussianModel
 from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
 
 
-def save_ply(model: GaussianModel, path: str | Path) -> None:
+def save_ply(
+    model: GaussianModel, path: str | Path, filter_3d: torch.Tensor | None = None
+) -> None:
+    """Writes `model` to `path` in the reference 3DGS .ply layout.
+
+    Pass the `filter_3d` the model was trained and evaluated with (see
+    metalsplat.filter3d) to bake it into the written scales and opacities,
+    the way Mip-Splatting exports. Other viewers know nothing about the
+    filter, so without this they render every gaussian thinner and the
+    small ones denser than training ever saw them. A baked file must then
+    be rendered *without* `filter_3d`, or the filter is applied twice.
+
+    The screen-space anti-aliasing compensation (`render(antialias=True)`)
+    depends on the view and cannot be baked.
+    """
     path = Path(path)
     n = model.num_points
 
@@ -55,12 +72,16 @@ def save_ply(model: GaussianModel, path: str | Path) -> None:
             .astype(np.float32)
         )
 
-    opacity = (
-        model.raw_opacities.detach().cpu().numpy().astype(np.float32).reshape(n, 1)
-    )
-    scale = (
-        model.raw_scales.detach().cpu().numpy().astype(np.float32)
-    )  # (N, 3), log-space
+    raw_opacities = model.raw_opacities.detach()
+    raw_scales = model.raw_scales.detach()
+    if filter_3d is not None:
+        scales, opacities = apply_3d_filter(
+            model.scales.detach(), model.opacities.detach(), filter_3d.detach()
+        )
+        raw_scales = scales.log()
+        raw_opacities = torch.logit(opacities, eps=1e-6)
+    opacity = raw_opacities.cpu().numpy().astype(np.float32).reshape(n, 1)
+    scale = raw_scales.cpu().numpy().astype(np.float32)  # (N, 3), log-space
     rot = model.quats.detach().cpu().numpy().astype(np.float32)  # (N, 4), unit, w x y z
 
     data = np.concatenate([xyz, normals, dc, rest, opacity, scale, rot], axis=1).astype(
@@ -99,9 +120,10 @@ def load_ply(path: str | Path, device: str = "cpu") -> GaussianModel:
     """Inverse of save_ply: reads a 3DGS .ply back into a GaussianModel.
 
     Reads the SH degree from the header's f_rest_* property count rather
-    than assuming one, so files written by other tools (degree 3 / 45
-    f_rest entries) are detected -- though only degree<=2 can currently be
-    represented, so higher-degree coefficients are dropped with a warning.
+    than assuming one, so files of any degree up to 3 (45 f_rest entries,
+    what the reference and most tools write) load at their own degree.
+    Coefficients beyond degree 3 are dropped with a warning, and a file
+    whose f_rest entries are all zero loads as a flat-RGB model.
     """
     import warnings
 
