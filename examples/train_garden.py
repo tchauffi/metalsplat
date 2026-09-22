@@ -190,6 +190,10 @@ def main() -> None:
     n_images = len(scene.cameras)
     eval_idx = list(range(0, n_images, EVAL_HOLDOUT_STRIDE))
     train_idx = [i for i in range(n_images) if i not in set(eval_idx)]
+    # Everything derived from the cameras (initial scale, extent, 3D filter)
+    # uses the training views only: the held-out views must not shape the
+    # model they are used to score.
+    train_cameras = [scene.cameras[i] for i in train_idx]
     cam0 = scene.cameras[0]
     print(
         f"{n_images} images: {len(train_idx)} train, {len(eval_idx)} eval "
@@ -199,7 +203,7 @@ def main() -> None:
     print(f"{scene.points.shape[0]} sparse points", flush=True)
 
     scene_scale = estimate_scene_scale(scene.points)
-    init_scale = calibrate_initial_scale(scene.points, scene.cameras, scene_scale)
+    init_scale = calibrate_initial_scale(scene.points, train_cameras, scene_scale)
     print(
         f"Scene scale (median NN spacing): {scene_scale:.4f}, calibrated initial gaussian scale: {init_scale:.5f}",
         flush=True,
@@ -240,7 +244,7 @@ def main() -> None:
         flush=True,
     )
 
-    extent = camera_extent(scene.cameras)
+    extent = camera_extent(train_cameras)
     max_world_size = PRUNE_MAX_WORLD_FRACTION * extent
     split_scale = PERCENT_DENSE * extent
     print(
@@ -315,7 +319,7 @@ def main() -> None:
         if not FILTER_3D_SCALE:
             return None
         return compute_3d_filter(
-            model.means.detach(), scene.cameras, sampling_scale=FILTER_3D_SCALE
+            model.means.detach(), train_cameras, sampling_scale=FILTER_3D_SCALE
         )
 
     # Calibrated on the first densification round, then held fixed.

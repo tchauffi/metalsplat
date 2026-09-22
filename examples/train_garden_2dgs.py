@@ -367,7 +367,10 @@ def main() -> None:
     # module docstring and metalsplat.densify2dgs).
     scene_scale = estimate_scene_scale(scene.points)
     init_scale = calibrate_initial_scale(
-        scene.points, scene.cameras, scene_scale, target_pixel_radius=3.0
+        scene.points,
+        [scene.cameras[i] for i in train_idx],  # held-out views stay unseen
+        scene_scale,
+        target_pixel_radius=3.0,
     )
     print(
         f"Scene scale (median NN spacing): {scene_scale:.4f}, calibrated initial gaussian scale: {init_scale:.5f}",
