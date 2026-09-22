@@ -93,10 +93,10 @@ SEED_MAX_PER_CALL = 300
 
 # Oversized-gaussian pruning, as in the reference: during the densify window
 # and once the first opacity reset has happened, densify rounds also drop
-# gaussians whose projected radius exceeded PRUNE_MAX_SCREEN_SIZE pixels
-# since the last round, or whose largest scale exceeds
-# PRUNE_MAX_WORLD_FRACTION x the camera extent.
-PRUNE_MAX_SCREEN_SIZE = 20.0
+# gaussians whose largest scale exceeds PRUNE_MAX_WORLD_FRACTION x the
+# camera extent. The reference also passes a 20px screen-size limit, but its
+# densification_postfix zeroes max_radii2D before the check, so it never
+# fires there; enforcing it here deleted the foreground near the cameras.
 PRUNE_MAX_WORLD_FRACTION = 0.1
 
 OPACITY_RESET_INTERVAL = 1500  # 0/None disables
@@ -327,7 +327,6 @@ def main() -> None:
 
     grad_accum = torch.zeros(model.num_points, device=DEVICE)
     grad_count = torch.zeros(model.num_points, device=DEVICE)
-    max_radii2d = torch.zeros(model.num_points, device=DEVICE)
     previous_sh_degree = model.active_sh_degree
 
     start = time.time()
@@ -357,9 +356,6 @@ def main() -> None:
 
         with torch.no_grad():
             grad_count[visible] += 1.0
-            max_radii2d[visible] = torch.maximum(
-                max_radii2d[visible], aux.radii.detach()[visible]
-            )
 
         if step % 25 == 0 or step == 1:
             torch.mps.synchronize()
@@ -380,8 +376,6 @@ def main() -> None:
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 max_points=DENSIFY_MAX_POINTS,
                 grad_threshold=densify_threshold,
-                max_radii2d=max_radii2d,
-                max_screen_size=PRUNE_MAX_SCREEN_SIZE if prune_large else None,
                 max_world_size=max_world_size if prune_large else None,
             )
             # `stats.grad_threshold` is None when the round did nothing and
@@ -402,7 +396,6 @@ def main() -> None:
             )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
-            max_radii2d = torch.zeros(model.num_points, device=DEVICE)
             filter_3d = carry_filter_3d(filter_3d, stats.parent_index)
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
@@ -432,7 +425,6 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
-                max_radii2d = torch.zeros(model.num_points, device=DEVICE)
                 filter_3d = carry_filter_3d(filter_3d, seed_stats.parent_index)
             print(
                 f"  seed @ step {step}: {seed_stats.n_before} -> {seed_stats.n_after} "
@@ -460,7 +452,6 @@ def main() -> None:
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
-                max_radii2d = torch.zeros(model.num_points, device=DEVICE)
                 # Pruning only removes; survivors keep their radius unchanged.
                 filter_3d = carry_filter_3d(filter_3d, prune_index)
                 print(

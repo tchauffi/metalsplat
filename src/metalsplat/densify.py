@@ -28,7 +28,7 @@ class DensifyStats:
     n_before: int
     n_split: int  # gaussians replaced by 2 new ones each
     n_cloned: int  # gaussians duplicated in place
-    n_pruned: int  # gaussians removed (low opacity or too large)
+    n_pruned: int  # rows removed after split/clone (low opacity or too large)
     n_after: int
     # The absolute screen-space gradient bar used this round, or None if the
     # round did nothing (no visible gaussians, or already at `max_points`)
@@ -82,14 +82,21 @@ def densify_and_prune(
     is not, so the returned `stats.grad_threshold` lets a caller calibrate
     on the first round and freeze it thereafter.
 
-    Oversized gaussians are pruned alongside low-opacity ones, as in the
-    reference: any whose largest projected radius since the last round
-    (`max_radii2d`, pixels) exceeds `max_screen_size`, or whose largest
-    world-space scale exceeds `max_world_size` (the reference uses 0.1 x
-    the camera extent). Each check is skipped when its threshold is None.
-    Large gaussians are neither split nor cloned. The reference enables
-    this only after the first opacity reset; that schedule is the
-    caller's.
+    Pruning follows the reference's order: split and clone first, then
+    prune the *result*, so a large gaussian with a high gradient is split
+    rather than dropped, and a clone or split child is pruned by the same
+    rules as everything else. A row is pruned if its opacity is at most
+    `prune_opacity_thresh`, or its largest world-space scale exceeds
+    `max_world_size` (the reference uses 0.1 x the camera extent), or --
+    for surviving originals only -- its largest projected radius since the
+    last round (`max_radii2d`, pixels) exceeds `max_screen_size`. Each size
+    check is skipped when its threshold is None.
+
+    The screen-size check exists for completeness but is best left off:
+    the reference passes 20px, but its densification_postfix zeroes
+    max_radii2D before the check runs, so there it never fires. Actually
+    enforcing it deletes legitimately large foreground gaussians near the
+    cameras and leaves holes.
     """
     device = model.means.device
     n = model.num_points
@@ -115,18 +122,10 @@ def densify_and_prune(
         threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
     else:
         threshold = float(grad_threshold)
+    candidates = visible & (avg_grad >= threshold)
 
     means = model.means.detach()
     scales = model.scales.detach()
-
-    too_big = torch.zeros(n, dtype=torch.bool, device=device)
-    if max_screen_size is not None and max_radii2d is not None:
-        too_big |= max_radii2d > max_screen_size
-    if max_world_size is not None:
-        too_big |= scales.max(dim=-1).values > max_world_size
-
-    candidates = visible & (avg_grad >= threshold) & ~too_big
-
     quats = model.quats.detach()
     opacities = model.opacities.detach()
     # Whatever per-gaussian "color-like" tensor the model uses -- (N, 3) for
@@ -176,19 +175,48 @@ def densify_and_prune(
     clone_color_like = color_like[clone_idx]
 
     # Split removes the original (replaced by 2 new); clone keeps the
-    # original as well as adding a duplicate; prune removes low-opacity and
-    # oversized gaussians regardless of candidacy.
-    keep_mask = ~is_large & (opacities > prune_opacity_thresh) & ~too_big
+    # original as well as adding a duplicate.
+    unsplit = ~is_large
+    unsplit_idx = unsplit.nonzero(as_tuple=True)[0]
 
-    final_means = torch.cat([means[keep_mask], split_means, clone_means], dim=0)
-    final_scales = torch.cat([scales[keep_mask], split_scales, clone_scales], dim=0)
-    final_quats = torch.cat([quats[keep_mask], split_quats, clone_quats], dim=0)
-    final_opacities = torch.cat(
-        [opacities[keep_mask], split_opacities, clone_opacities], dim=0
+    rows_means = torch.cat([means[unsplit], split_means, clone_means], dim=0)
+    rows_scales = torch.cat([scales[unsplit], split_scales, clone_scales], dim=0)
+    rows_quats = torch.cat([quats[unsplit], split_quats, clone_quats], dim=0)
+    rows_opacities = torch.cat(
+        [opacities[unsplit], split_opacities, clone_opacities], dim=0
     )
-    final_color_like = torch.cat(
-        [color_like[keep_mask], split_color_like, clone_color_like], dim=0
+    rows_color_like = torch.cat(
+        [color_like[unsplit], split_color_like, clone_color_like], dim=0
     )
+    n_new = 2 * split_idx.numel() + clone_idx.numel()
+    # Split children and clones start with zeroed Adam state, and a split
+    # parent's state dies with it -- matching the reference implementation,
+    # which appends zeros for every gaussian it creates.
+    rows_source = torch.cat(
+        [
+            unsplit_idx,
+            torch.full((n_new,), NEW_GAUSSIAN, dtype=torch.int64, device=device),
+        ]
+    )
+    # Split children and clones sit essentially where their parent did.
+    rows_parent = torch.cat([unsplit_idx, split_idx, split_idx, clone_idx])
+
+    # Prune the densified set, as the reference does (see docstring).
+    prune = rows_opacities <= prune_opacity_thresh
+    if max_world_size is not None:
+        prune |= rows_scales.max(dim=-1).values > max_world_size
+    if max_screen_size is not None and max_radii2d is not None:
+        # New rows have no screen history yet, as in the reference.
+        screen_big = torch.zeros_like(prune)
+        screen_big[: unsplit_idx.numel()] = max_radii2d[unsplit] > max_screen_size
+        prune |= screen_big
+    keep = ~prune
+
+    final_means = rows_means[keep]
+    final_scales = rows_scales[keep]
+    final_quats = rows_quats[keep]
+    final_opacities = rows_opacities[keep]
+    final_color_like = rows_color_like[keep]
 
     if model.sh_degree == 0:
         new_model = GaussianModel(
@@ -209,24 +237,11 @@ def densify_and_prune(
             active_sh_degree=model.active_sh_degree,
         ).to(device)
 
-    # Split children and clones start with zeroed Adam state, and a split
-    # parent's state dies with it -- matching the reference implementation,
-    # which appends zeros for every gaussian it creates.
-    keep_idx = keep_mask.nonzero(as_tuple=True)[0]
-    fresh = torch.full(
-        (2 * split_idx.numel() + clone_idx.numel(),),
-        NEW_GAUSSIAN,
-        dtype=torch.int64,
-        device=device,
-    )
-    source_index = torch.cat([keep_idx, fresh])
-    # Split children and clones sit essentially where their parent did.
-    parent_index = torch.cat([keep_idx, split_idx, split_idx, clone_idx])
+    source_index = rows_source[keep]
+    parent_index = rows_parent[keep]
 
     n_after = final_means.shape[0]
-    n_pruned = int(
-        (~keep_mask & ~is_large).sum().item()
-    )  # low-opacity / oversized prunes among non-split gaussians
+    n_pruned = int(prune.sum().item())  # rows removed after densification
     stats = DensifyStats(
         n_before=n_before,
         n_split=int(split_idx.numel()),

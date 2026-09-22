@@ -286,33 +286,56 @@ def test_reported_threshold_round_trips():
     assert again.n_split + again.n_cloned == stats.n_split + stats.n_cloned
 
 
-def test_oversized_gaussians_are_pruned_not_densified():
-    n = 6
+def test_pruning_runs_after_split_and_clone_like_the_reference():
+    n = 4
     model = _model(n)
     with torch.no_grad():
-        model.raw_scales[1] = torch.log(torch.tensor(3.0))  # too big in world
-    max_radii2d = torch.full((n,), 5.0)
-    max_radii2d[2] = 50.0  # too big on screen
+        # 0: too big in world but a split candidate -> split, and its
+        #    children (3.0 / 1.6 = 1.875) fit under the bar, so they survive.
+        model.raw_scales[0] = torch.log(torch.tensor(3.0))
+        # 1: too big in world and *not* a candidate -> pruned.
+        model.raw_scales[1] = torch.log(torch.tensor(3.0))
+        # 2: low opacity but a clone candidate -> the clone is pruned too.
+        model.raw_opacities[2] = -10.0
+    grad_accum = torch.tensor([1.0, 0.0, 1.0, 0.0])
 
-    # Every gaussian is a densify candidate, so an oversized one surviving
-    # (or being split/cloned) would show up in the counts.
     new_model, stats = densify_and_prune(
         model,
-        torch.full((n,), 1.0),
+        grad_accum,
+        torch.ones(n),
+        scene_scale=SCENE_SCALE,
+        grad_threshold=0.5,
+        max_world_size=2.0,
+    )
+
+    assert stats.n_split == 1 and stats.n_cloned == 1
+    # Removed after densification: 1 (world size), 2 and its clone (opacity).
+    assert stats.n_pruned == 3
+    assert new_model.num_points == 3  # gaussian 3 + two children of 0
+    assert sorted(stats.parent_index.tolist()) == [0, 0, 3]
+    assert (new_model.scales.max(dim=-1).values <= 2.0).all()
+
+
+def test_screen_size_pruning_spares_new_rows():
+    n = 3
+    model = _model(n)
+    max_radii2d = torch.tensor([50.0, 50.0, 5.0])
+    grad_accum = torch.tensor([1.0, 0.0, 0.0])  # 0 is cloned
+
+    _, stats = densify_and_prune(
+        model,
+        grad_accum,
         torch.ones(n),
         scene_scale=SCENE_SCALE,
         grad_threshold=0.5,
         max_radii2d=max_radii2d,
         max_screen_size=20.0,
-        max_world_size=2.0,
     )
 
+    # Originals 0 and 1 are over the bar; 0's fresh clone has no history.
     assert stats.n_pruned == 2
-    assert stats.n_split == 0
-    assert stats.n_cloned == n - 2
-    assert new_model.num_points == 2 * (n - 2)
-    assert 1 not in stats.parent_index.tolist()
-    assert 2 not in stats.parent_index.tolist()
+    assert stats.parent_index.tolist() == [2, 0]
+    assert stats.source_index.tolist() == [2, -1]
 
 
 def test_oversized_pruning_is_off_by_default():
