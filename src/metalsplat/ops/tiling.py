@@ -26,7 +26,11 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import _loader
-from metalsplat.reference.tiling_ref import DEFAULT_TILE_SIZE, TileBinningResult
+from metalsplat.reference.tiling_ref import (
+    DEFAULT_TILE_SIZE,
+    TileBinningResult,
+    sigma_extent,
+)
 
 __all__ = ["DEFAULT_TILE_SIZE", "TileBinningResult", "bin_and_sort_gaussians"]
 
@@ -51,6 +55,7 @@ def bin_and_sort_gaussians(
     img_width: int,
     img_height: int,
     tile_size: int = DEFAULT_TILE_SIZE,
+    opacities: torch.Tensor | None = None,  # (N,); see tiling_ref.sigma_extent
 ) -> TileBinningResult:
     device = means2d.device
     n = means2d.shape[0]
@@ -61,7 +66,15 @@ def bin_and_sort_gaussians(
         from metalsplat.reference.tiling_ref import bin_and_sort_gaussians as ref
 
         return ref(
-            means2d, depths, conics, radii, valid, img_width, img_height, tile_size
+            means2d,
+            depths,
+            conics,
+            radii,
+            valid,
+            img_width,
+            img_height,
+            tile_size,
+            opacities,
         )
 
     if n == 0:
@@ -77,6 +90,8 @@ def bin_and_sort_gaussians(
         else valid.contiguous().float()
     )
 
+    extent = sigma_extent(opacities, n, device).contiguous()
+
     lib = _loader.load("tiling")
 
     counts = torch.empty(n, dtype=torch.int32, device=device)
@@ -85,6 +100,7 @@ def bin_and_sort_gaussians(
         conics_c,
         radii_c,
         valid_c,
+        extent,
         tiles_x,
         tiles_y,
         float(tile_size),
@@ -109,6 +125,7 @@ def bin_and_sort_gaussians(
         depths_c,
         radii_c,
         valid_c,
+        extent,
         offsets,
         tiles_x,
         tiles_y,

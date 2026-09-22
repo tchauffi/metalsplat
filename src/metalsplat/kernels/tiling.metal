@@ -15,7 +15,10 @@ using namespace metal;
 // already compares correctly as an integer, and every gaussian that gets here
 // has depth > near > 0.
 
-// Per-axis 3-sigma half-extents of the projected gaussian, from the conic.
+// Per-axis half-extents of the projected gaussian, `k` sigmas out, from the
+// conic. `k` comes from the host per gaussian: 3 by default, or the
+// opacity-aware distance at which the rasterizer's alpha falls below 1/255
+// (see reference/tiling_ref.py sigma_extent).
 // The conic is the inverse of the 2D covariance, so inverting it back gives
 // Sigma2d, whose diagonal is what bounds the ellipse along x and y.
 //
@@ -25,13 +28,13 @@ using namespace metal;
 // as wide as it is long. On the garden scene the tight box produces 43%
 // fewer (gaussian, tile) pairs, which is less to sort and less for the
 // rasterizer to walk per tile.
-inline float2 ellipse_half_extents(float3 conic)
+inline float2 ellipse_half_extents(float3 conic, float k)
 {
     float det = conic.x * conic.z - conic.y * conic.y;
     if (det <= 0.0) return float2(0.0);
     // Sigma2d = inv(conic): diagonal entries are conic.z/det and conic.x/det.
-    return float2(3.0 * sqrt(max(conic.z / det, 0.0)),
-                  3.0 * sqrt(max(conic.x / det, 0.0)));
+    return float2(k * sqrt(max(conic.z / det, 0.0)),
+                  k * sqrt(max(conic.x / det, 0.0)));
 }
 
 inline void tile_bbox(float mx, float my, float hw, float hh,
@@ -61,6 +64,7 @@ kernel void tile_counts(
     device const float* conics,          // (N,3) a,b,c
     device const float* radii,            // (N,)
     device const float* valid,             // (N,)
+    device const float* extent,             // (N,) half-extent in sigmas, 0 = cull
     constant int& tiles_x,
     constant int& tiles_y,
     constant float& tile_size,
@@ -68,12 +72,13 @@ kernel void tile_counts(
     uint gid [[thread_position_in_grid]])
 {
     float r = radii[gid];
-    if (valid[gid] < 0.5 || r <= 0.0) {
+    float ext = extent[gid];
+    if (valid[gid] < 0.5 || r <= 0.0 || ext <= 0.0) {
         counts[gid] = 0;
         return;
     }
     float2 half_extent = ellipse_half_extents(
-        float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]));
+        float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]), ext);
     int min_tx, min_ty, span_x, span_y;
     tile_bbox(means2d[gid * 2 + 0], means2d[gid * 2 + 1], half_extent.x, half_extent.y,
               tiles_x, tiles_y, tile_size, min_tx, min_ty, span_x, span_y);
@@ -86,6 +91,7 @@ kernel void tile_pairs(
     device const float* depths,           // (N,)
     device const float* radii,             // (N,)
     device const float* valid,              // (N,)
+    device const float* extent,              // (N,) half-extent in sigmas, 0 = cull
     device const int* offsets,              // (N,) exclusive prefix sum of counts
     constant int& tiles_x,
     constant int& tiles_y,
@@ -95,10 +101,11 @@ kernel void tile_pairs(
     uint gid [[thread_position_in_grid]])
 {
     float r = radii[gid];
-    if (valid[gid] < 0.5 || r <= 0.0) return;
+    float ext = extent[gid];
+    if (valid[gid] < 0.5 || r <= 0.0 || ext <= 0.0) return;
 
     float2 half_extent = ellipse_half_extents(
-        float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]));
+        float3(conics[gid * 3 + 0], conics[gid * 3 + 1], conics[gid * 3 + 2]), ext);
     int min_tx, min_ty, span_x, span_y;
     tile_bbox(means2d[gid * 2 + 0], means2d[gid * 2 + 1], half_extent.x, half_extent.y,
               tiles_x, tiles_y, tile_size, min_tx, min_ty, span_x, span_y);

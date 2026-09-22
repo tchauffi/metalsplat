@@ -231,6 +231,10 @@ def rasterize_gaussians(
         img_width,
         img_height,
         tile_size,
+        # Opacity-aware bounding boxes: the box ends exactly where alpha
+        # drops below the rasterizer's 1/255 cutoff, so no gaussian is cut
+        # off at a tile border (see tiling_ref.sigma_extent).
+        opacities=opacities.detach(),
     )
     device = means2d.device
     if background is None:
