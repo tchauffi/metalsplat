@@ -15,8 +15,10 @@ so a degree-3 model writes the reference implementation's full 45 and a
 degree-2 model writes 24. Viewers that read the SH degree from the
 header's property count (most modern ones do) render either correctly;
 older viewers that hardcode degree 3 may not render a lower-degree file. A
-flat-RGB model (sh_degree=0) is exported as degree-0-only SH (f_rest all
-zero), via the standard RGB2SH formula.
+flat-RGB model (sh_degree=0) is exported with its colour as the DC term
+(via the standard RGB2SH formula) and 24 all-zero f_rest entries, i.e. the
+degree-2 layout carrying no view dependence; load_ply reads such a file back
+as a flat-RGB model.
 """
 
 from __future__ import annotations
@@ -118,9 +120,10 @@ def load_ply(path: str | Path, device: str = "cpu") -> GaussianModel:
     """Inverse of save_ply: reads a 3DGS .ply back into a GaussianModel.
 
     Reads the SH degree from the header's f_rest_* property count rather
-    than assuming one, so files written by other tools (degree 3 / 45
-    f_rest entries) are detected -- though only degree<=2 can currently be
-    represented, so higher-degree coefficients are dropped with a warning.
+    than assuming one, so files of any degree up to 3 (45 f_rest entries,
+    what the reference and most tools write) load at their own degree.
+    Coefficients beyond degree 3 are dropped with a warning, and a file
+    whose f_rest entries are all zero loads as a flat-RGB model.
     """
     import warnings
 
