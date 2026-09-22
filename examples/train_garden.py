@@ -443,7 +443,7 @@ def main() -> None:
             and step <= OPACITY_RESET_STOP
             and step % OPACITY_RESET_INTERVAL == 0
         ):
-            reset_opacity(model, value=OPACITY_RESET_VALUE)
+            reset_opacity(model, value=OPACITY_RESET_VALUE, optimizer=optimizer)
             print(
                 f"  opacity reset @ step {step} (cap {OPACITY_RESET_VALUE})", flush=True
             )

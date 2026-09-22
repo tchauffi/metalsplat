@@ -260,16 +260,31 @@ def densify_and_prune(
 
 
 @torch.no_grad()
-def reset_opacity(model: GaussianModel | Gaussian2DModel, value: float = 0.01) -> None:
+def reset_opacity(
+    model: GaussianModel | Gaussian2DModel,
+    value: float = 0.01,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> None:
     """Caps every gaussian's opacity at `value`, in place. Standard 3DGS
     trick: periodically forces all gaussians back to near-transparent, so
     ones that only got high opacity by occluding/compensating for a
     neighbor (rather than genuinely representing something) have to
     re-earn it through training or fall below the prune threshold and get
     removed by the next prune_low_opacity() call. Modifies
-    `model.raw_opacities.data` in place (same Parameter object, same
-    Adam momentum buffers) rather than rebuilding the model, since no
-    gaussian is added or removed.
+    `model.raw_opacities.data` in place (same Parameter object) rather than
+    rebuilding the model, since no gaussian is added or removed.
+
+    Pass the training `optimizer` so the opacity's Adam moments are zeroed
+    too, keeping the step count -- exactly what the reference's
+    `replace_tensor_to_optimizer` does. It matters a great deal: the
+    gradient on raw opacity scales with the sigmoid's slope, which is ~10x
+    smaller at 0.01 than at typical pre-reset opacities, so a second moment
+    left over from before the reset shrinks every post-reset step to a
+    fraction of the learning rate. Opacities then cannot climb back before
+    the next densify round culls them -- measured on the 2DGS garden run,
+    one reset with stale moments pruned 77% of the model (249k -> 58k) at
+    the following round. Zeroed moments give the reference's large first
+    steps instead.
 
     Works for both `GaussianModel` and `Gaussian2DModel` unchanged -- it
     only touches `.opacities`/`.raw_opacities`, never means/scales/quats,
@@ -278,6 +293,12 @@ def reset_opacity(model: GaussianModel | Gaussian2DModel, value: float = 0.01) -
     """
     new_opacities = torch.clamp(model.opacities, max=value)
     model.raw_opacities.data = logit(new_opacities)
+    if optimizer is not None:
+        state = optimizer.state.get(model.raw_opacities)
+        if state:
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in state:
+                    state[key].zero_()
 
 
 def prune_low_opacity(

@@ -608,7 +608,7 @@ def main() -> None:
             and step % OPACITY_RESET_INTERVAL == 0
             and step < OPACITY_STOP_RESET
         ):
-            reset_opacity(model)
+            reset_opacity(model, optimizer=optimizer)
             print(f"  opacity reset @ step {step}", flush=True)
 
         # Standalone prune: keeps running after DENSIFY_STOP, unlike

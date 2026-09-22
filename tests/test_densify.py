@@ -351,3 +351,24 @@ def test_oversized_pruning_is_off_by_default():
         max_radii2d=max_radii2d,
     )
     assert stats.n_pruned == 0
+
+
+def test_reset_opacity_zeroes_opacity_adam_moments_only():
+    from metalsplat.optim import SparseAdam
+
+    model = _model(4)
+    optimizer = SparseAdam(
+        [{"params": [model.raw_opacities]}, {"params": [model.raw_scales]}]
+    )
+    for _ in range(3):
+        optimizer.zero_grad()
+        (model.opacities.sum() + model.scales.sum()).backward()
+        optimizer.step(torch.ones(4, dtype=torch.bool))
+
+    reset_opacity(model, value=0.01, optimizer=optimizer)
+
+    op_state = optimizer.state[model.raw_opacities]
+    assert (op_state["exp_avg"] == 0).all() and (op_state["exp_avg_sq"] == 0).all()
+    assert op_state["step"].item() == 3  # bias correction keeps elapsed steps
+    assert (optimizer.state[model.raw_scales]["exp_avg"] != 0).all()
+    assert (model.opacities <= 0.01 + 1e-6).all()
