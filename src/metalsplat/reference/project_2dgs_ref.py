@@ -111,6 +111,9 @@ def project_gaussians_2dgs(
         # against the inflated radius for the same reason, and the two
         # must agree gaussian-for-gaussian.
         radius_margin=RADIUS_SAFETY_MARGIN,
+        # 2DGS keeps the 3-sigma base radius its kernel reproduces; the 2.5x
+        # margin above already covers the frame edge.
+        radius_sigmas=3.0,
     )
     # ops.tiling/kernels/tiling.metal derive the actual per-tile bounding
     # box from `conics` (via the 2D covariance's diagonal), not from

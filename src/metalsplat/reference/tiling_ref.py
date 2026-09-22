@@ -17,6 +17,7 @@ structural, matching gsplat), so it deliberately operates outside autograd.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -26,6 +27,9 @@ DEFAULT_TILE_SIZE = 16
 ALPHA_THRESHOLD = 1.0 / 255.0
 # Bounding-box half-extent in sigmas when no opacity is given.
 DEFAULT_SIGMA_EXTENT = 3.0
+# The farthest any gaussian can reach before alpha falls below the cutoff:
+# sigma_extent at opacity 1, sqrt(2 ln 255) ~= 3.33.
+MAX_SIGMA_EXTENT = math.sqrt(2.0 * math.log(1.0 / ALPHA_THRESHOLD))
 
 
 def sigma_extent(opacities: torch.Tensor | None, n: int, device) -> torch.Tensor:
