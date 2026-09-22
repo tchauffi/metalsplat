@@ -21,7 +21,7 @@ from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
 from metalsplat.filter3d import carry_filter_3d, compute_3d_filter
 from metalsplat.losses import gaussian_splatting_loss
-from metalsplat.optim import SparseAdam, migrate_optimizer_state
+from metalsplat.optim import SparseAdam, migrate_optimizer_state, sh_lr_scale
 from metalsplat.seed import seed_uncovered_regions
 
 DEVICE = "mps"
@@ -33,8 +33,14 @@ OUT_DIR = Path(__file__).parent
 RESOLUTION_DOWNSCALE = 2.0
 NUM_ITERS = 30_000
 EVAL_EVERY = 1000
-LR_OTHER_INIT = 0.01
-LR_OTHER_FINAL = LR_OTHER_INIT * 0.1  # color/scale/rotation are decayed, like means
+# Reference 3DGS learning rates, held constant like the reference. The SH
+# rate applies to the DC coefficient; the higher bands get 1/20 of it (see
+# metalsplat.optim.sh_lr_scale). These used to be a single decayed 0.01 for
+# all three groups -- 80x the reference on the higher SH bands, which let
+# them overfit view-dependent colour.
+LR_SH = 0.0025
+LR_SCALES = 0.005
+LR_QUATS = 0.001
 LR_OPACITY = 0.05
 SH_DEGREE = 3  # 0 = plain RGB; 1..3 = spherical harmonics (3 = the 3DGS default)
 SH_DEGREE_INTERVAL = 0  # 0 disables (fit every band from the start)
@@ -85,6 +91,14 @@ SEED_RESIDUAL_THRESH = 0.15
 SEED_COVERAGE_THRESH = 0.8
 SEED_MAX_PER_CALL = 300
 
+# Oversized-gaussian pruning, as in the reference: during the densify window
+# and once the first opacity reset has happened, densify rounds also drop
+# gaussians whose projected radius exceeded PRUNE_MAX_SCREEN_SIZE pixels
+# since the last round, or whose largest scale exceeds
+# PRUNE_MAX_WORLD_FRACTION x the camera extent.
+PRUNE_MAX_SCREEN_SIZE = 20.0
+PRUNE_MAX_WORLD_FRACTION = 0.1
+
 OPACITY_RESET_INTERVAL = 1500  # 0/None disables
 OPACITY_RESET_STOP = 3000
 OPACITY_RESET_VALUE = 0.01
@@ -121,6 +135,13 @@ def estimate_scene_scale(points: torch.Tensor, sample_size: int = 5000) -> float
     d = torch.cdist(sample, sample)
     d.fill_diagonal_(float("inf"))
     return d.min(dim=1).values.median().item()
+
+
+def camera_extent(cameras: list) -> float:
+    """Radius of the camera rig, the reference's `cameras_extent`: 1.1x the
+    largest distance from any camera centre to their mean."""
+    centers = torch.stack([c.position for c in cameras])
+    return 1.1 * (centers - centers.mean(dim=0)).norm(dim=-1).max().item()
 
 
 def calibrate_initial_scale(
@@ -215,26 +236,40 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"other lr: {LR_OTHER_INIT:.5f} -> {LR_OTHER_FINAL:.5f} (exponential decay)",
+        f"constant lr: sh {LR_SH} (rest /20), scales {LR_SCALES}, "
+        f"quats {LR_QUATS}, opacity {LR_OPACITY}",
         flush=True,
     )
-    print(f"opacity lr: {LR_OPACITY:.5f} (constant, see LR_OPACITY)", flush=True)
 
-    # Param group order matters: the training loop updates groups 0 and 1's
-    # LR each step and deliberately leaves group 2 (opacity) alone.
-    def make_optimizer(
-        m: GaussianModel, lr_means: float, lr_other: float
-    ) -> torch.optim.Optimizer:
-        color_param = m.raw_colors if m.sh_degree == 0 else m.raw_sh
+    extent = camera_extent(scene.cameras)
+    max_world_size = PRUNE_MAX_WORLD_FRACTION * extent
+    print(
+        f"camera extent {extent:.3f}: pruning scales > {max_world_size:.3f}",
+        flush=True,
+    )
+
+    # Param group order matters: the training loop updates group 0's LR
+    # (means) each step; the others are constant.
+    def make_optimizer(m: GaussianModel, lr_means: float) -> torch.optim.Optimizer:
+        if m.sh_degree == 0:
+            color_group = {"params": [m.raw_colors], "lr": LR_SH}
+        else:
+            color_group = {
+                "params": [m.raw_sh],
+                "lr": LR_SH,
+                "lr_scale": sh_lr_scale(m.raw_sh),
+            }
         return SparseAdam(
             [
                 {"params": [m.means], "lr": lr_means},
-                {"params": [m.raw_scales, m.raw_quats, color_param], "lr": lr_other},
+                {"params": [m.raw_scales], "lr": LR_SCALES},
+                {"params": [m.raw_quats], "lr": LR_QUATS},
+                color_group,
                 {"params": [m.raw_opacities], "lr": LR_OPACITY},
             ]
         )
 
-    optimizer = make_optimizer(model, lr_means_init, LR_OTHER_INIT)
+    optimizer = make_optimizer(model, lr_means_init)
     background = torch.zeros(3, device=DEVICE)
 
     def eval_and_save(step: int) -> None:
@@ -299,15 +334,14 @@ def main() -> None:
 
     grad_accum = torch.zeros(model.num_points, device=DEVICE)
     grad_count = torch.zeros(model.num_points, device=DEVICE)
+    max_radii2d = torch.zeros(model.num_points, device=DEVICE)
     previous_sh_degree = model.active_sh_degree
 
     start = time.time()
     for step in range(1, NUM_ITERS + 1):
         t = step / NUM_ITERS
         lr_means = lr_means_init * (lr_means_final / lr_means_init) ** t
-        lr_other = LR_OTHER_INIT * (LR_OTHER_FINAL / LR_OTHER_INIT) ** t
         optimizer.param_groups[0]["lr"] = lr_means
-        optimizer.param_groups[1]["lr"] = lr_other
 
         idx = train_idx[int(torch.randint(len(train_idx), (1,)).item())]
         cam = scene.cameras[idx]
@@ -330,6 +364,9 @@ def main() -> None:
 
         with torch.no_grad():
             grad_count[visible] += 1.0
+            max_radii2d[visible] = torch.maximum(
+                max_radii2d[visible], aux.radii.detach()[visible]
+            )
 
         if step % 25 == 0 or step == 1:
             torch.mps.synchronize()
@@ -341,6 +378,7 @@ def main() -> None:
             )
 
         if DENSIFY_START <= step <= DENSIFY_STOP and step % DENSIFY_INTERVAL == 0:
+            prune_large = bool(OPACITY_RESET_INTERVAL) and step > OPACITY_RESET_INTERVAL
             model, stats = densify_and_prune(
                 model,
                 grad_accum,
@@ -349,6 +387,9 @@ def main() -> None:
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 max_points=DENSIFY_MAX_POINTS,
                 grad_threshold=densify_threshold,
+                max_radii2d=max_radii2d,
+                max_screen_size=PRUNE_MAX_SCREEN_SIZE if prune_large else None,
+                max_world_size=max_world_size if prune_large else None,
             )
             # `stats.grad_threshold` is None when the round did nothing and
             # so never computed a bar. Freezing that would leave the
@@ -364,10 +405,11 @@ def main() -> None:
                     flush=True,
                 )
             optimizer = migrate_optimizer_state(
-                optimizer, make_optimizer(model, lr_means, lr_other), stats.source_index
+                optimizer, make_optimizer(model, lr_means), stats.source_index
             )
             grad_accum = torch.zeros(model.num_points, device=DEVICE)
             grad_count = torch.zeros(model.num_points, device=DEVICE)
+            max_radii2d = torch.zeros(model.num_points, device=DEVICE)
             filter_3d = carry_filter_3d(filter_3d, stats.parent_index)
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
@@ -392,11 +434,12 @@ def main() -> None:
             if seed_stats.n_seeded > 0:
                 optimizer = migrate_optimizer_state(
                     optimizer,
-                    make_optimizer(model, lr_means, lr_other),
+                    make_optimizer(model, lr_means),
                     seed_stats.source_index,
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
+                max_radii2d = torch.zeros(model.num_points, device=DEVICE)
                 filter_3d = carry_filter_3d(filter_3d, seed_stats.parent_index)
             print(
                 f"  seed @ step {step}: {seed_stats.n_before} -> {seed_stats.n_after} "
@@ -420,10 +463,11 @@ def main() -> None:
             )
             if n_pruned > 0:
                 optimizer = migrate_optimizer_state(
-                    optimizer, make_optimizer(model, lr_means, lr_other), prune_index
+                    optimizer, make_optimizer(model, lr_means), prune_index
                 )
                 grad_accum = torch.zeros(model.num_points, device=DEVICE)
                 grad_count = torch.zeros(model.num_points, device=DEVICE)
+                max_radii2d = torch.zeros(model.num_points, device=DEVICE)
                 # Pruning only removes; survivors keep their radius unchanged.
                 filter_3d = carry_filter_3d(filter_3d, prune_index)
                 print(

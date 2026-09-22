@@ -284,3 +284,47 @@ def test_reported_threshold_round_trips():
         grad_threshold=stats.grad_threshold,
     )
     assert again.n_split + again.n_cloned == stats.n_split + stats.n_cloned
+
+
+def test_oversized_gaussians_are_pruned_not_densified():
+    n = 6
+    model = _model(n)
+    with torch.no_grad():
+        model.raw_scales[1] = torch.log(torch.tensor(3.0))  # too big in world
+    max_radii2d = torch.full((n,), 5.0)
+    max_radii2d[2] = 50.0  # too big on screen
+
+    # Every gaussian is a densify candidate, so an oversized one surviving
+    # (or being split/cloned) would show up in the counts.
+    new_model, stats = densify_and_prune(
+        model,
+        torch.full((n,), 1.0),
+        torch.ones(n),
+        scene_scale=SCENE_SCALE,
+        grad_threshold=0.5,
+        max_radii2d=max_radii2d,
+        max_screen_size=20.0,
+        max_world_size=2.0,
+    )
+
+    assert stats.n_pruned == 2
+    assert stats.n_split == 0
+    assert stats.n_cloned == n - 2
+    assert new_model.num_points == 2 * (n - 2)
+    assert 1 not in stats.parent_index.tolist()
+    assert 2 not in stats.parent_index.tolist()
+
+
+def test_oversized_pruning_is_off_by_default():
+    n = 4
+    model = _model(n)
+    max_radii2d = torch.full((n,), 1000.0)
+    _, stats = densify_and_prune(
+        model,
+        torch.zeros(n),
+        torch.ones(n),
+        scene_scale=SCENE_SCALE,
+        grad_threshold=1.0,
+        max_radii2d=max_radii2d,
+    )
+    assert stats.n_pruned == 0

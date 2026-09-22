@@ -37,8 +37,8 @@ def test_filter_radius_follows_the_closest_observing_camera():
     r_far = compute_3d_filter(means, [far_cam], sampling_scale=0.2)
     r_both = compute_3d_filter(means, [near_cam, far_cam], sampling_scale=0.2)
 
-    assert r_near.item() == pytest.approx(0.2 * 2.0 / FX, rel=1e-5)
-    assert r_far.item() == pytest.approx(0.2 * 10.0 / FX, rel=1e-5)
+    assert r_near.item() == pytest.approx(0.2**0.5 * 2.0 / FX, rel=1e-5)
+    assert r_far.item() == pytest.approx(0.2**0.5 * 10.0 / FX, rel=1e-5)
     # A closer view resolves finer detail, so it wins.
     assert r_both.item() == pytest.approx(r_near.item(), rel=1e-5)
     assert r_near < r_far
@@ -53,9 +53,11 @@ def test_unseen_gaussians_are_not_filtered():
 
 
 def test_filter_scales_with_sampling_scale():
+    # sampling_scale is a variance factor, as in Mip-Splatting: 4x the
+    # scale doubles the radius.
     means = torch.zeros(1, 3)
     cam = [_camera_at(4.0)]
-    assert compute_3d_filter(means, cam, sampling_scale=0.4).item() == pytest.approx(
+    assert compute_3d_filter(means, cam, sampling_scale=0.8).item() == pytest.approx(
         2 * compute_3d_filter(means, cam, sampling_scale=0.2).item(), rel=1e-5
     )
 

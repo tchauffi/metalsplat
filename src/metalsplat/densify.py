@@ -28,7 +28,7 @@ class DensifyStats:
     n_before: int
     n_split: int  # gaussians replaced by 2 new ones each
     n_cloned: int  # gaussians duplicated in place
-    n_pruned: int  # gaussians removed (low opacity)
+    n_pruned: int  # gaussians removed (low opacity or too large)
     n_after: int
     # The absolute screen-space gradient bar used this round, or None if the
     # round did nothing (no visible gaussians, or already at `max_points`)
@@ -61,6 +61,9 @@ def densify_and_prune(
     prune_opacity_thresh: float = 0.005,
     split_scale_factor: float = 1.6,
     max_points: int | None = None,
+    max_radii2d: torch.Tensor | None = None,
+    max_screen_size: float | None = None,
+    max_world_size: float | None = None,
 ) -> tuple[GaussianModel, DensifyStats]:
     """Splits, clones and prunes, returning the new model and stats.
 
@@ -78,6 +81,15 @@ def densify_and_prune(
     That is fine when the cap is the real constraint and disastrous when it
     is not, so the returned `stats.grad_threshold` lets a caller calibrate
     on the first round and freeze it thereafter.
+
+    Oversized gaussians are pruned alongside low-opacity ones, as in the
+    reference: any whose largest projected radius since the last round
+    (`max_radii2d`, pixels) exceeds `max_screen_size`, or whose largest
+    world-space scale exceeds `max_world_size` (the reference uses 0.1 x
+    the camera extent). Each check is skipped when its threshold is None.
+    Large gaussians are neither split nor cloned. The reference enables
+    this only after the first opacity reset; that schedule is the
+    caller's.
     """
     device = model.means.device
     n = model.num_points
@@ -103,10 +115,18 @@ def densify_and_prune(
         threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
     else:
         threshold = float(grad_threshold)
-    candidates = visible & (avg_grad >= threshold)
 
     means = model.means.detach()
     scales = model.scales.detach()
+
+    too_big = torch.zeros(n, dtype=torch.bool, device=device)
+    if max_screen_size is not None and max_radii2d is not None:
+        too_big |= max_radii2d > max_screen_size
+    if max_world_size is not None:
+        too_big |= scales.max(dim=-1).values > max_world_size
+
+    candidates = visible & (avg_grad >= threshold) & ~too_big
+
     quats = model.quats.detach()
     opacities = model.opacities.detach()
     # Whatever per-gaussian "color-like" tensor the model uses -- (N, 3) for
@@ -156,9 +176,9 @@ def densify_and_prune(
     clone_color_like = color_like[clone_idx]
 
     # Split removes the original (replaced by 2 new); clone keeps the
-    # original as well as adding a duplicate; prune removes low-opacity
-    # gaussians regardless of candidacy.
-    keep_mask = ~is_large & (opacities > prune_opacity_thresh)
+    # original as well as adding a duplicate; prune removes low-opacity and
+    # oversized gaussians regardless of candidacy.
+    keep_mask = ~is_large & (opacities > prune_opacity_thresh) & ~too_big
 
     final_means = torch.cat([means[keep_mask], split_means, clone_means], dim=0)
     final_scales = torch.cat([scales[keep_mask], split_scales, clone_scales], dim=0)
@@ -206,7 +226,7 @@ def densify_and_prune(
     n_after = final_means.shape[0]
     n_pruned = int(
         (~keep_mask & ~is_large).sum().item()
-    )  # low-opacity prunes among non-split gaussians
+    )  # low-opacity / oversized prunes among non-split gaussians
     stats = DensifyStats(
         n_before=n_before,
         n_split=int(split_idx.numel()),
