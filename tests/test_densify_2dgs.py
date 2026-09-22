@@ -410,3 +410,33 @@ def test_no_op_round_reports_no_threshold():
     # A round that actually ran reports the bar it used.
     _, stats = densify_and_prune_2dgs(model, grad_accum, torch.ones(n))
     assert stats.grad_threshold is not None
+
+
+def test_pruning_runs_after_split_and_clone_like_the_reference():
+    # Mirrors metalsplat.densify's test: prune the densified set, not the
+    # originals, so large candidates split and low-opacity clones go too.
+    from metalsplat.densify2dgs import densify_and_prune_2dgs
+    from metalsplat.gaussians_2dgs import Gaussian2DModel
+
+    n = 4
+    scales = torch.tensor([[3.0, 1.0], [3.0, 1.0], [0.1, 0.1], [0.1, 0.1]])
+    opacities = torch.tensor([0.5, 0.5, 1e-4, 0.5])
+    model = Gaussian2DModel(torch.zeros(n, 3), scales=scales, opacities=opacities)
+    grad_accum = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+    new_model, stats = densify_and_prune_2dgs(
+        model,
+        grad_accum,
+        torch.ones(n),
+        grad_threshold=0.5,
+        prune_opacity_thresh=0.005,
+        max_world_size=2.0,
+    )
+
+    # 0: large candidate -> split; children (3.0 / 1.6) fit under the bar.
+    # 1: too large, not a candidate -> pruned. 2: faint candidate -> cloned,
+    # and both it and its clone are pruned. 3: kept.
+    assert stats.n_split == 1 and stats.n_cloned == 1
+    assert stats.n_pruned == 3
+    assert new_model.num_points == 3
+    assert sorted(stats.parent_index.tolist()) == [0, 0, 3]

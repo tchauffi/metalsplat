@@ -117,6 +117,7 @@ from pathlib import Path
 import torch
 
 from metalsplat import Gaussian2DModel, render_2dgs, save_ply_2dgs
+from metalsplat.camera import camera_extent
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import reset_opacity
 from metalsplat.densify2dgs import densify_and_prune_2dgs, prune_low_opacity_2dgs
@@ -126,7 +127,7 @@ from metalsplat.losses import (
     normal_consistency_loss,
     psnr,
 )
-from metalsplat.optim import SparseAdam, migrate_optimizer_state
+from metalsplat.optim import SparseAdam, migrate_optimizer_state, sh_lr_scale
 
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
@@ -141,7 +142,8 @@ RESOLUTION_DOWNSCALE = 2.0
 # --- 2DGS paper defaults (arguments/__init__.py's OptimizationParams) ---
 NUM_ITERS = 15_000
 FEATURE_LR = 0.0025  # paper splits this into f_dc (this rate) / f_rest (this / 20);
-# this repo's SH parameter isn't split that way, so one rate covers all bands.
+# this repo keeps SH in one tensor, so the split is a per-coefficient
+# multiplier on it (metalsplat.optim.sh_lr_scale).
 OPACITY_LR = 0.05
 SCALING_LR = 0.005
 ROTATION_LR = 0.001
@@ -220,6 +222,10 @@ DENSIFY_INTERVAL = 100  # paper: densification_interval
 # other.
 PIXEL_NORMALIZED_DENSIFY = False
 PRUNE_OPACITY_THRESH = 0.05  # paper: opacity_cull
+# Paper: once past the first opacity reset, densify rounds also prune
+# splats whose larger scale exceeds 0.1 x the camera extent (its 20px
+# screen-size check never fires, see metalsplat.densify2dgs).
+PRUNE_MAX_WORLD_FRACTION = 0.1
 OPACITY_RESET_INTERVAL = (
     3000  # paper default (reset_opacity()'s own 0.01 cap matches too)
 )
@@ -377,6 +383,13 @@ def main() -> None:
         flush=True,
     )
 
+    extent = camera_extent([scene.cameras[i] for i in train_idx])
+    max_world_size = PRUNE_MAX_WORLD_FRACTION * extent
+    print(
+        f"camera extent {extent:.3f}: pruning scales > {max_world_size:.3f}",
+        flush=True,
+    )
+
     # Paper's exact ratio: position_lr_final / position_lr_init = 0.01.
     lr_means_init = 0.02 * scene_scale
     lr_means_final = lr_means_init * 0.01
@@ -404,11 +417,18 @@ def main() -> None:
     # the first (means/"xyz") gets its learning rate scheduled per step,
     # the rest stay constant for the whole run.
     def make_optimizer(m: Gaussian2DModel, lr_means: float) -> torch.optim.Optimizer:
-        color_param = m.raw_colors if m.sh_degree == 0 else m.raw_sh
+        if m.sh_degree == 0:
+            color_group = {"params": [m.raw_colors], "lr": FEATURE_LR}
+        else:
+            color_group = {
+                "params": [m.raw_sh],
+                "lr": FEATURE_LR,
+                "lr_scale": sh_lr_scale(m.raw_sh),
+            }
         return SparseAdam(
             [
                 {"params": [m.means], "lr": lr_means},
-                {"params": [color_param], "lr": FEATURE_LR},
+                color_group,
                 {"params": [m.raw_scales], "lr": SCALING_LR},
                 {"params": [m.raw_quats], "lr": ROTATION_LR},
                 {"params": [m.raw_opacities], "lr": OPACITY_LR},
@@ -552,6 +572,11 @@ def main() -> None:
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 prune_opacity_thresh=PRUNE_OPACITY_THRESH,
                 grad_threshold=densify_threshold,
+                max_world_size=(
+                    max_world_size
+                    if OPACITY_RESET_INTERVAL and step > OPACITY_RESET_INTERVAL
+                    else None
+                ),
             )
             # `stats.grad_threshold` is None when the round did nothing and
             # so never computed a bar. Freezing that would leave the

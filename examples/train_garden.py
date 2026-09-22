@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 
 from metalsplat import GaussianModel, render, save_ply
+from metalsplat.camera import camera_extent
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
 from metalsplat.filter3d import carry_filter_3d, compute_3d_filter
@@ -134,13 +135,6 @@ def estimate_scene_scale(points: torch.Tensor, sample_size: int = 5000) -> float
     d = torch.cdist(sample, sample)
     d.fill_diagonal_(float("inf"))
     return d.min(dim=1).values.median().item()
-
-
-def camera_extent(cameras: list) -> float:
-    """Radius of the camera rig, the reference's `cameras_extent`: 1.1x the
-    largest distance from any camera centre to their mean."""
-    centers = torch.stack([c.position for c in cameras])
-    return 1.1 * (centers - centers.mean(dim=0)).norm(dim=-1).max().item()
 
 
 def calibrate_initial_scale(
