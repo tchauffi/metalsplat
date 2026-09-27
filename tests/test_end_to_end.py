@@ -56,6 +56,25 @@ def test_gradients_flow_end_to_end():
     )
 
 
+def test_forward_only_outputs_do_not_claim_a_gradient():
+    # depth and final_T have no backward; they used to come out with
+    # requires_grad=True, so a depth loss silently trained nothing.
+    from metalsplat import Gaussian2DModel, render_2dgs
+
+    model, camera = _scene("mps")
+    aux = render(model, camera, return_aux=True)
+    assert aux.image.requires_grad
+    assert not aux.depth.requires_grad
+    assert not aux.final_T.requires_grad
+    assert not aux.valid.requires_grad
+    assert not aux.radii.requires_grad
+
+    model_2d = Gaussian2DModel(model.means.detach().clone())
+    aux_2d = render_2dgs(model_2d, camera, return_aux=True)
+    assert aux_2d.depth.requires_grad  # 2DGS depth is genuinely differentiable
+    assert not aux_2d.final_T.requires_grad
+
+
 def test_sh_render_and_gradients_flow_end_to_end():
     torch.manual_seed(0)
     n = 20

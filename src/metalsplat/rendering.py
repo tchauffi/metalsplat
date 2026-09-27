@@ -24,8 +24,8 @@ class RenderAux(NamedTuple):
     image: torch.Tensor  # (H, W, 3)
     means2d: torch.Tensor  # (N, 2), with retain_grad() called
     valid: torch.Tensor  # (N,)
-    final_T: torch.Tensor  # (H, W) per-pixel transmittance
-    depth: torch.Tensor  # (H, W) alpha-weighted expected depth, forward-only
+    final_T: torch.Tensor  # (H, W) per-pixel transmittance, requires_grad=False
+    depth: torch.Tensor  # (H, W) alpha-weighted expected depth, requires_grad=False
     radii: torch.Tensor  # (N,) projected 3-sigma pixel radius, 0 if culled
 
 
@@ -178,7 +178,7 @@ class Render2DGSAux(NamedTuple):
     image: torch.Tensor  # (H, W, 3)
     means2d: torch.Tensor  # (N, 2), with retain_grad() called
     valid: torch.Tensor  # (N,)
-    final_T: torch.Tensor  # (H, W) per-pixel transmittance, forward-only
+    final_T: torch.Tensor  # (H, W) per-pixel transmittance, requires_grad=False
     depth: (
         torch.Tensor
     )  # (H, W) alpha-weighted ray-splat-intersection depth, differentiable

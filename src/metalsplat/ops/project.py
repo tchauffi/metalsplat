@@ -75,6 +75,8 @@ class ProjectGaussians(torch.autograd.Function):
         ctx.img_width, ctx.img_height = img_width, img_height
         ctx.near, ctx.eps2d = near, eps2d
         ctx.n = n
+        # Integer radii and a 0/1 flag: structural, never differentiated.
+        ctx.mark_non_differentiable(radii, valid)
         return means2d, depths, conics, radii, valid, compensations
 
     @staticmethod

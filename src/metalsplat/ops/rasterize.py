@@ -108,14 +108,18 @@ class _RasterizeGaussiansImpl(torch.autograd.Function):
         ctx.tile_size = tile_size
         ctx.n = n
         ctx.abs_grad_accum = abs_grad_accum
+        # Forward-only outputs (see backward): marked so that they come out
+        # with requires_grad=False instead of looking differentiable while
+        # backward silently drops their gradient.
+        ctx.mark_non_differentiable(out_depth, out_final_T)
         return out_image, out_depth, out_final_T
 
     @staticmethod
     def backward(ctx, grad_out_image, grad_out_depth, grad_final_T):
-        # grad_out_depth / grad_final_T are ignored: both are structural,
-        # forward-only outputs (depth for visualisation and seeding, final_T
-        # for coverage detection), never part of the differentiable loss.
-        # Depth supervision would need a real backward through out_depth.
+        # grad_out_depth / grad_final_T are always zero: both outputs are
+        # marked non-differentiable in forward (depth for visualisation and
+        # seeding, final_T for coverage detection). Depth supervision would
+        # need a real backward through out_depth.
         (
             means2d,
             conics,

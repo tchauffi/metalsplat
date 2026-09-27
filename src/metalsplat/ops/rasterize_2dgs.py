@@ -145,6 +145,9 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         ctx.n = n
         ctx.abs_grad_accum = abs_grad_accum
         ctx.pixel_count_accum = pixel_count_accum
+        # final_T has no backward (see there); marked so it comes out with
+        # requires_grad=False rather than looking differentiable.
+        ctx.mark_non_differentiable(out_final_T)
         return out_image, out_depth, out_normal, out_distortion, out_final_T
 
     @staticmethod
@@ -156,8 +159,8 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         grad_out_distortion,
         grad_final_T,
     ):
-        # grad_final_T is ignored: forward-only structural output (coverage
-        # detection), same convention as 3DGS's rasterize.py.
+        # grad_final_T is always zero: final_T is marked non-differentiable
+        # in forward (coverage detection only), same as 3DGS's rasterize.py.
         (
             means2d,
             transform,
