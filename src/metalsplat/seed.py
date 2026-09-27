@@ -27,7 +27,6 @@ import torch
 from metalsplat.camera import Camera
 from metalsplat.gaussians import GaussianModel
 from metalsplat.optim import NEW_GAUSSIAN
-from metalsplat.reference.sh_ref import SH_C0
 
 
 @dataclass
@@ -111,42 +110,22 @@ def seed_uncovered_regions(
     new_opacities = torch.full((k,), 0.1, device=device)
     new_colors = target[ys, xs]  # bootstrap color directly from ground truth
 
-    means = model.means.detach()
-    scales = model.scales.detach()
-    quats = model.quats.detach()
-    opacities = model.opacities.detach()
-    color_like = (model.colors if model.sh_degree == 0 else model.raw_sh).detach()
+    # Existing gaussians are carried over losslessly from their raw
+    # parameters; only the seeded ones are built from activated values. For
+    # an SH model the constructor puts the colour in the DC band and zeroes
+    # the rest, at the model's own coefficient count.
+    seeded = GaussianModel(
+        new_means,
+        scales=new_scales,
+        quats=new_quats,
+        opacities=new_opacities,
+        colors=new_colors,
+        sh_degree=model.sh_degree,
+        active_sh_degree=model.active_sh_degree,
+    )
+    new_model = model.cat(seeded)
 
-    final_means = torch.cat([means, new_means], dim=0)
-    final_scales = torch.cat([scales, new_scales], dim=0)
-    final_quats = torch.cat([quats, new_quats], dim=0)
-    final_opacities = torch.cat([opacities, new_opacities], dim=0)
-
-    if model.sh_degree == 0:
-        final_color_like = torch.cat([color_like, new_colors], dim=0)
-        new_model = GaussianModel(
-            final_means,
-            scales=final_scales,
-            quats=final_quats,
-            opacities=final_opacities,
-            colors=final_color_like,
-        ).to(device)
-    else:
-        # Match the model's own coefficient count, which depends on its degree.
-        new_sh = torch.zeros(k, color_like.shape[1], 3, device=device)
-        new_sh[:, 0, :] = (new_colors - 0.5) / SH_C0
-        final_color_like = torch.cat([color_like, new_sh], dim=0)
-        new_model = GaussianModel(
-            final_means,
-            scales=final_scales,
-            quats=final_quats,
-            opacities=final_opacities,
-            sh_degree=model.sh_degree,
-            sh_coeffs=final_color_like,
-            active_sh_degree=model.active_sh_degree,
-        ).to(device)
-
-    n_after = final_means.shape[0]
+    n_after = new_model.num_points
     source_index = torch.cat(
         [
             torch.arange(n_before, device=device),

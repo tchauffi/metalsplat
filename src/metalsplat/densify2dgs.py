@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import torch
 
-from metalsplat.densify import DensifyStats, select_candidates
+from metalsplat.densify import DensifyStats, select_candidates, split_clone_prune
 from metalsplat.gaussians_2dgs import Gaussian2DModel
-from metalsplat.optim import NEW_GAUSSIAN
 from metalsplat.utils.quaternion import quat_to_rotmat
 
 
@@ -138,7 +137,6 @@ def densify_and_prune_2dgs(
     """
     device = model.means.device
     n = model.num_points
-    n_before = n
 
     visible = grad_count > 0
     avg_grad = torch.zeros(n, device=device)
@@ -159,11 +157,7 @@ def densify_and_prune_2dgs(
         avg_grad, visible, grad_percentile, grad_threshold, max_points
     )
 
-    means = model.means.detach()
     scales = model.scales.detach()  # (N, 2)
-    quats = model.quats.detach()
-    opacities = model.opacities.detach()
-    color_like = (model.colors if model.sh_degree == 0 else model.raw_sh).detach()
 
     # Relative split-vs-clone bar -- see the docstring for why this is a
     # quantile of the population's own sizes rather than an absolute
@@ -176,120 +170,26 @@ def densify_and_prune_2dgs(
         is_large = candidates & (extent > split_bar)
     else:
         is_large = candidates
-    is_small = candidates & ~is_large
-
     split_idx = is_large.nonzero(as_tuple=True)[0]
-    clone_idx = is_small.nonzero(as_tuple=True)[0]
+    clone_idx = (candidates & ~is_large).nonzero(as_tuple=True)[0]
 
-    color_shape = tuple(color_like.shape[1:])  # (3,) or (9, 3)
+    # Two children per split parent, offset within the parent's tangent
+    # plane only: a 2D splat has no third axis to offset along.
+    rotmat = quat_to_rotmat(model.quats.detach()[split_idx])  # (K, 3, 3)
+    tangent = rotmat[..., :, :2]  # (K, 3, 2): t_u/t_v columns only, no normal axis
+    samples = torch.randn(2, split_idx.numel(), 2, device=device) * scales[split_idx]
+    split_offsets = torch.einsum("kij,skj->ski", tangent, samples)  # (2, K, 3)
 
-    def _expand2(x):  # (K, *color_shape) -> (2*K, *color_shape), two identical copies
-        return x.unsqueeze(0).expand(2, *([-1] * x.dim())).reshape(-1, *color_shape)
-
-    def _empty(*shape):
-        return means.new_zeros(0, *shape)
-
-    if split_idx.numel() > 0:
-        rotmat = quat_to_rotmat(quats[split_idx])  # (K, 3, 3)
-        tangent = rotmat[..., :, :2]  # (K, 3, 2): t_u/t_v columns only, no normal axis
-        std = scales[split_idx]  # (K, 2)
-        samples = torch.randn(2, split_idx.numel(), 2, device=device) * std
-        offsets = torch.einsum("kij,skj->ski", tangent, samples)  # (2, K, 3)
-        split_means = (means[split_idx].unsqueeze(0) + offsets).reshape(-1, 3)
-        split_scales = (
-            (scales[split_idx] / split_scale_factor)
-            .unsqueeze(0)
-            .expand(2, -1, -1)
-            .reshape(-1, 2)
-        )
-        split_quats = quats[split_idx].unsqueeze(0).expand(2, -1, -1).reshape(-1, 4)
-        split_opacities = opacities[split_idx].unsqueeze(0).expand(2, -1).reshape(-1)
-        split_color_like = _expand2(color_like[split_idx])
-    else:
-        split_means, split_scales, split_quats = _empty(3), _empty(2), _empty(4)
-        split_opacities, split_color_like = _empty(), _empty(*color_shape)
-
-    clone_means = means[clone_idx]
-    clone_scales = scales[clone_idx]
-    clone_quats = quats[clone_idx]
-    clone_opacities = opacities[clone_idx]
-    clone_color_like = color_like[clone_idx]
-
-    # Split removes the original (replaced by 2 new); clone keeps the
-    # original as well as adding a duplicate.
-    unsplit = ~is_large
-    unsplit_idx = unsplit.nonzero(as_tuple=True)[0]
-
-    rows_means = torch.cat([means[unsplit], split_means, clone_means], dim=0)
-    rows_scales = torch.cat([scales[unsplit], split_scales, clone_scales], dim=0)
-    rows_quats = torch.cat([quats[unsplit], split_quats, clone_quats], dim=0)
-    rows_opacities = torch.cat(
-        [opacities[unsplit], split_opacities, clone_opacities], dim=0
+    return split_clone_prune(
+        model,
+        split_idx,
+        clone_idx,
+        split_offsets,
+        split_scale_factor=split_scale_factor,
+        prune_opacity_thresh=prune_opacity_thresh,
+        max_world_size=max_world_size,
+        threshold=threshold,
     )
-    rows_color_like = torch.cat(
-        [color_like[unsplit], split_color_like, clone_color_like], dim=0
-    )
-    n_new = 2 * split_idx.numel() + clone_idx.numel()
-    rows_source = torch.cat(
-        [
-            unsplit_idx,
-            torch.full((n_new,), NEW_GAUSSIAN, dtype=torch.int64, device=device),
-        ]
-    )
-    rows_parent = torch.cat([unsplit_idx, split_idx, split_idx, clone_idx])
-
-    # Prune the densified set, as the reference does (see docstring).
-    prune = rows_opacities <= prune_opacity_thresh
-    if max_world_size is not None:
-        prune |= rows_scales.max(dim=-1).values > max_world_size
-    keep = ~prune
-    if n_new == 0 and not bool(prune.any()):
-        unchanged = torch.arange(n, device=device)
-        return model, DensifyStats(
-            n_before, 0, 0, 0, n_before, threshold, unchanged, unchanged
-        )
-
-    final_means = rows_means[keep]
-    final_scales = rows_scales[keep]
-    final_quats = rows_quats[keep]
-    final_opacities = rows_opacities[keep]
-    final_color_like = rows_color_like[keep]
-
-    if model.sh_degree == 0:
-        new_model = Gaussian2DModel(
-            final_means,
-            scales=final_scales,
-            quats=final_quats,
-            opacities=final_opacities,
-            colors=final_color_like,
-        ).to(device)
-    else:
-        new_model = Gaussian2DModel(
-            final_means,
-            scales=final_scales,
-            quats=final_quats,
-            opacities=final_opacities,
-            sh_degree=model.sh_degree,
-            sh_coeffs=final_color_like,
-            active_sh_degree=model.active_sh_degree,
-        ).to(device)
-
-    source_index = rows_source[keep]
-    parent_index = rows_parent[keep]
-
-    n_after = final_means.shape[0]
-    n_pruned = int(prune.sum().item())  # rows removed after densification
-    stats = DensifyStats(
-        n_before=n_before,
-        n_split=int(split_idx.numel()),
-        n_cloned=int(clone_idx.numel()),
-        n_pruned=n_pruned,
-        n_after=n_after,
-        grad_threshold=threshold,
-        source_index=source_index,
-        parent_index=parent_index,
-    )
-    return new_model, stats
 
 
 def prune_low_opacity_2dgs(
@@ -299,34 +199,8 @@ def prune_low_opacity_2dgs(
     `Gaussian2DModel` reconstruction.
     """
     device = model.means.device
-    n_before = model.num_points
     keep_mask = model.opacities.detach() > prune_opacity_thresh
     n_pruned = int((~keep_mask).sum().item())
     if n_pruned == 0:
-        return model, 0, torch.arange(n_before, device=device)
-
-    means = model.means.detach()[keep_mask]
-    scales = model.scales.detach()[keep_mask]
-    quats = model.quats.detach()[keep_mask]
-    opacities = model.opacities.detach()[keep_mask]
-
-    if model.sh_degree == 0:
-        new_model = Gaussian2DModel(
-            means,
-            scales=scales,
-            quats=quats,
-            opacities=opacities,
-            colors=model.colors.detach()[keep_mask],
-        ).to(device)
-    else:
-        new_model = Gaussian2DModel(
-            means,
-            scales=scales,
-            quats=quats,
-            opacities=opacities,
-            sh_degree=model.sh_degree,
-            sh_coeffs=model.raw_sh.detach()[keep_mask],
-            active_sh_degree=model.active_sh_degree,
-        ).to(device)
-
-    return new_model, n_pruned, keep_mask.nonzero(as_tuple=True)[0]
+        return model, 0, torch.arange(model.num_points, device=device)
+    return model.select(keep_mask), n_pruned, keep_mask.nonzero(as_tuple=True)[0]

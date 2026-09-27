@@ -63,15 +63,88 @@ class SplatModel(nn.Module):
         if opacities is None:
             opacities = torch.full((n,), 0.5, device=device)
 
-        self.means = nn.Parameter(means.clone())
-        self.raw_scales = nn.Parameter(scales.clone().log())
-        self.raw_quats = nn.Parameter(quats.clone())
-        self.raw_opacities = nn.Parameter(logit(opacities.clone()))
-
         color_param_name, color_param_init = sh_color.init_color_param(
             n, sh_degree, colors, sh_coeffs, device
         )
-        setattr(self, color_param_name, nn.Parameter(color_param_init))
+        self._set_rows(
+            {
+                "means": means,
+                "raw_scales": scales.log(),
+                "raw_quats": quats,
+                "raw_opacities": logit(opacities),
+                color_param_name: color_param_init,
+            }
+        )
+
+    @property
+    def color_param_name(self) -> str:
+        """`"raw_colors"` for plain RGB, `"raw_sh"` for spherical harmonics."""
+        return "raw_colors" if self.sh_degree == 0 else "raw_sh"
+
+    def _set_rows(self, rows: dict[str, torch.Tensor]) -> None:
+        names = ("means", "raw_scales", "raw_quats", "raw_opacities")
+        expected = set(names) | {self.color_param_name}
+        if set(rows) != expected:
+            raise ValueError(f"expected rows {sorted(expected)}, got {sorted(rows)}")
+        n = rows["means"].shape[0]
+        shapes = {
+            "means": (n, 3),
+            "raw_scales": (n, self.NUM_SCALE_AXES),
+            "raw_quats": (n, 4),
+            "raw_opacities": (n,),
+        }
+        for name, shape in shapes.items():
+            if tuple(rows[name].shape) != shape:
+                raise ValueError(
+                    f"{name} must have shape {shape}, got {tuple(rows[name].shape)}"
+                )
+        # Registration order is parameters() order: keep it stable.
+        for name in (*names, self.color_param_name):
+            setattr(self, name, nn.Parameter(rows[name].detach().clone()))
+
+    def raw_rows(self) -> dict[str, torch.Tensor]:
+        """Every per-gaussian raw (pre-activation) parameter by name, detached.
+
+        Row-edit these and hand them to `with_rows` to add, drop or reorder
+        gaussians losslessly. Rebuilding through the constructor instead
+        round-trips every gaussian through its activations: `logit` clamps
+        opacity (and plain-RGB colour) to [1e-4, 1 - 1e-4], capping every
+        raw opacity at +-9.2, and quaternions come back normalized under
+        Adam moments accumulated for their unnormalized values.
+        """
+        return {
+            "means": self.means.detach(),
+            "raw_scales": self.raw_scales.detach(),
+            "raw_quats": self.raw_quats.detach(),
+            "raw_opacities": self.raw_opacities.detach(),
+            self.color_param_name: getattr(self, self.color_param_name).detach(),
+        }
+
+    def with_rows(self, rows: dict[str, torch.Tensor]):
+        """A new model of the same type, SH degree and active degree, whose
+        parameters are exactly `rows` (see `raw_rows`)."""
+        model = type(self).__new__(type(self))
+        nn.Module.__init__(model)
+        model.sh_degree = self.sh_degree
+        model.active_sh_degree = self.active_sh_degree
+        model._set_rows(rows)
+        return model
+
+    def select(self, index: torch.Tensor):
+        """The gaussians at `index` (int64 indices, or a bool mask), copied
+        losslessly into a new model."""
+        return self.with_rows({k: v[index] for k, v in self.raw_rows().items()})
+
+    def cat(self, *others):
+        """This model's gaussians followed by each of `others`', losslessly.
+        All must be the same type with the same SH degree."""
+        for other in others:
+            if type(other) is not type(self) or other.sh_degree != self.sh_degree:
+                raise ValueError(
+                    "can only concatenate models of the same type and SH degree"
+                )
+        parts = [self.raw_rows()] + [o.raw_rows() for o in others]
+        return self.with_rows({k: torch.cat([p[k] for p in parts]) for k in parts[0]})
 
     @property
     def scales(self) -> torch.Tensor:
