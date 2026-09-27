@@ -82,14 +82,29 @@ def seed_uncovered_regions(
 
     # A purely uncovered pixel (e.g. true sky) has no real depth to
     # estimate from, so fall back to a representative "far" depth: a high
-    # percentile of this camera's *currently visible* gaussian depths.
+    # percentile of the depths of the gaussians this camera actually sees
+    # (centre in front and inside the frame). Everything merely in front of
+    # the camera would include geometry far off to the side, which says
+    # nothing about how deep this view's content is. If none are in frame,
+    # everything in front is the best remaining guess.
     with torch.no_grad():
         means_cam = model.means.detach() @ camera.R_wc.T + camera.t_wc
         depths_cam = means_cam[:, 2]
         in_front = depths_cam > near
+        z_safe = depths_cam.clamp_min(near)
+        u = camera.fx * means_cam[:, 0] / z_safe + camera.cx
+        v = camera.fy * means_cam[:, 1] / z_safe + camera.cy
+        in_frame = (
+            in_front
+            & (u >= 0)
+            & (u < camera.img_width)
+            & (v >= 0)
+            & (v < camera.img_height)
+        )
+        pool = in_frame if bool(in_frame.any()) else in_front
         fallback_depth = (
-            torch.quantile(depths_cam[in_front], fallback_depth_percentile).item()
-            if bool(in_front.any())
+            torch.quantile(depths_cam[pool], fallback_depth_percentile).item()
+            if bool(pool.any())
             else 10.0 * init_scale
         )
 

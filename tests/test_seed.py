@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from metalsplat.camera import Camera
@@ -177,3 +178,26 @@ def test_seeding_works_on_a_2dgs_model():
     assert type(new_model) is Gaussian2DModel
     assert new_model.raw_scales.shape == (2, 2)
     assert new_model.sh_degree == 1
+
+
+def test_fallback_depth_comes_from_the_gaussians_in_frame():
+    # Two gaussians in frame at z=5, and many in front of the camera but far
+    # off to the side at z=80: the seed depth must come from what this view
+    # sees, not from everything in front of it.
+    _, camera = _model_and_camera()
+    means = torch.cat(
+        [
+            torch.tensor([[0.0, 0.0, 5.0], [0.2, 0.0, 5.0]]),
+            torch.tensor([[500.0, 0.0, 80.0]] * 8),
+        ]
+    )
+    model = GaussianModel(means)
+    target = torch.zeros(H, W, 3)
+    target[H // 2, W // 2] = 1.0
+
+    new_model, stats = seed_uncovered_regions(
+        model, camera, torch.zeros(H, W, 3), target, torch.ones(H, W), init_scale=0.05
+    )
+
+    assert stats.n_seeded == 1
+    assert new_model.means[-1, 2].item() == pytest.approx(5.0)
