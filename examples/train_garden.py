@@ -20,10 +20,16 @@ from metalsplat import GaussianModel, render, save_ply
 from metalsplat.camera import camera_extent
 from metalsplat.data.colmap import load_colmap_scene
 from metalsplat.densify import densify_and_prune, prune_low_opacity, reset_opacity
-from metalsplat.filter3d import carry_filter_3d, compute_3d_filter
+from metalsplat.filter3d import compute_3d_filter
 from metalsplat.losses import gaussian_splatting_loss, psnr
-from metalsplat.optim import SparseAdam, migrate_optimizer_state, sh_lr_scale
+from metalsplat.optim import SparseAdam, sh_lr_scale
 from metalsplat.seed import seed_uncovered_regions
+from metalsplat.training import (
+    GaussianTrainingState,
+    calibrate_initial_scale,
+    estimate_scene_scale,
+    save_image,
+)
 
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
@@ -115,64 +121,6 @@ PRUNE_INTERVAL = 100
 PRUNE_OPACITY_THRESH = 0.005
 
 
-def save_image(tensor: torch.Tensor, path: Path) -> None:
-    import numpy as np
-    from PIL import Image
-
-    arr = (tensor.clamp(0, 1).detach().cpu().numpy() * 255).astype(np.uint8)
-    Image.fromarray(arr).save(path)
-
-
-def estimate_scene_scale(points: torch.Tensor, sample_size: int = 5000) -> float:
-    """Median nearest-neighbor distance between sparse points -- a natural
-    "local spacing" unit for this scene's (COLMAP-arbitrary) coordinate
-    scale, used both for the initial gaussian scale and to calibrate the
-    means learning rate to that scale rather than a fixed absolute value.
-    """
-    n = points.shape[0]
-    idx = torch.randperm(n, device=points.device)[: min(sample_size, n)]
-    sample = points[idx]
-    d = torch.cdist(sample, sample)
-    d.fill_diagonal_(float("inf"))
-    return d.min(dim=1).values.median().item()
-
-
-def calibrate_initial_scale(
-    points: torch.Tensor,
-    cameras: list,
-    scene_scale: float,
-    target_pixel_radius: float = 3.0,
-    sample_points: int = 3000,
-    sample_cameras: int = 20,
-) -> float:
-    """Scales `scene_scale` so a gaussian of that size projects to roughly
-    `target_pixel_radius` pixels on screen. Needed because the raw
-    world-space nearest-neighbor spacing says nothing about how zoomed-in
-    the cameras are -- for this scene it was ~0.12 world units but the
-    camera sits close enough to a locally dense cluster that it projected
-    to a ~23px radius, so 138k mostly-overlapping oversized gaussians
-    produced an undifferentiated blur with no usable per-gaussian
-    gradient signal.
-    """
-    n = points.shape[0]
-    idx = torch.randperm(n, device=points.device)[: min(sample_points, n)]
-    sample = points[idx]
-
-    cam_idx = torch.randperm(len(cameras))[: min(sample_cameras, len(cameras))]
-    magnifications = []
-    for ci in cam_idx.tolist():
-        cam = cameras[ci]
-        pts_cam = sample.to(cam.R_wc.device) @ cam.R_wc.T + cam.t_wc
-        z = pts_cam[:, 2]
-        in_front = z > 0.1
-        if in_front.any():
-            magnifications.append((cam.fx / z[in_front]).median().item())
-
-    median_magnification = torch.tensor(magnifications).median().item()
-    multiplier = target_pixel_radius / (scene_scale * median_magnification)
-    return scene_scale * multiplier
-
-
 def main() -> None:
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS is not available on this machine.")
@@ -248,8 +196,9 @@ def main() -> None:
     )
 
     # Param group order matters: the training loop updates group 0's LR
-    # (means) each step; the others are constant.
-    def make_optimizer(m: GaussianModel, lr_means: float) -> torch.optim.Optimizer:
+    # (means) each step; the others are constant. The training state
+    # carries each group's current LR over when it rebuilds the optimizer.
+    def make_optimizer(m: GaussianModel) -> torch.optim.Optimizer:
         if m.sh_degree == 0:
             color_group = {"params": [m.raw_colors], "lr": LR_SH}
         else:
@@ -260,7 +209,7 @@ def main() -> None:
             }
         return SparseAdam(
             [
-                {"params": [m.means], "lr": lr_means},
+                {"params": [m.means], "lr": lr_means_init},
                 {"params": [m.raw_scales], "lr": LR_SCALES},
                 {"params": [m.raw_quats], "lr": LR_QUATS},
                 color_group,
@@ -268,7 +217,6 @@ def main() -> None:
             ]
         )
 
-    optimizer = make_optimizer(model, lr_means_init)
     background = torch.zeros(3, device=DEVICE)
 
     def eval_and_save(step: int) -> None:
@@ -280,10 +228,10 @@ def main() -> None:
             psnrs = []
             for k, idx in enumerate(eval_idx):
                 pred = render(
-                    model,
+                    state.model,
                     scene.cameras[idx],
                     background=background,
-                    filter_3d=filter_3d,
+                    filter_3d=state.filter_3d,
                 )
                 torch.mps.synchronize()
                 psnrs.append(psnr(pred, scene.images[idx]).item())
@@ -302,26 +250,32 @@ def main() -> None:
         nonlocal best
         if mean_psnr > best[0]:
             best = (mean_psnr, step)
-            save_ply(model, OUT_DIR / "garden_best.ply", filter_3d=filter_3d)
+            save_ply(
+                state.model, OUT_DIR / "garden_best.ply", filter_3d=state.filter_3d
+            )
 
     best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
 
-    # The 3D filter is per-gaussian, so it has to be recomputed every time
-    # the gaussian set changes -- a stale one is indexed by the old ordering
-    # and would silently band-limit the wrong gaussians.
-    def recompute_filter_3d():
+    # The 3D filter is per-gaussian: the training state carries it across
+    # every change to the gaussian set (children inherit their parent's
+    # radius), and it is rebuilt from scratch every FILTER_3D_REFRESH steps.
+    def compute_filter_3d(m: GaussianModel):
         if not FILTER_3D_SCALE:
             return None
         return compute_3d_filter(
-            model.means.detach(), train_cameras, sampling_scale=FILTER_3D_SCALE
+            m.means.detach(), train_cameras, sampling_scale=FILTER_3D_SCALE
         )
 
     # Calibrated on the first densification round, then held fixed.
     densify_threshold = DENSIFY_GRAD_THRESHOLD
 
-    filter_3d = recompute_filter_3d()
-    if filter_3d is not None:
-        seen = (filter_3d > 0).float().mean().item()
+    # The model, its optimizer, the densification accumulators and the 3D
+    # filter, kept consistent with each other through densify/seed/prune.
+    state = GaussianTrainingState(
+        model, make_optimizer, filter_3d=compute_filter_3d(model)
+    )
+    if state.filter_3d is not None:
+        seen = (state.filter_3d > 0).float().mean().item()
         print(
             f"3D filter: scale {FILTER_3D_SCALE}, {100 * seen:.1f}% of gaussians observed",
             flush=True,
@@ -331,43 +285,39 @@ def main() -> None:
     save_image(scene.images[eval_idx[0]], OUT_DIR / "garden_target_0.png")
     eval_and_save(0)
 
-    grad_accum = torch.zeros(model.num_points, device=DEVICE)
-    grad_count = torch.zeros(model.num_points, device=DEVICE)
-    previous_sh_degree = model.active_sh_degree
+    previous_sh_degree = state.model.active_sh_degree
 
     start = time.time()
     for step in range(1, NUM_ITERS + 1):
         t = step / NUM_ITERS
         lr_means = lr_means_init * (lr_means_final / lr_means_init) ** t
-        optimizer.param_groups[0]["lr"] = lr_means
+        state.optimizer.param_groups[0]["lr"] = lr_means
 
         idx = train_idx[int(torch.randint(len(train_idx), (1,)).item())]
         cam = scene.cameras[idx]
         target = scene.images[idx]
 
-        optimizer.zero_grad()
+        state.optimizer.zero_grad()
         aux = render(
-            model,
+            state.model,
             cam,
             background=background,
             return_aux=True,
-            abs_grad_accum=grad_accum,
-            filter_3d=filter_3d,
+            abs_grad_accum=state.grad_accum,
+            filter_3d=state.filter_3d,
         )
         pred, valid, final_T = aux.image, aux.valid, aux.final_T
         loss = gaussian_splatting_loss(pred, target, lambda_dssim=LAMBDA_DSSIM)
         loss.backward()  # accumulates into grad_accum in place (AbsGS-style, see rendering.render)
         visible = valid > 0.5
-        optimizer.step(visible)
-
-        with torch.no_grad():
-            grad_count[visible] += 1.0
+        state.optimizer.step(visible)
+        state.record_visibility(visible)
 
         if step % 25 == 0 or step == 1:
             torch.mps.synchronize()
             elapsed = time.time() - start
             print(
-                f"step {step:5d}  loss {loss.item():.5f}  n {model.num_points}  "
+                f"step {step:5d}  loss {loss.item():.5f}  n {state.model.num_points}  "
                 f"({elapsed:.1f}s elapsed, {elapsed / step:.2f}s/step)",
                 flush=True,
             )
@@ -375,9 +325,9 @@ def main() -> None:
         if DENSIFY_START <= step <= DENSIFY_STOP and step % DENSIFY_INTERVAL == 0:
             prune_large = bool(OPACITY_RESET_INTERVAL) and step > OPACITY_RESET_INTERVAL
             model, stats = densify_and_prune(
-                model,
-                grad_accum,
-                grad_count,
+                state.model,
+                state.grad_accum,
+                state.grad_count,
                 scene_scale=split_scale,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 max_points=DENSIFY_MAX_POINTS,
@@ -397,12 +347,8 @@ def main() -> None:
                     f"(p{100 * DENSIFY_GRAD_PERCENTILE:.0f} of round 1); fixed from here",
                     flush=True,
                 )
-            optimizer = migrate_optimizer_state(
-                optimizer, make_optimizer(model, lr_means), stats.source_index
-            )
-            grad_accum = torch.zeros(model.num_points, device=DEVICE)
-            grad_count = torch.zeros(model.num_points, device=DEVICE)
-            filter_3d = carry_filter_3d(filter_3d, stats.parent_index)
+            state.replace_model(model, stats.source_index, stats.parent_index)
+            state.reset_accumulators()  # every round starts a new window
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
                 f"(+{stats.n_split} split, +{stats.n_cloned} cloned, -{stats.n_pruned} pruned)",
@@ -411,7 +357,7 @@ def main() -> None:
 
         if SEED_START <= step <= SEED_STOP and step % SEED_INTERVAL == 0:
             model, seed_stats = seed_uncovered_regions(
-                model,
+                state.model,
                 cam,
                 pred.detach(),
                 target,
@@ -423,15 +369,7 @@ def main() -> None:
                 near=0.2,
                 max_points=DENSIFY_MAX_POINTS,
             )
-            if seed_stats.n_seeded > 0:
-                optimizer = migrate_optimizer_state(
-                    optimizer,
-                    make_optimizer(model, lr_means),
-                    seed_stats.source_index,
-                )
-                grad_accum = torch.zeros(model.num_points, device=DEVICE)
-                grad_count = torch.zeros(model.num_points, device=DEVICE)
-                filter_3d = carry_filter_3d(filter_3d, seed_stats.parent_index)
+            state.replace_model(model, seed_stats.source_index, seed_stats.parent_index)
             print(
                 f"  seed @ step {step}: {seed_stats.n_before} -> {seed_stats.n_after} "
                 f"(+{seed_stats.n_seeded} seeded)",
@@ -443,35 +381,32 @@ def main() -> None:
             and step <= OPACITY_RESET_STOP
             and step % OPACITY_RESET_INTERVAL == 0
         ):
-            reset_opacity(model, value=OPACITY_RESET_VALUE, optimizer=optimizer)
+            reset_opacity(
+                state.model, value=OPACITY_RESET_VALUE, optimizer=state.optimizer
+            )
             print(
                 f"  opacity reset @ step {step} (cap {OPACITY_RESET_VALUE})", flush=True
             )
 
         if PRUNE_START <= step <= PRUNE_STOP and step % PRUNE_INTERVAL == 0:
             model, n_pruned, prune_index = prune_low_opacity(
-                model, prune_opacity_thresh=PRUNE_OPACITY_THRESH
+                state.model, prune_opacity_thresh=PRUNE_OPACITY_THRESH
             )
+            # Pruning only removes; survivors keep their filter radius.
+            state.replace_model(model, prune_index)
             if n_pruned > 0:
-                optimizer = migrate_optimizer_state(
-                    optimizer, make_optimizer(model, lr_means), prune_index
-                )
-                grad_accum = torch.zeros(model.num_points, device=DEVICE)
-                grad_count = torch.zeros(model.num_points, device=DEVICE)
-                # Pruning only removes; survivors keep their radius unchanged.
-                filter_3d = carry_filter_3d(filter_3d, prune_index)
                 print(
-                    f"  prune @ step {step}: -{n_pruned} (n={model.num_points})",
+                    f"  prune @ step {step}: -{n_pruned} (n={state.model.num_points})",
                     flush=True,
                 )
 
         if FILTER_3D_SCALE and FILTER_3D_REFRESH and step % FILTER_3D_REFRESH == 0:
             # Means drift between refreshes, so inheritance is only an
             # approximation; rebuild from the cameras periodically.
-            filter_3d = recompute_filter_3d()
+            state.filter_3d = compute_filter_3d(state.model)
 
         if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
-            active = model.increase_sh_degree()
+            active = state.model.increase_sh_degree()
             if active != previous_sh_degree:
                 print(f"  SH degree -> {active} @ step {step}", flush=True)
                 previous_sh_degree = active
@@ -481,7 +416,7 @@ def main() -> None:
 
     eval_and_save(NUM_ITERS)
     ply_path = OUT_DIR / "garden.ply"
-    save_ply(model, ply_path, filter_3d=filter_3d)
+    save_ply(state.model, ply_path, filter_3d=state.filter_3d)
     print(
         f"Done. Renders saved to {OUT_DIR}, final scene saved to {ply_path}", flush=True
     )

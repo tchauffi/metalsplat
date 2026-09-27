@@ -127,7 +127,13 @@ from metalsplat.losses import (
     normal_consistency_loss,
     psnr,
 )
-from metalsplat.optim import SparseAdam, migrate_optimizer_state, sh_lr_scale
+from metalsplat.optim import SparseAdam, sh_lr_scale
+from metalsplat.training import (
+    GaussianTrainingState,
+    calibrate_initial_scale,
+    estimate_scene_scale,
+    save_image,
+)
 
 DEVICE = "mps"
 DATA_ROOT = Path(__file__).parent.parent / "data" / "garden"
@@ -296,59 +302,6 @@ def _as_float(x: torch.Tensor | float) -> float:
     return x.item() if torch.is_tensor(x) else float(x)
 
 
-def save_image(tensor: torch.Tensor, path: Path) -> None:
-    import numpy as np
-    from PIL import Image
-
-    arr = (tensor.clamp(0, 1).detach().cpu().numpy() * 255).astype(np.uint8)
-    Image.fromarray(arr).save(path)
-
-
-def estimate_scene_scale(points: torch.Tensor, sample_size: int = 5000) -> float:
-    """Median nearest-neighbor distance between sparse points -- see
-    train_garden.py's identical helper for the full rationale (this
-    script's module docstring explains why it stands in for the paper's
-    scene-normalization-calibrated position learning rate).
-    """
-    n = points.shape[0]
-    idx = torch.randperm(n, device=points.device)[: min(sample_size, n)]
-    sample = points[idx]
-    d = torch.cdist(sample, sample)
-    d.fill_diagonal_(float("inf"))
-    return d.min(dim=1).values.median().item()
-
-
-def calibrate_initial_scale(
-    points: torch.Tensor,
-    cameras: list,
-    scene_scale: float,
-    target_pixel_radius: float = 3.0,
-    sample_points: int = 3000,
-    sample_cameras: int = 20,
-) -> float:
-    """Scales `scene_scale` so a gaussian of that size projects to roughly
-    `target_pixel_radius` pixels on screen -- see train_garden.py's
-    identical helper for the full rationale.
-    """
-    n = points.shape[0]
-    idx = torch.randperm(n, device=points.device)[: min(sample_points, n)]
-    sample = points[idx]
-
-    cam_idx = torch.randperm(len(cameras))[: min(sample_cameras, len(cameras))]
-    magnifications = []
-    for ci in cam_idx.tolist():
-        cam = cameras[ci]
-        pts_cam = sample.to(cam.R_wc.device) @ cam.R_wc.T + cam.t_wc
-        z = pts_cam[:, 2]
-        in_front = z > 0.1
-        if in_front.any():
-            magnifications.append((cam.fx / z[in_front]).median().item())
-
-    median_magnification = torch.tensor(magnifications).median().item()
-    multiplier = target_pixel_radius / (scene_scale * median_magnification)
-    return scene_scale * multiplier
-
-
 def main() -> None:
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS is not available on this machine.")
@@ -416,7 +369,7 @@ def main() -> None:
     # Five param groups, matching the paper's training_setup exactly: only
     # the first (means/"xyz") gets its learning rate scheduled per step,
     # the rest stay constant for the whole run.
-    def make_optimizer(m: Gaussian2DModel, lr_means: float) -> torch.optim.Optimizer:
+    def make_optimizer(m: Gaussian2DModel) -> torch.optim.Optimizer:
         if m.sh_degree == 0:
             color_group = {"params": [m.raw_colors], "lr": FEATURE_LR}
         else:
@@ -427,7 +380,7 @@ def main() -> None:
             }
         return SparseAdam(
             [
-                {"params": [m.means], "lr": lr_means},
+                {"params": [m.means], "lr": lr_means_init},
                 color_group,
                 {"params": [m.raw_scales], "lr": SCALING_LR},
                 {"params": [m.raw_quats], "lr": ROTATION_LR},
@@ -435,7 +388,13 @@ def main() -> None:
             ]
         )
 
-    optimizer = make_optimizer(model, lr_means_init)
+    # The model, its optimizer and the densification accumulators, kept
+    # consistent with each other through densify/prune. Covered-pixel
+    # counts are only collected when they are used -- see
+    # PIXEL_NORMALIZED_DENSIFY and densify2dgs's docstring.
+    state = GaussianTrainingState(
+        model, make_optimizer, track_pixel_count=PIXEL_NORMALIZED_DENSIFY
+    )
     background = torch.zeros(3, device=DEVICE)
 
     def eval_and_save(step: int) -> None:
@@ -443,7 +402,10 @@ def main() -> None:
             psnrs = []
             for k, idx in enumerate(eval_idx):
                 aux = render_2dgs(
-                    model, scene.cameras[idx], background=background, return_aux=True
+                    state.model,
+                    scene.cameras[idx],
+                    background=background,
+                    return_aux=True,
                 )
                 torch.mps.synchronize()
                 psnrs.append(psnr(aux.image, scene.images[idx]).item())
@@ -482,7 +444,7 @@ def main() -> None:
         nonlocal best
         if mean_psnr > best[0]:
             best = (mean_psnr, step)
-            save_ply_2dgs(model, OUT_DIR / "garden_2dgs_best.ply")
+            save_ply_2dgs(state.model, OUT_DIR / "garden_2dgs_best.ply")
 
     best = (float("-inf"), 0)  # (psnr, step) of the best checkpoint so far
 
@@ -490,34 +452,29 @@ def main() -> None:
     save_image(scene.images[eval_idx[0]], OUT_DIR / "garden_2dgs_target_0.png")
     eval_and_save(0)
 
-    grad_accum = torch.zeros(model.num_points, device=DEVICE)
-    grad_count = torch.zeros(model.num_points, device=DEVICE)
-    # Covered-pixel counts, the per-pixel normalizer for grad_accum -- see
-    # PIXEL_NORMALIZED_DENSIFY and densify2dgs's docstring.
-    pixel_count = torch.zeros(model.num_points, device=DEVICE)
     # Calibrated on the first densification round, then held fixed -- see
     # module docstring.
     densify_threshold = None
 
-    previous_sh_degree = model.active_sh_degree
+    previous_sh_degree = state.model.active_sh_degree
     start = time.time()
     for step in range(1, NUM_ITERS + 1):
         t = step / NUM_ITERS
         lr_means = lr_means_init * (lr_means_final / lr_means_init) ** t
-        optimizer.param_groups[0]["lr"] = lr_means
+        state.optimizer.param_groups[0]["lr"] = lr_means
 
         idx = train_idx[int(torch.randint(len(train_idx), (1,)).item())]
         cam = scene.cameras[idx]
         target = scene.images[idx]
 
-        optimizer.zero_grad()
+        state.optimizer.zero_grad()
         aux = render_2dgs(
-            model,
+            state.model,
             cam,
             background=background,
             return_aux=True,
-            abs_grad_accum=grad_accum,
-            pixel_count_accum=pixel_count if PIXEL_NORMALIZED_DENSIFY else None,
+            abs_grad_accum=state.grad_accum,
+            pixel_count_accum=state.pixel_count,
         )
         photo_loss = gaussian_splatting_loss(
             aux.image, target, lambda_dssim=LAMBDA_DSSIM
@@ -547,16 +504,14 @@ def main() -> None:
             loss = loss + dist_loss
         loss.backward()  # accumulates into grad_accum in place (AbsGS-style)
         visible = aux.valid > 0.5
-        optimizer.step(visible)
-
-        with torch.no_grad():
-            grad_count[visible] += 1.0
+        state.optimizer.step(visible)
+        state.record_visibility(visible)
 
         if step % 25 == 0 or step == 1:
             torch.mps.synchronize()
             elapsed = time.time() - start
             print(
-                f"step {step:5d}  loss {loss.item():.5f}  n {model.num_points}  "
+                f"step {step:5d}  loss {loss.item():.5f}  n {state.model.num_points}  "
                 f"(photo {photo_loss.item():.5f}  normal {_as_float(normal_loss):.5f}  "
                 f"dist {_as_float(dist_loss):.5f})  "
                 f"({elapsed:.1f}s elapsed, {elapsed / step:.2f}s/step)",
@@ -565,10 +520,10 @@ def main() -> None:
 
         if DENSIFY_START <= step <= DENSIFY_STOP and step % DENSIFY_INTERVAL == 0:
             model, stats = densify_and_prune_2dgs(
-                model,
-                grad_accum,
-                grad_count,
-                pixel_count=pixel_count if PIXEL_NORMALIZED_DENSIFY else None,
+                state.model,
+                state.grad_accum,
+                state.grad_count,
+                pixel_count=state.pixel_count,
                 grad_percentile=DENSIFY_GRAD_PERCENTILE,
                 prune_opacity_thresh=PRUNE_OPACITY_THRESH,
                 grad_threshold=densify_threshold,
@@ -591,12 +546,8 @@ def main() -> None:
                     f"(p{100 * DENSIFY_GRAD_PERCENTILE:.0f} of round 1); fixed from here",
                     flush=True,
                 )
-            optimizer = migrate_optimizer_state(
-                optimizer, make_optimizer(model, lr_means), stats.source_index
-            )
-            grad_accum = torch.zeros(model.num_points, device=DEVICE)
-            grad_count = torch.zeros(model.num_points, device=DEVICE)
-            pixel_count = torch.zeros(model.num_points, device=DEVICE)
+            state.replace_model(model, stats.source_index, stats.parent_index)
+            state.reset_accumulators()  # every round starts a new window
             print(
                 f"  densify @ step {step}: {stats.n_before} -> {stats.n_after} "
                 f"(+{stats.n_split} split, +{stats.n_cloned} cloned, -{stats.n_pruned} pruned)",
@@ -608,29 +559,24 @@ def main() -> None:
             and step % OPACITY_RESET_INTERVAL == 0
             and step < OPACITY_STOP_RESET
         ):
-            reset_opacity(model, optimizer=optimizer)
+            reset_opacity(state.model, optimizer=state.optimizer)
             print(f"  opacity reset @ step {step}", flush=True)
 
         # Standalone prune: keeps running after DENSIFY_STOP, unlike
         # densify_and_prune_2dgs's own inline prune -- see module docstring.
         if PRUNE_START <= step <= PRUNE_STOP and step % PRUNE_INTERVAL == 0:
             model, n_pruned, prune_index = prune_low_opacity_2dgs(
-                model, prune_opacity_thresh=STANDALONE_PRUNE_OPACITY_THRESH
+                state.model, prune_opacity_thresh=STANDALONE_PRUNE_OPACITY_THRESH
             )
+            state.replace_model(model, prune_index)
             if n_pruned > 0:
-                optimizer = migrate_optimizer_state(
-                    optimizer, make_optimizer(model, lr_means), prune_index
-                )
-                grad_accum = torch.zeros(model.num_points, device=DEVICE)
-                grad_count = torch.zeros(model.num_points, device=DEVICE)
-                pixel_count = torch.zeros(model.num_points, device=DEVICE)
                 print(
-                    f"  prune @ step {step}: -{n_pruned} (n={model.num_points})",
+                    f"  prune @ step {step}: -{n_pruned} (n={state.model.num_points})",
                     flush=True,
                 )
 
         if SH_DEGREE_INTERVAL and step % SH_DEGREE_INTERVAL == 0:
-            active = model.increase_sh_degree()
+            active = state.model.increase_sh_degree()
             if active != previous_sh_degree:
                 print(f"  SH degree -> {active} @ step {step}", flush=True)
                 previous_sh_degree = active
@@ -640,9 +586,9 @@ def main() -> None:
 
     eval_and_save(NUM_ITERS)
     ply_path = OUT_DIR / "garden_2dgs.ply"
-    save_ply_2dgs(model, ply_path)
+    save_ply_2dgs(state.model, ply_path)
     print(
-        f"Done. {model.num_points} gaussians. Renders saved to {OUT_DIR}, "
+        f"Done. {state.model.num_points} gaussians. Renders saved to {OUT_DIR}, "
         f"final scene saved to {ply_path}.",
         flush=True,
     )
