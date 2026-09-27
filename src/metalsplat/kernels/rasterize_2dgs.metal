@@ -64,11 +64,9 @@ inline float ray_splat_alpha(
     // `FilterSize = 0.707106 // sqrt(2)/2` / `FilterInvSquare = 2.0f`.
     // Sub-pixel by design -- and since `rho` below is a min(), it is a
     // lower bound on every splat's footprint, so widening it stops the
-    // optimizer sharpening detail by shrinking a splat. Deliberately
-    // *not* the projection's covariance dilation, a px^2 quantity for the
-    // EWA/tile-culling bound: sharing one number made neither tunable
-    // without breaking the other. See rasterize_2dgs_ref's
-    // DEFAULT_FILTER_SIZE.
+    // optimizer sharpening detail by shrinking a splat. It widens every
+    // splat's footprint, so the projection's tile rectangles include it
+    // too. See rasterize_2dgs_ref's DEFAULT_FILTER_SIZE.
     float dx = px - mean2d.x, dy = py - mean2d.y;
     float filter_var = filter_size * filter_size;
     float rho_screen = (dx * dx + dy * dy) / filter_var;

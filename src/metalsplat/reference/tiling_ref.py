@@ -5,11 +5,14 @@ Kept as the reference rather than deleted -- it is what the kernel version
 is tested against, and it runs on any device (including CPU), so it doubles
 as a fallback backend.
 
-Given projected gaussians (means2d, depths, radii, valid), this builds:
+Given each gaussian's screen rectangle, depth and validity, this builds:
 - a flat list of (gaussian_id, tile_id) pairs, one per tile a gaussian's
-  dilated bounding box touches, sorted by (tile_id, depth) so that within
-  a tile the gaussians are front-to-back;
+  rectangle touches, sorted by (tile_id, depth) so that within a tile the
+  gaussians are front-to-back;
 - per-tile [start, end) index ranges into that sorted list.
+
+`bin_and_sort_rects` takes the rectangles directly; `bin_and_sort_gaussians`
+derives them from a 3DGS conic first (`ellipse_rects`).
 
 This whole stage is non-differentiable (radii/tile membership are discrete/
 structural, matching gsplat), so it deliberately operates outside autograd.
@@ -61,6 +64,51 @@ class TileBinningResult:
     )  # (tiles_x * tiles_y, 2) int32, [start, end) into sorted_gaussian_ids
 
 
+# The rectangle a culled gaussian gets: xmax < xmin, so it touches no tile.
+EMPTY_RECT = (0.0, 0.0, -1.0, -1.0)
+
+
+def ellipse_rects(
+    means2d: torch.Tensor,  # (N, 2)
+    conics: torch.Tensor,  # (N, 3) a, b, c -- inverse 2D covariance
+    radii: torch.Tensor,  # (N,)
+    valid: torch.Tensor,  # (N,) bool-ish
+    extent: torch.Tensor,  # (N,) half-extent in sigmas, see sigma_extent
+) -> torch.Tensor:
+    """(N, 4) xmin, ymin, xmax, ymax bounding each gaussian's conic ellipse
+    `extent` sigmas out; EMPTY_RECT for a culled one (invalid, zero radius,
+    or too faint to reach the alpha cutoff anywhere).
+
+    Per-axis half-extents from the conic (the inverse 2D covariance), not a
+    circle of radius extent*sqrt(lambda_max). Bounding an elongated gaussian
+    by its circumscribed circle gives a box as wide as the splat is long; on
+    the garden scene the tight box produces 43% fewer (gaussian, tile)
+    pairs.
+    """
+    valid_mask = valid > 0.5 if valid.dtype != torch.bool else valid
+    culled = ~(valid_mask & (radii > 0) & (extent > 0))
+
+    det = conics[:, 0] * conics[:, 2] - conics[:, 1] * conics[:, 1]
+    det_safe = det.clamp_min(1e-12)
+    half_w = extent * (conics[:, 2] / det_safe).clamp_min(0.0).sqrt()
+    half_h = extent * (conics[:, 0] / det_safe).clamp_min(0.0).sqrt()
+    degenerate = det <= 0
+    half_w = torch.where(degenerate, torch.zeros_like(half_w), half_w)
+    half_h = torch.where(degenerate, torch.zeros_like(half_h), half_h)
+
+    rects = torch.stack(
+        [
+            means2d[:, 0] - half_w,
+            means2d[:, 1] - half_h,
+            means2d[:, 0] + half_w,
+            means2d[:, 1] + half_h,
+        ],
+        dim=-1,
+    )
+    empty = torch.tensor(EMPTY_RECT, device=rects.device, dtype=rects.dtype)
+    return torch.where(culled[:, None], empty, rects)
+
+
 @torch.no_grad()
 def bin_and_sort_gaussians(
     means2d: torch.Tensor,  # (N, 2)
@@ -73,17 +121,27 @@ def bin_and_sort_gaussians(
     tile_size: int = DEFAULT_TILE_SIZE,
     opacities: torch.Tensor | None = None,  # (N,), see sigma_extent
 ) -> TileBinningResult:
-    device = means2d.device
-    n = means2d.shape[0]
+    extent = sigma_extent(opacities, means2d.shape[0], means2d.device)
+    rects = ellipse_rects(means2d, conics, radii, valid, extent)
+    return bin_and_sort_rects(rects, depths, valid, img_width, img_height, tile_size)
+
+
+@torch.no_grad()
+def bin_and_sort_rects(
+    rects: torch.Tensor,  # (N, 4) xmin, ymin, xmax, ymax; empty if xmax < xmin
+    depths: torch.Tensor,  # (N,)
+    valid: torch.Tensor,  # (N,) bool-ish
+    img_width: int,
+    img_height: int,
+    tile_size: int = DEFAULT_TILE_SIZE,
+) -> TileBinningResult:
+    device = rects.device
+    n = rects.shape[0]
     tiles_x = (img_width + tile_size - 1) // tile_size
     tiles_y = (img_height + tile_size - 1) // tile_size
     num_tiles = tiles_x * tiles_y
 
-    valid_mask = valid > 0.5 if valid.dtype != torch.bool else valid
-    extent = sigma_extent(opacities, n, device)
-    valid_mask = valid_mask & (radii > 0) & (extent > 0)
-
-    if n == 0 or not bool(valid_mask.any()):
+    def _empty() -> TileBinningResult:
         return TileBinningResult(
             tile_size=tile_size,
             tiles_x=tiles_x,
@@ -92,34 +150,28 @@ def bin_and_sort_gaussians(
             tile_bins=torch.zeros(num_tiles, 2, dtype=torch.int32, device=device),
         )
 
+    valid_mask = valid > 0.5 if valid.dtype != torch.bool else valid
+    # `>=` is False for NaN, so a NaN rectangle is empty too.
+    non_empty = (rects[:, 2] >= rects[:, 0]) & (rects[:, 3] >= rects[:, 1])
+    valid_mask = valid_mask & non_empty
+    if n == 0 or not bool(valid_mask.any()):
+        return _empty()
+
     idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)  # (K,)
-    means2d_v = means2d[idx]
     depths_v = depths[idx]
 
-    # Per-axis half-extents (extent sigmas, see sigma_extent) from the conic
-    # (the inverse 2D covariance), not a circle of radius
-    # extent*sqrt(lambda_max). Bounding an
-    # elongated gaussian by its circumscribed circle gives a box as wide as
-    # the splat is long; on the garden scene the tight box produces 43%
-    # fewer (gaussian, tile) pairs.
-    conics_v = conics[idx]
-    det = conics_v[:, 0] * conics_v[:, 2] - conics_v[:, 1] * conics_v[:, 1]
-    det_safe = det.clamp_min(1e-12)
-    extent_v = extent[idx]
-    half_w = extent_v * (conics_v[:, 2] / det_safe).clamp_min(0.0).sqrt()
-    half_h = extent_v * (conics_v[:, 0] / det_safe).clamp_min(0.0).sqrt()
-    degenerate = det <= 0
-    half_w = torch.where(degenerate, torch.zeros_like(half_w), half_w)
-    half_h = torch.where(degenerate, torch.zeros_like(half_h), half_h)
+    # Clamp to just outside the tile grid before flooring (as the kernel
+    # does), so an unbounded rectangle cannot overflow the integer
+    # conversion; anything entirely off one side stays entirely off it.
+    grid_w, grid_h = float(tiles_x * tile_size), float(tiles_y * tile_size)
+    r = rects[idx]
+    x0, x1 = r[:, 0].clamp(-1.0, grid_w), r[:, 2].clamp(-1.0, grid_w)
+    y0, y1 = r[:, 1].clamp(-1.0, grid_h), r[:, 3].clamp(-1.0, grid_h)
 
-    min_tx = torch.clamp(((means2d_v[:, 0] - half_w) / tile_size).floor().long(), min=0)
-    max_tx = torch.clamp(
-        ((means2d_v[:, 0] + half_w) / tile_size).floor().long(), max=tiles_x - 1
-    )
-    min_ty = torch.clamp(((means2d_v[:, 1] - half_h) / tile_size).floor().long(), min=0)
-    max_ty = torch.clamp(
-        ((means2d_v[:, 1] + half_h) / tile_size).floor().long(), max=tiles_y - 1
-    )
+    min_tx = torch.clamp((x0 / tile_size).floor().long(), min=0)
+    max_tx = torch.clamp((x1 / tile_size).floor().long(), max=tiles_x - 1)
+    min_ty = torch.clamp((y0 / tile_size).floor().long(), min=0)
+    max_ty = torch.clamp((y1 / tile_size).floor().long(), max=tiles_y - 1)
 
     tiles_touched_x = (max_tx - min_tx + 1).clamp(min=0)
     tiles_touched_y = (max_ty - min_ty + 1).clamp(min=0)
@@ -127,18 +179,11 @@ def bin_and_sort_gaussians(
 
     keep = counts > 0
     if not bool(keep.any()):
-        return TileBinningResult(
-            tile_size=tile_size,
-            tiles_x=tiles_x,
-            tiles_y=tiles_y,
-            sorted_gaussian_ids=torch.empty(0, dtype=torch.int32, device=device),
-            tile_bins=torch.zeros(num_tiles, 2, dtype=torch.int32, device=device),
-        )
+        return _empty()
     idx = idx[keep]
     depths_v = depths_v[keep]
-    min_tx, max_tx = min_tx[keep], max_tx[keep]
-    min_ty, max_ty = min_ty[keep], max_ty[keep]
-    tiles_touched_x, tiles_touched_y = tiles_touched_x[keep], tiles_touched_y[keep]
+    min_tx, min_ty = min_tx[keep], min_ty[keep]
+    tiles_touched_x = tiles_touched_x[keep]
     counts = counts[keep]
 
     total_pairs = int(counts.sum().item())

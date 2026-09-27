@@ -1,11 +1,15 @@
 """Tile binning and sorting for the rasterizer, using Metal kernels for the
 per-pair work and torch's sort for the ordering.
 
-Given projected gaussians (means2d, depths, radii, valid), this builds:
+Given each gaussian's screen rectangle, depth and validity, this builds:
 - a flat list of (gaussian_id, tile_id) pairs, one per tile a gaussian's
-  dilated bounding box touches, sorted by (tile_id, depth) so that within
-  a tile the gaussians are front-to-back;
+  rectangle touches, sorted by (tile_id, depth) so that within a tile the
+  gaussians are front-to-back;
 - per-tile [start, end) index ranges into that sorted list.
+
+`bin_and_sort_rects` takes the rectangles directly (2DGS computes exact
+ones in its projection); `bin_and_sort_gaussians` derives them from 3DGS's
+conic first.
 
 This whole stage is non-differentiable (radii/tile membership are discrete/
 structural, matching gsplat), so it deliberately operates outside autograd.
@@ -32,7 +36,12 @@ from metalsplat.reference.tiling_ref import (
     sigma_extent,
 )
 
-__all__ = ["DEFAULT_TILE_SIZE", "TileBinningResult", "bin_and_sort_gaussians"]
+__all__ = [
+    "DEFAULT_TILE_SIZE",
+    "TileBinningResult",
+    "bin_and_sort_gaussians",
+    "bin_and_sort_rects",
+]
 
 
 def _empty(tile_size: int, tiles_x: int, tiles_y: int, device) -> TileBinningResult:
@@ -57,10 +66,10 @@ def bin_and_sort_gaussians(
     tile_size: int = DEFAULT_TILE_SIZE,
     opacities: torch.Tensor | None = None,  # (N,); see tiling_ref.sigma_extent
 ) -> TileBinningResult:
+    """3DGS binning: each gaussian's rectangle is its conic ellipse, out to
+    the opacity-aware extent (see tiling_ref.sigma_extent)."""
     device = means2d.device
     n = means2d.shape[0]
-    tiles_x = (img_width + tile_size - 1) // tile_size
-    tiles_y = (img_height + tile_size - 1) // tile_size
 
     if device.type != "mps":  # CPU/other: fall back to the reference
         from metalsplat.reference.tiling_ref import bin_and_sort_gaussians as ref
@@ -77,30 +86,54 @@ def bin_and_sort_gaussians(
             opacities,
         )
 
+    valid_c = _as_float_flags(valid)
+    rects = torch.empty(n, 4, dtype=torch.float32, device=device)
+    if n > 0:
+        _loader.load("tiling").ellipse_rects(
+            means2d.contiguous().float(),
+            conics.contiguous().float(),
+            radii.contiguous().float(),
+            valid_c,
+            sigma_extent(opacities, n, device).contiguous(),
+            rects,
+            threads=n,
+        )
+    return bin_and_sort_rects(rects, depths, valid_c, img_width, img_height, tile_size)
+
+
+@torch.no_grad()
+def bin_and_sort_rects(
+    rects: torch.Tensor,  # (N, 4) xmin, ymin, xmax, ymax in pixels; empty if xmax < xmin
+    depths: torch.Tensor,  # (N,)
+    valid: torch.Tensor,  # (N,) bool-ish
+    img_width: int,
+    img_height: int,
+    tile_size: int = DEFAULT_TILE_SIZE,
+) -> TileBinningResult:
+    """Bins each valid gaussian into every tile its rectangle touches."""
+    device = rects.device
+    n = rects.shape[0]
+    tiles_x = (img_width + tile_size - 1) // tile_size
+    tiles_y = (img_height + tile_size - 1) // tile_size
+
+    if device.type != "mps":  # CPU/other: fall back to the reference
+        from metalsplat.reference.tiling_ref import bin_and_sort_rects as ref
+
+        return ref(rects, depths, valid, img_width, img_height, tile_size)
+
     if n == 0:
         return _empty(tile_size, tiles_x, tiles_y, device)
 
-    means2d_c = means2d.contiguous().float()
-    conics_c = conics.contiguous().float()
+    rects_c = rects.contiguous().float()
     depths_c = depths.contiguous().float()
-    radii_c = radii.contiguous().float()
-    valid_c = (
-        (valid > 0.5).to(torch.float32).contiguous()
-        if valid.dtype == torch.bool
-        else valid.contiguous().float()
-    )
-
-    extent = sigma_extent(opacities, n, device).contiguous()
+    valid_c = _as_float_flags(valid)
 
     lib = _loader.load("tiling")
 
     counts = torch.empty(n, dtype=torch.int32, device=device)
     lib.tile_counts(
-        means2d_c,
-        conics_c,
-        radii_c,
+        rects_c,
         valid_c,
-        extent,
         tiles_x,
         tiles_y,
         float(tile_size),
@@ -120,12 +153,9 @@ def bin_and_sort_gaussians(
     keys = torch.empty(total_pairs, dtype=torch.int64, device=device)
     gaussian_ids = torch.empty(total_pairs, dtype=torch.int32, device=device)
     lib.tile_pairs(
-        means2d_c,
-        conics_c,
+        rects_c,
         depths_c,
-        radii_c,
         valid_c,
-        extent,
         offsets,
         tiles_x,
         tiles_y,
@@ -157,3 +187,10 @@ def bin_and_sort_gaussians(
         sorted_gaussian_ids=sorted_gaussian_ids,
         tile_bins=tile_bins,
     )
+
+
+def _as_float_flags(valid: torch.Tensor) -> torch.Tensor:
+    """`valid` as the contiguous 0.0/1.0 float32 buffer the kernels read."""
+    if valid.dtype == torch.bool:
+        return valid.to(torch.float32).contiguous()
+    return valid.contiguous().float()

@@ -82,12 +82,8 @@ DISTORTION_FAR = 100.0
 # detail by shrinking a splat, and densification answers with overlapping
 # larger splats instead; 2.0 here (8x this variance) visibly does that.
 #
-# Deliberately separate from the projection's `eps2d`: that one dilates
-# the 2D *covariance* (px^2) for the EWA/tile-culling bound, this one is a
-# filter width (px) for an isotropic screen-space gaussian. They were the
-# same number here once -- eps2d = 0.3 read as a variance is sigma
-# ~0.548px against this 0.707px, so the old behaviour was slightly tight
-# rather than wildly off, and neither knob could move without the other.
+# It widens every splat's screen footprint, so project_2dgs_ref's tile
+# rectangles (surfel_rects) must use the same value.
 DEFAULT_FILTER_SIZE = 0.707106  # sqrt(2) / 2
 
 

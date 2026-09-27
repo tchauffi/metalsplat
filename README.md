@@ -279,9 +279,10 @@ rows are identical by construction, the whole transform collapses to **9
 independent floats** per gaussian, which is what the projection stage
 hands the rasterizer.
 
-The 3DGS EWA path is still computed, but only to bound each splat's screen
-footprint for tile culling, so the existing tiling stage is reused
-unmodified.
+The same 9 floats also give each splat's exact screen footprint for tile
+binning: the perspective image of its alpha-cutoff ellipse is itself a
+conic with a closed-form bounding box, joined with the screen-space
+filter's disk. The shared tiling stage bins those rectangles directly.
 
 ### The two regularizers
 
@@ -360,13 +361,12 @@ automatically.
   camera at render time). Color/SH parameterization is shared with
   `GaussianModel` via `metalsplat/sh_color.py`.
 - **`metalsplat/ops/project_2dgs.py`** (Metal kernel,
-  `kernels/project_2dgs.metal`): reuses the exact 3DGS EWA/conic math
-  (treating the missing 3rd scale as a fixed small epsilon) for the
-  tile-culling bound, so `metalsplat/ops/tiling.py` is reused completely
-  unmodified for tile binning. Additionally outputs the 9 independent
-  entries of `M = W @ H` (the composition of the camera's projection with
-  the local tangent-plane-to-world embedding) and the camera-facing
-  normal, both consumed by the rasterizer's exact per-pixel intersection.
+  `kernels/project_2dgs.metal`): outputs the 9 independent entries of
+  `M = W @ H` (the composition of the camera's projection with the local
+  tangent-plane-to-world embedding) and the camera-facing normal, both
+  consumed by the rasterizer's exact per-pixel intersection, plus each
+  splat's exact, opacity-aware screen rectangle, which
+  `metalsplat/ops/tiling.py` bins directly.
 - **`metalsplat/ops/rasterize_2dgs.py`** (Metal kernel,
   `kernels/rasterize_2dgs.metal`): same tile-based front-to-back
   compositing structure as 3DGS's rasterizer, but per-pixel alpha comes

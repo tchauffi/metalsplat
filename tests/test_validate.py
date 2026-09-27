@@ -37,15 +37,13 @@ def _splats_2d(n=8, size=32):
         fx=size, fy=size, cx=size / 2, cy=size / 2, img_width=size, img_height=size
     ).to(DEV)
     cam.t_wc = torch.tensor([0.0, 0.0, 3.0], device=DEV)
-    means2d, depths, conics, radii, valid, _, transform, normal = (
-        project_gaussians_2dgs(
-            model.means, model.scales, model.quats, cam.R_wc, cam.t_wc,
-            cam.fx, cam.fy, cam.cx, cam.cy, size, size,
-        )
+    means2d, depths, rects, valid, transform, normal = project_gaussians_2dgs(
+        model.means, model.scales, model.quats, cam.R_wc, cam.t_wc,
+        cam.fx, cam.fy, cam.cx, cam.cy, size, size,
     )  # fmt: skip
     args = (
         means2d, transform, normal, model.opacities, model.colors, depths,
-        radii, valid, conics, size, size,
+        rects, valid, size, size,
     )  # fmt: skip
     return args, n
 

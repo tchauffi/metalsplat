@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from metalsplat.reference.project_2dgs_ref import project_gaussians_2dgs
+from metalsplat.reference.rasterize_2dgs_ref import rasterize_gaussians_2dgs
+from metalsplat.reference.tiling_ref import MAX_SIGMA_EXTENT
 from metalsplat.utils.quaternion import quat_to_rotmat
 
 IDENTITY_R = torch.eye(3)
@@ -29,8 +32,13 @@ def test_centered_disk_projects_to_principal_point():
     assert bool(out.valid[0])
     assert torch.allclose(out.means2d[0], torch.tensor([50.0, 50.0]), atol=1e-4)
     assert torch.allclose(out.depths[0], torch.tensor(5.0))
-    assert out.radii[0] > 0
     assert torch.isfinite(out.transform).all()
+    # Face-on, the exact footprint is a circle of radius c * f * s / z at
+    # the max cutoff c: the bound is tight, not inflated by a margin.
+    h = MAX_SIGMA_EXTENT * 100.0 * 0.1 / 5.0
+    assert torch.allclose(
+        out.rects[0], torch.tensor([50.0 - h, 50.0 - h, 50.0 + h, 50.0 + h]), atol=1e-3
+    )
 
 
 def test_disk_behind_camera_is_culled():
@@ -53,7 +61,7 @@ def test_disk_behind_camera_is_culled():
     )
 
     assert not bool(out.valid[0])
-    assert out.radii[0] == 0
+    assert out.rects[0, 2] < out.rects[0, 0]  # empty: touches no tile
 
 
 def test_normal_flipped_to_face_camera():
@@ -169,3 +177,75 @@ def test_ray_splat_intersection_matches_independent_ray_plane_calculation():
         assert torch.allclose(u, u_expected, atol=1e-4)
         assert torch.allclose(v, v_expected, atol=1e-4)
         assert torch.allclose(z, z_expected, atol=1e-4)
+
+
+def _tilted_quats(n, g):
+    raw = torch.randn(n, 4, generator=g)
+    return raw / raw.norm(dim=-1, keepdim=True)
+
+
+# Seeds 4, 15, 31 and 33 each contain a splat that the EWA x 2.5 bound this
+# replaced cut off (320 composited pixels outside its box across the four).
+@pytest.mark.parametrize("seed", [0, 1, 4, 15, 31, 33])
+def test_rect_covers_every_pixel_the_rasterizer_composites(seed):
+    """The binning rectangle is only safe if no splat composites outside
+    it -- that would cut the splat off at a tile border. Checked per splat
+    against the brute-force reference rasterizer, on large, arbitrarily
+    tilted splats close to the camera: exactly where the EWA (local-affine)
+    bound this replaced underestimated the perspective footprint.
+    """
+    g = torch.Generator().manual_seed(seed)
+    n, size, f = 12, 48, 40.0
+    z = torch.rand(n, generator=g) * 2.5 + 0.5
+    xy = (torch.rand(n, 2, generator=g) * 2 - 1) * 0.6 * z[:, None]
+    means = torch.cat([xy, z[:, None]], dim=-1)
+    scales = torch.rand(n, 2, generator=g) * 0.4 + 0.02
+    quats = _tilted_quats(n, g)
+    opacities = torch.rand(n, generator=g) * 0.9 + 0.05
+
+    out = project_gaussians_2dgs(
+        means, scales, quats, IDENTITY_R, ZERO_T, f, f, size / 2, size / 2,
+        size, size, opacities=opacities,
+    )  # fmt: skip
+    ys, xs = torch.meshgrid(
+        torch.arange(size) + 0.5, torch.arange(size) + 0.5, indexing="ij"
+    )
+    colors = torch.ones(n, 3)
+    checked = 0
+    for i in range(n):
+        if not bool(out.valid[i]):
+            continue
+        only_i = torch.zeros(n, dtype=torch.bool)
+        only_i[i] = True
+        final_t = rasterize_gaussians_2dgs(
+            out.means2d, out.depths, out.transform, out.normal, opacities, colors,
+            only_i, size, size,
+        )["final_T"]  # fmt: skip
+        drawn = final_t < 1.0
+        x0, y0, x1, y1 = out.rects[i].tolist()
+        inside = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+        assert not bool((drawn & ~inside).any()), f"splat {i} drawn outside its rect"
+        checked += int(drawn.any())
+    assert checked >= n // 2  # most splats actually reach the frame
+
+
+def test_disk_reaching_the_camera_plane_gets_the_whole_frame():
+    # A 1m disk 0.5m ahead, tilted 80 degrees off face-on: its 3.33-sigma
+    # ellipse extends behind the camera, so its perspective image is
+    # unbounded and only the whole frame is a safe bound.
+    angle = torch.tensor(80.0).deg2rad()
+    quat = torch.stack(
+        [
+            torch.cos(angle / 2),
+            torch.sin(angle / 2),
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        ]
+    )[None]
+    out = project_gaussians_2dgs(
+        torch.tensor([[0.0, 0.0, 0.5]]), torch.tensor([[1.0, 1.0]]), quat,
+        IDENTITY_R, ZERO_T, 40.0, 40.0, 24.0, 24.0, 48, 48,
+    )  # fmt: skip
+    assert bool(out.valid[0])
+    x0, y0, x1, y1 = out.rects[0].tolist()
+    assert x0 <= 0 and y0 <= 0 and x1 >= 48 and y1 >= 48
