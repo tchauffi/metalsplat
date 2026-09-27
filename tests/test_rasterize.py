@@ -99,6 +99,49 @@ def test_backward_matches_reference(n):
     assert torch.allclose(colors_mps.grad.cpu(), colors_ref.grad, atol=2e-2, rtol=2e-2)
 
 
+def test_saturated_pixel_matches_reference():
+    # Front to back at the centre pixel: 0.99 leaves T=0.01, 0.5 leaves
+    # T=0.005, and the third (0.99) would take T to 5e-5 < 1e-4, so the
+    # kernel stops *without* compositing it. The reference used to composite
+    # it anyway (a weight of ~5e-3 of pure blue), below the other tests'
+    # 2e-3-per-pixel tolerance on most pixels but a real divergence.
+    n = 3
+    means2d = torch.full((n, 2), 8.5)
+    depths = torch.tensor([1.0, 2.0, 3.0])
+    conics = torch.tensor([[0.01, 0.0, 0.01]] * n)
+    opacities = torch.tensor([0.99, 0.5, 0.99])
+    colors = torch.eye(3)
+    radii = torch.full((n,), 30.0)
+    valid = torch.ones(n)
+
+    params_ref = [t.clone().requires_grad_() for t in (means2d, conics, opacities)]
+    colors_ref = colors.clone().requires_grad_()
+    ref = rasterize_gaussians_ref(
+        params_ref[0], depths, params_ref[1], params_ref[2], colors_ref, valid, 16, 16
+    )
+    params_mps = [t.to("mps").requires_grad_() for t in (means2d, conics, opacities)]
+    colors_mps = colors.to("mps").requires_grad_()
+    kernel = rasterize_gaussians(
+        params_mps[0],
+        depths.to("mps"),
+        params_mps[1],
+        params_mps[2],
+        colors_mps,
+        radii.to("mps"),
+        valid.to("mps"),
+        16,
+        16,
+    )
+    ref.sum().backward()
+    kernel.sum().backward()
+    torch.mps.synchronize()
+
+    assert kernel[8, 8, 2].item() == 0.0  # the exhausting gaussian is dropped
+    assert torch.allclose(kernel.cpu(), ref, atol=1e-5)
+    for p_mps, p_ref in zip(params_mps + [colors_mps], params_ref + [colors_ref]):
+        assert torch.allclose(p_mps.grad.cpu(), p_ref.grad, atol=1e-4, rtol=1e-3)
+
+
 @pytest.mark.parametrize("n", [1, 5, 40])
 def test_depth_matches_reference(n):
     means2d, depths, conics, opacities, colors, radii, valid = _random_scene(n)

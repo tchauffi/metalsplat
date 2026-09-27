@@ -51,6 +51,10 @@ def rasterize_gaussians(
     image = torch.zeros(img_height, img_width, 3, device=device, dtype=dtype)
     depth_map = torch.zeros(img_height, img_width, device=device, dtype=dtype)
     trans = torch.ones(img_height, img_width, device=device, dtype=dtype)
+    # Sticky per-pixel "this pixel is finished" flag, standing in for the
+    # kernel's `break`: this loop is vectorized over pixels and cannot break
+    # per pixel.
+    stopped = torch.zeros(img_height, img_width, device=device, dtype=torch.bool)
 
     for i in order:
         if not bool(valid_mask[i]):
@@ -63,19 +67,22 @@ def rasterize_gaussians(
         alpha = (opacities[i] * torch.exp(power)).clamp(max=0.99)
         # Match the kernel's negligible-contribution cutoff and transmittance
         # early-termination exactly (not just approximately), so this stays
-        # a precise oracle rather than a merely-close one. Once `trans` has
-        # dropped below the termination threshold for a pixel, forcing
-        # alpha_eff to 0 there leaves `trans` unchanged from then on, which
-        # is equivalent to having broken out of the (unrollable, per-pixel)
-        # loop early.
-        active = trans >= 1e-4
-        alpha_eff = torch.where(
-            active & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha)
-        )
+        # a precise oracle rather than a merely-close one. The kernel
+        # computes `test_T = T * (1 - alpha)` and breaks *before* compositing
+        # when that falls below 1e-4, so the gaussian that would exhaust the
+        # pixel contributes nothing. Gating on the pre-update `trans` instead
+        # composites it, leaving the oracle up to ~1% off the kernel on
+        # saturated pixels. A too-faint gaussian is skipped but does *not*
+        # finish the pixel (`continue`, not `break`). Same as
+        # rasterize_2dgs_ref.
+        visible = (alpha >= 1.0 / 255.0) & ~stopped
+        exhausts = visible & (trans * (1.0 - alpha) < 1e-4)
+        alpha_eff = torch.where(visible & ~exhausts, alpha, torch.zeros_like(alpha))
         weight = trans * alpha_eff
         image = image + weight[..., None] * colors[i]
         depth_map = depth_map + weight * depths[i]
         trans = trans * (1 - alpha_eff)
+        stopped = stopped | exhausts
 
     image = image + trans[..., None] * background
     if return_depth:
