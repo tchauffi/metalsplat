@@ -408,9 +408,10 @@ the hand-written Metal backward passes are tested against.
 Natural follow-ups, not implemented: **mesh/TSDF extraction** (the actual
 payoff of 2DGS's surface accuracy -- the depth/normal/distortion outputs
 all exist, but nothing consumes them into a mesh yet), Mip-Splatting's 3D
-filter generalized to two scales, and a `Gaussian2DModel` equivalent of
-`metalsplat/cleanup.py`'s floater pruning and view-dependence damping (the
-orbit above is rendered from the raw trained model, with no cleanup pass).
+filter generalized to two scales, and a cleanup pass tuned for 2DGS
+(`metalsplat/cleanup.py`'s floater pruning and view-dependence damping
+accept a `Gaussian2DModel`, but the orbit above is rendered from the raw
+trained model, with no cleanup pass).
 
 ## Roadmap
 

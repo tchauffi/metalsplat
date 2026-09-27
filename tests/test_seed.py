@@ -159,3 +159,21 @@ def test_seeding_preserves_active_sh_degree():
 
     assert stats.n_seeded == 1
     assert seeded.active_sh_degree == 1
+
+
+def test_seeding_works_on_a_2dgs_model():
+    from metalsplat.gaussians_2dgs import Gaussian2DModel
+
+    _, camera = _model_and_camera()
+    model = Gaussian2DModel(torch.tensor([[0.0, 0.0, 5.0]]), sh_degree=1)
+    target = torch.zeros(H, W, 3)
+    target[0, 0] = torch.tensor([1.0, 0.0, 0.0])
+
+    new_model, stats = seed_uncovered_regions(
+        model, camera, torch.zeros(H, W, 3), target, torch.ones(H, W), init_scale=0.05
+    )
+
+    assert stats.n_seeded == 1
+    assert type(new_model) is Gaussian2DModel
+    assert new_model.raw_scales.shape == (2, 2)
+    assert new_model.sh_degree == 1

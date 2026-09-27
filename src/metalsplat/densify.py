@@ -19,7 +19,6 @@ from dataclasses import dataclass
 import torch
 
 from metalsplat.gaussians import GaussianModel, logit
-from metalsplat.gaussians_2dgs import Gaussian2DModel
 from metalsplat.optim import NEW_GAUSSIAN
 from metalsplat.splat_model import SplatModel
 from metalsplat.utils.quaternion import quat_to_rotmat
@@ -268,7 +267,7 @@ def split_clone_prune(
 
 @torch.no_grad()
 def reset_opacity(
-    model: GaussianModel | Gaussian2DModel,
+    model: SplatModel,
     value: float = 0.01,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
@@ -295,8 +294,7 @@ def reset_opacity(
 
     Works for both `GaussianModel` and `Gaussian2DModel` unchanged -- it
     only touches `.opacities`/`.raw_opacities`, never means/scales/quats,
-    so nothing here is 3D-vs-2D-specific. `metalsplat.densify2dgs` reuses
-    this directly rather than duplicating it.
+    so nothing here is 3D-vs-2D-specific.
     """
     new_opacities = torch.clamp(model.opacities, max=value)
     model.raw_opacities.data = logit(new_opacities)
@@ -309,8 +307,8 @@ def reset_opacity(
 
 
 def prune_low_opacity(
-    model: GaussianModel, prune_opacity_thresh: float = 0.005
-) -> tuple[GaussianModel, int, torch.Tensor]:
+    model: SplatModel, prune_opacity_thresh: float = 0.005
+) -> tuple[SplatModel, int, torch.Tensor]:
     """Removes gaussians with opacity below the threshold. Standalone (no
     split/clone candidate computation) so it can run on its own, more
     frequent schedule, and -- unlike densify_and_prune -- keep running

@@ -74,10 +74,9 @@ STILL_WIDTH = 924
 # all" rather than "mostly opaque" or it punches holes through real surfaces.
 NORMAL_COVERAGE_THRESH = 0.1
 
-# No post-training cleanup pass here: metalsplat.cleanup's prune_isolated /
-# damp_view_dependence are written against GaussianModel (3 scales) and have
-# no Gaussian2DModel equivalent yet. The orbit is rendered from the raw
-# trained model.
+# No post-training cleanup pass here: the orbit is rendered from the raw
+# trained model. metalsplat.cleanup's prune_isolated / damp_view_dependence
+# accept a Gaussian2DModel too, but have not been tuned for one.
 
 
 def build_camera_path(

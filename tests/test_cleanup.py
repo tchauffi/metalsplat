@@ -81,3 +81,14 @@ def test_cleanup_preserves_active_sh_degree():
     pruned, _ = prune_isolated(model, cell_size=0.5, min_per_cell=8)
     assert pruned.active_sh_degree == 1
     assert damp_view_dependence(model, 0.5).active_sh_degree == 1
+
+
+def test_cleanup_accepts_a_2dgs_model():
+    from metalsplat.gaussians_2dgs import Gaussian2DModel
+
+    means = torch.cat([torch.zeros(10, 3), torch.tensor([[50.0, 50.0, 50.0]])])
+    model = Gaussian2DModel(means, sh_degree=1)
+    pruned, n_pruned = prune_isolated(model, cell_size=1.0, min_per_cell=5)
+    assert n_pruned == 1 and type(pruned) is Gaussian2DModel
+    damped = damp_view_dependence(pruned, 0.5)
+    assert type(damped) is Gaussian2DModel and damped.raw_scales.shape == (10, 2)

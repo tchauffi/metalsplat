@@ -2,26 +2,23 @@
 mirroring `metalsplat.densify`'s 3DGS version. See that module's docstring
 for the overall rationale (why fixed gaussian counts fail).
 
-Deliberately a parallel module rather than a generalized/shared
-implementation: the two model classes have no common base class anywhere
-in this codebase (see `sh_color.py`'s docstring for why), and the only
-genuinely 2D-specific piece -- confining a split child's random offset to
-the parent's tangent plane instead of sampling a full 3D offset -- is
-small enough that duplicating the surrounding percentile/threshold/clone
-logic is cheaper and safer than introducing a shared abstraction across
-that boundary.
-
-`DensifyStats`, `NEW_GAUSSIAN` and `reset_opacity` are reused directly
-from `metalsplat.densify`/`metalsplat.optim` -- they operate purely
-through `.opacities`/`.raw_opacities`/optimizer param groups, with no
-model-reconstruction step, so nothing about them is 3DGS-specific.
+Candidate selection, the split/clone/prune step itself, `reset_opacity`
+and `prune_low_opacity` are shared with `metalsplat.densify`; this module
+only holds what genuinely differs for a 2D splat: the relative split-vs-
+clone bar, split offsets confined to the tangent plane, and the optional
+per-pixel normalization of the densification signal.
 """
 
 from __future__ import annotations
 
 import torch
 
-from metalsplat.densify import DensifyStats, select_candidates, split_clone_prune
+from metalsplat.densify import (
+    DensifyStats,
+    prune_low_opacity,
+    select_candidates,
+    split_clone_prune,
+)
 from metalsplat.gaussians_2dgs import Gaussian2DModel
 from metalsplat.utils.quaternion import quat_to_rotmat
 
@@ -192,15 +189,6 @@ def densify_and_prune_2dgs(
     )
 
 
-def prune_low_opacity_2dgs(
-    model: Gaussian2DModel, prune_opacity_thresh: float = 0.005
-) -> tuple[Gaussian2DModel, int, torch.Tensor]:
-    """See `metalsplat.densify.prune_low_opacity` -- identical logic,
-    `Gaussian2DModel` reconstruction.
-    """
-    device = model.means.device
-    keep_mask = model.opacities.detach() > prune_opacity_thresh
-    n_pruned = int((~keep_mask).sum().item())
-    if n_pruned == 0:
-        return model, 0, torch.arange(model.num_points, device=device)
-    return model.select(keep_mask), n_pruned, keep_mask.nonzero(as_tuple=True)[0]
+# Kept as a name for existing callers: pruning by opacity does not depend
+# on the model type.
+prune_low_opacity_2dgs = prune_low_opacity

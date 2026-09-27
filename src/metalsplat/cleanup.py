@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import torch
 
-from metalsplat.gaussians import GaussianModel
+from metalsplat.splat_model import SplatModel
 
 
 def prune_isolated(
-    model: GaussianModel, cell_size: float = 0.4, min_per_cell: int = 8
-) -> tuple[GaussianModel, int]:
+    model: SplatModel, cell_size: float = 0.4, min_per_cell: int = 8
+) -> tuple[SplatModel, int]:
     """Drops gaussians sitting in sparsely-populated regions of space.
 
     Voxelises positions and removes anything in a cell holding fewer than
@@ -45,7 +45,7 @@ def prune_isolated(
     return model.select(keep), n_pruned
 
 
-def damp_view_dependence(model: GaussianModel, factor: float = 0.75) -> GaussianModel:
+def damp_view_dependence(model: SplatModel, factor: float = 0.75) -> SplatModel:
     """Scales the non-DC spherical-harmonics coefficients by `factor`.
 
     With a few hundred training views and no regularisation on the SH

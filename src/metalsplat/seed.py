@@ -25,8 +25,8 @@ from dataclasses import dataclass
 import torch
 
 from metalsplat.camera import Camera
-from metalsplat.gaussians import GaussianModel
 from metalsplat.optim import NEW_GAUSSIAN
+from metalsplat.splat_model import SplatModel
 
 
 @dataclass
@@ -43,7 +43,7 @@ class SeedStats:
 
 
 def seed_uncovered_regions(
-    model: GaussianModel,
+    model: SplatModel,
     camera: Camera,
     pred: torch.Tensor,  # (H, W, 3) rendered image this step
     target: torch.Tensor,  # (H, W, 3) ground truth
@@ -55,7 +55,7 @@ def seed_uncovered_regions(
     fallback_depth_percentile: float = 0.8,
     near: float = 0.2,
     max_points: int | None = None,
-) -> tuple[GaussianModel, SeedStats]:
+) -> tuple[SplatModel, SeedStats]:
     device = model.means.device
     n_before = model.num_points
     if max_points is not None and n_before >= max_points:
@@ -104,7 +104,7 @@ def seed_uncovered_regions(
     # = R_wc^T @ cam + camera.position (row-vector form: cam_pts @ R_wc).
     new_means = cam_pts @ camera.R_wc + camera.position
 
-    new_scales = torch.full((k, 3), init_scale, device=device)
+    new_scales = torch.full((k, model.NUM_SCALE_AXES), init_scale, device=device)
     new_quats = torch.zeros(k, 4, device=device)
     new_quats[:, 0] = 1.0
     new_opacities = torch.full((k,), 0.1, device=device)
@@ -114,7 +114,7 @@ def seed_uncovered_regions(
     # parameters; only the seeded ones are built from activated values. For
     # an SH model the constructor puts the colour in the DC band and zeroes
     # the rest, at the model's own coefficient count.
-    seeded = GaussianModel(
+    seeded = type(model)(
         new_means,
         scales=new_scales,
         quats=new_quats,
