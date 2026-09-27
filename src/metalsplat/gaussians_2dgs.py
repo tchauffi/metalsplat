@@ -46,8 +46,8 @@ class Gaussian2DModel(nn.Module):
 
         sh_color.validate_sh_degree(sh_degree)
         self.sh_degree = sh_degree
-        self.active_sh_degree = (
-            sh_degree if active_sh_degree is None else active_sh_degree
+        self.active_sh_degree = sh_color.resolve_active_sh_degree(
+            sh_degree, active_sh_degree
         )
 
         if scales is None:

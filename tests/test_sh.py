@@ -81,6 +81,49 @@ def test_inactive_bands_get_zero_gradient(active_degree):
     assert torch.count_nonzero(grad[:, first_inactive:, :]) == 0
 
 
+@pytest.mark.parametrize("stored_degree", [0, 1, 2, 3])
+def test_default_active_degree_is_the_stored_degree(stored_degree):
+    sh_coeffs, dirs = _random_inputs(8)
+    sh_coeffs = sh_coeffs[:, : (stored_degree + 1) ** 2].contiguous()
+
+    ref = eval_sh_ref(sh_coeffs, dirs, stored_degree)
+    kernel = eval_sh(sh_coeffs.to("mps"), dirs.to("mps"))
+    torch.mps.synchronize()
+
+    assert torch.allclose(kernel.cpu(), ref, atol=1e-3, rtol=1e-3)
+
+
+def test_active_degree_above_stored_degree_raises():
+    sh_coeffs, dirs = _random_inputs(2)
+    degree_one = sh_coeffs[:, :4].contiguous().to("mps")
+    with pytest.raises(ValueError, match="active_degree=3"):
+        eval_sh(degree_one, dirs.to("mps"), 3)
+
+
+def test_coefficient_count_must_be_a_whole_degree():
+    sh_coeffs, dirs = _random_inputs(2)
+    with pytest.raises(ValueError, match="not \\(degree\\+1\\)\\^2"):
+        eval_sh(sh_coeffs[:, :5].contiguous().to("mps"), dirs.to("mps"))
+
+
+def test_kernel_never_reads_the_next_gaussians_coefficients():
+    # Bypasses eval_sh's validation to exercise the kernel's own guard: at an
+    # active degree above what the buffer stores, gaussian 0 used to pick up
+    # gaussian 1's coefficients as its missing higher bands.
+    from metalsplat.ops.sh import EvalSH
+
+    dirs = torch.nn.functional.normalize(
+        torch.tensor([[0.3, 0.4, 0.8]] * 2, device="mps"), dim=-1
+    )
+    sh = torch.zeros(2, 4, 3, device="mps")
+    before = EvalSH.apply(sh, dirs, 3)[0].clone()
+    sh[1] = 5.0
+    after = EvalSH.apply(sh, dirs, 3)[0]
+    torch.mps.synchronize()
+
+    assert torch.equal(before.cpu(), after.cpu())
+
+
 def test_degree_zero_is_view_independent():
     sh_coeffs, dirs = _random_inputs(8)
     other = -dirs  # look from the opposite side

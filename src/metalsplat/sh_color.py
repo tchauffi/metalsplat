@@ -34,6 +34,19 @@ def validate_sh_degree(sh_degree: int) -> None:
         )
 
 
+def resolve_active_sh_degree(sh_degree: int, active_sh_degree: int | None) -> int:
+    """`active_sh_degree`, defaulting to `sh_degree`; it may not exceed the
+    degree the model actually stores coefficients for."""
+    if active_sh_degree is None:
+        return sh_degree
+    if not 0 <= active_sh_degree <= sh_degree:
+        raise ValueError(
+            f"active_sh_degree must be between 0 and sh_degree={sh_degree}, "
+            f"got {active_sh_degree}"
+        )
+    return active_sh_degree
+
+
 def init_color_param(
     n: int,
     sh_degree: int,

@@ -47,8 +47,8 @@ class GaussianModel(nn.Module):
         # from step 1 lets the higher ones absorb per-photo exposure and
         # white-balance drift before the diffuse base has settled, which
         # is overfitting that shows up as shimmer when the camera moves.
-        self.active_sh_degree = (
-            sh_degree if active_sh_degree is None else active_sh_degree
+        self.active_sh_degree = sh_color.resolve_active_sh_degree(
+            sh_degree, active_sh_degree
         )
 
         if scales is None:

@@ -5,7 +5,9 @@
 // `num_coeffs` is the per-channel coefficient count of the buffer, passed in
 // rather than hard-coded, so a degree-2 model still stores 9 per channel
 // instead of padding to 16. `active_degree` gates which bands are evaluated
-// and must satisfy (active_degree+1)^2 <= num_coeffs.
+// and must satisfy (active_degree+1)^2 <= num_coeffs; ops/sh.py checks
+// that, and both passes also gate every band on num_coeffs so a violation
+// can never read into the next gaussian's coefficients.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -44,17 +46,17 @@ kernel void sh_forward(
     // progressive SH growth an actual constraint during training.
     for (int ch = 0; ch < 3; ch++) {
         float result = SH_C0 * c[0 * 3 + ch];
-        if (active_degree >= 1) {
+        if (active_degree >= 1 && num_coeffs > 1) {
             result += -SH_C1 * y * c[1 * 3 + ch] + SH_C1 * z * c[2 * 3 + ch] - SH_C1 * x * c[3 * 3 + ch];
         }
-        if (active_degree >= 2) {
+        if (active_degree >= 2 && num_coeffs > 4) {
             result += SH_C2_0 * xy * c[4 * 3 + ch]
                      + SH_C2_1 * yz * c[5 * 3 + ch]
                      + SH_C2_2 * (2.0 * zz - xx - yy) * c[6 * 3 + ch]
                      + SH_C2_3 * xz * c[7 * 3 + ch]
                      + SH_C2_4 * (xx - yy) * c[8 * 3 + ch];
         }
-        if (active_degree >= 3) {
+        if (active_degree >= 3 && num_coeffs > 9) {
             result += SH_C3_0 * y * (3.0 * xx - yy) * c[9 * 3 + ch]
                      + SH_C3_1 * xy * z * c[10 * 3 + ch]
                      + SH_C3_2 * y * (4.0 * zz - xx - yy) * c[11 * 3 + ch]
