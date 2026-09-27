@@ -21,21 +21,16 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
-
-# torch and pycolmap each bundle their own OpenMP runtime; loading both in
-# one process aborts with "OMP: Error #15: Initializing libomp.dylib, but
-# found libomp.dylib already initialized" unless this is set before
-# pycolmap is imported. Benign here -- there's no shared OpenMP state
-# between the two libraries in this codebase.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
-import pycolmap
 import torch
 from PIL import Image
 
 from metalsplat.camera import Camera
+
+if TYPE_CHECKING:
+    import pycolmap
 
 _SUPPORTED_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
 
@@ -88,6 +83,25 @@ class ColmapScene:
     colors: torch.Tensor  # (P, 3) float32 in [0, 1]
 
 
+def _import_pycolmap():
+    """Imports pycolmap, allowing its OpenMP runtime next to torch's.
+
+    torch and pycolmap each bundle their own OpenMP runtime; loading both in
+    one process aborts with "OMP: Error #15: Initializing libomp.dylib, but
+    found libomp.dylib already initialized" unless KMP_DUPLICATE_LIB_OK is
+    set before pycolmap loads. That flag is process-wide, and Intel
+    documents it as unsafe in general (two runtimes can then disagree), so
+    it is set here -- only when a scene is actually loaded, and only if the
+    caller has not set it either way -- rather than as a side effect of
+    importing this module. Nothing here shares OpenMP state between the two
+    libraries. See the README's Requirements.
+    """
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    import pycolmap
+
+    return pycolmap
+
+
 def _camera_intrinsics(cam: pycolmap.Camera) -> tuple[float, float, float, float]:
     model = cam.model.name
     if model not in _SUPPORTED_MODELS:
@@ -121,6 +135,7 @@ def load_colmap_scene(
     MipNeRF360's `images_4`).
     """
     scene_root = Path(scene_root)
+    pycolmap = _import_pycolmap()
     rec = pycolmap.Reconstruction(str(scene_root / sparse_subdir))
 
     images_by_name = sorted(rec.images.values(), key=lambda im: im.name)

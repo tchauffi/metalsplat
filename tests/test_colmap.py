@@ -96,3 +96,20 @@ def test_downscale_halves_resolution_and_rescales_intrinsics():
     scale = cam_half.img_width / cam_full.img_width
     assert abs(cam_half.fx - cam_full.fx * scale) < 1e-3
     assert abs(cam_half.cx - cam_full.cx * scale) < 1e-3
+
+
+def test_importing_the_loader_leaves_the_environment_alone():
+    # KMP_DUPLICATE_LIB_OK is process-wide; it is only set once a scene is
+    # actually loaded, not as a side effect of the import.
+    import subprocess
+    import sys
+
+    code = (
+        "import os; os.environ.pop('KMP_DUPLICATE_LIB_OK', None); "
+        "import metalsplat.data.colmap; "
+        "print(os.environ.get('KMP_DUPLICATE_LIB_OK'))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "None"

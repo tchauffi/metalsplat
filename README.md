@@ -30,6 +30,11 @@ GPU, reaching **23.5 dB PSNR / 0.741 SSIM** on the 24 held-out views with
   version). Kernels are Metal Shading Language source compiled at *runtime*
   via PyTorch's built-in Metal compiler -- no Xcode command-line tools or
   `xcrun metal` toolchain required, no native build step.
+- Loading a COLMAP scene (`metalsplat.data.colmap.load_colmap_scene`) sets
+  `KMP_DUPLICATE_LIB_OK=TRUE` for the process, unless already set: torch
+  and pycolmap each bundle an OpenMP runtime, and the process aborts on the
+  second one otherwise. Set it yourself (either way) to take control of
+  that choice.
 
 ```bash
 uv sync
