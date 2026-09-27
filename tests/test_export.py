@@ -175,3 +175,38 @@ def test_save_ply_bakes_3d_filter(tmp_path):
     # An unobserved gaussian (radius 0) is written unchanged.
     assert torch.allclose(loaded.scales[1], scales[1], rtol=1e-5)
     assert torch.allclose(loaded.opacities[1], opacities[1], atol=1e-5)
+
+
+def _patch_header(src, dst, old: bytes, new: bytes, extra: bytes = b""):
+    content = src.read_bytes()
+    assert content.count(old) == 1
+    dst.write_bytes(content.replace(old, new) + extra)
+
+
+def test_non_float_vertex_property_is_rejected_not_misread(tmp_path):
+    # A uchar colour property changes the per-vertex stride; reading the
+    # rest as float32 would scramble every field after it.
+    model = GaussianModel(torch.randn(4, 3))
+    save_ply(model, tmp_path / "a.ply")
+    _patch_header(
+        tmp_path / "a.ply",
+        tmp_path / "b.ply",
+        b"property float nx\n",
+        b"property uchar red\nproperty float nx\n",
+    )
+    with pytest.raises(ValueError, match="red"):
+        load_ply(tmp_path / "b.ply")
+
+
+def test_trailing_element_is_ignored(tmp_path):
+    model = GaussianModel(torch.randn(4, 3))
+    save_ply(model, tmp_path / "a.ply")
+    _patch_header(
+        tmp_path / "a.ply",
+        tmp_path / "b.ply",
+        b"end_header\n",
+        b"element face 1\nproperty list uchar int vertex_indices\nend_header\n",
+        extra=b"\x03\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00",
+    )
+    loaded = load_ply(tmp_path / "b.ply")
+    assert torch.allclose(loaded.means, model.means)
