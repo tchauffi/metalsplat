@@ -21,7 +21,10 @@ Trained by `examples/train_garden.py` and rendered by
 `examples/render_video.py`: 15000 iterations in 42 minutes on an M-series
 GPU, reaching **23.5 dB PSNR / 0.741 SSIM** on the 24 held-out views with
 330k gaussians. The trained scene renders back at **93 fps** at
-1297x840 (`examples/benchmark.py`).
+1297x840 (`examples/benchmark.py`). That run trained at the images' full
+1297x840 for 15000 steps; the script's current defaults differ
+(`NUM_ITERS = 30_000`, `RESOLUTION_DOWNSCALE = 2.0`) -- its constants
+block is the source of truth for what a run uses.
 
 ## Requirements
 
@@ -30,6 +33,13 @@ GPU, reaching **23.5 dB PSNR / 0.741 SSIM** on the 24 held-out views with
   version). Kernels are Metal Shading Language source compiled at *runtime*
   via PyTorch's built-in Metal compiler -- no Xcode command-line tools or
   `xcrun metal` toolchain required, no native build step.
+- Loading a COLMAP scene (`metalsplat.data.colmap.load_colmap_scene`) sets
+  `KMP_DUPLICATE_LIB_OK=TRUE` for the process, unless already set: torch
+  and pycolmap each bundle an OpenMP runtime, and the process aborts on the
+  second one otherwise. Set it yourself (either way) to take control of
+  that choice -- and set it before your own `import pycolmap` if you
+  import pycolmap directly alongside torch, since the loader only sets it
+  when it runs.
 
 ```bash
 uv sync
@@ -146,10 +156,11 @@ CUDA kernels.
   covariance from scale+quaternion, the EWA/affine perspective
   approximation, and the resulting 2D conic (inverse covariance) and pixel
   radius. Forward and backward are both hand-written MSL kernels.
-- **`metalsplat/ops/tiling.py`** (plain torch/MPS ops, no kernel): bins
-  projected gaussians into 16x16-pixel tiles and sorts them by (tile,
-  depth) via a single packed sort key -- gsplat itself doesn't use a
-  custom kernel for this stage either, relying on a generic sort.
+- **`metalsplat/ops/tiling.py`** (Metal kernels, `kernels/tiling.metal`,
+  plus torch's sort): bins each gaussian's screen rectangle into
+  16x16-pixel tiles and sorts the (gaussian, tile) pairs by (tile, depth)
+  via a single packed sort key. Two small kernels count and emit the
+  pairs; the ordering itself is a generic sort, as in gsplat.
 - **`metalsplat/ops/rasterize.py`** (Metal kernel, `kernels/rasterize.metal`):
   tile-based front-to-back alpha compositing. One thread per pixel, one
   threadgroup per tile. Backward accumulates per-gaussian gradients via
@@ -173,7 +184,9 @@ Every kernel-backed stage has a pure-PyTorch reference implementation
 oracle the kernels are tested against (`tests/test_project.py`,
 `tests/test_rasterize.py`) -- both forward values and backward gradients,
 via `torch.autograd` on the reference vs. the kernel's hand-written
-backward. It also works as a CPU-compatible fallback.
+backward. It runs on any device, CPU included, so it can be called
+directly on small scenes -- but `render()` / `render_2dgs()` always use the
+Metal kernels and need tensors on the `mps` device.
 
 Training-loop logic (no Metal kernels -- runs between steps, not inside
 the differentiable render): `metalsplat/densify.py` (split/clone/prune,
@@ -279,9 +292,10 @@ rows are identical by construction, the whole transform collapses to **9
 independent floats** per gaussian, which is what the projection stage
 hands the rasterizer.
 
-The 3DGS EWA path is still computed, but only to bound each splat's screen
-footprint for tile culling, so the existing tiling stage is reused
-unmodified.
+The same 9 floats also give each splat's exact screen footprint for tile
+binning: the perspective image of its alpha-cutoff ellipse is itself a
+conic with a closed-form bounding box, joined with the screen-space
+filter's disk. The shared tiling stage bins those rectangles directly.
 
 ### The two regularizers
 
@@ -357,16 +371,16 @@ automatically.
   `(N, 2)` -- the tangent-plane extents `(s_u, s_v)` -- with no third,
   depth-axis scale. `quat_to_rotmat`'s columns 0/1 are the disk's tangent
   axes, column 2 its surface normal (`.normals`, sign-flipped to face the
-  camera at render time). Color/SH parameterization is shared with
-  `GaussianModel` via `metalsplat/sh_color.py`.
+  camera at render time). Everything but the scale count -- activations,
+  color/SH, lossless row operations -- is shared with `GaussianModel`
+  through `metalsplat/splat_model.py`.
 - **`metalsplat/ops/project_2dgs.py`** (Metal kernel,
-  `kernels/project_2dgs.metal`): reuses the exact 3DGS EWA/conic math
-  (treating the missing 3rd scale as a fixed small epsilon) for the
-  tile-culling bound, so `metalsplat/ops/tiling.py` is reused completely
-  unmodified for tile binning. Additionally outputs the 9 independent
-  entries of `M = W @ H` (the composition of the camera's projection with
-  the local tangent-plane-to-world embedding) and the camera-facing
-  normal, both consumed by the rasterizer's exact per-pixel intersection.
+  `kernels/project_2dgs.metal`): outputs the 9 independent entries of
+  `M = W @ H` (the composition of the camera's projection with the local
+  tangent-plane-to-world embedding) and the camera-facing normal, both
+  consumed by the rasterizer's exact per-pixel intersection, plus each
+  splat's exact, opacity-aware screen rectangle, which
+  `metalsplat/ops/tiling.py` bins directly.
 - **`metalsplat/ops/rasterize_2dgs.py`** (Metal kernel,
   `kernels/rasterize_2dgs.metal`): same tile-based front-to-back
   compositing structure as 3DGS's rasterizer, but per-pixel alpha comes
@@ -387,20 +401,22 @@ automatically.
   implementation's handling of accumulated alpha -- the rasterizer's depth
   and normal outputs are alpha-weighted *sums*, so the normal loss needs
   `1 - final_T` to interpret either of them.
-- **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`/
-  `prune_low_opacity_2dgs`, adaptive density control for `Gaussian2DModel`
-  -- a parallel module to `metalsplat/densify.py`, differing only in
-  split-offset sampling (confined to the tangent plane, since a 2D splat
-  has no third axis to offset along). `reset_opacity` is reused unchanged
-  from the 3DGS module.
+- **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`, adaptive
+  density control for `Gaussian2DModel`. Candidate selection, the
+  split/clone/prune step, `reset_opacity` and `prune_low_opacity` are
+  shared with `metalsplat/densify.py`; this module adds only what differs
+  for a flat splat -- split offsets confined to the tangent plane, a split
+  bar relative to the model's own sizes, and optional per-pixel
+  normalization of the densification signal.
 - **`metalsplat/export2dgs.py`**: `save_ply`/`load_ply` for
   `Gaussian2DModel`, matching the official 2DGS reference implementation's
   own `.ply` layout exactly (identical to `metalsplat/export.py`'s 3DGS
   format except 2 `scale_*` properties instead of 3).
 
 As with the 3DGS path, every kernel-backed stage has a pure-PyTorch twin
-under `metalsplat/reference/` that serves as the executable spec, the CPU
-fallback, and -- being plain differentiable torch -- the gradient oracle
+under `metalsplat/reference/` that serves as the executable spec, a
+CPU-runnable implementation for small scenes, and -- being plain
+differentiable torch -- the gradient oracle
 the hand-written Metal backward passes are tested against.
 
 ### Status
@@ -408,9 +424,10 @@ the hand-written Metal backward passes are tested against.
 Natural follow-ups, not implemented: **mesh/TSDF extraction** (the actual
 payoff of 2DGS's surface accuracy -- the depth/normal/distortion outputs
 all exist, but nothing consumes them into a mesh yet), Mip-Splatting's 3D
-filter generalized to two scales, and a `Gaussian2DModel` equivalent of
-`metalsplat/cleanup.py`'s floater pruning and view-dependence damping (the
-orbit above is rendered from the raw trained model, with no cleanup pass).
+filter generalized to two scales, and a cleanup pass tuned for 2DGS
+(`metalsplat/cleanup.py`'s floater pruning and view-dependence damping
+accept a `Gaussian2DModel`, but the orbit above is rendered from the raw
+trained model, with no cleanup pass).
 
 ## Roadmap
 

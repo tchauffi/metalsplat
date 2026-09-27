@@ -93,6 +93,27 @@ def test_downscale_halves_resolution_and_rescales_intrinsics():
 
     # Intrinsics rescale with the actual image size, same mechanism that
     # already handles pre-downsampled image directories (e.g. images_4).
-    scale = cam_half.img_width / cam_full.img_width
-    assert abs(cam_half.fx - cam_full.fx * scale) < 1e-3
-    assert abs(cam_half.cx - cam_full.cx * scale) < 1e-3
+    scale_x = cam_half.img_width / cam_full.img_width
+    scale_y = cam_half.img_height / cam_full.img_height
+    assert abs(cam_half.fx - cam_full.fx * scale_x) < 1e-3
+    assert abs(cam_half.cx - cam_full.cx * scale_x) < 1e-3
+    # Vertical intrinsics follow the height, which rounds independently.
+    assert abs(cam_half.fy - cam_full.fy * scale_y) < 1e-3
+    assert abs(cam_half.cy - cam_full.cy * scale_y) < 1e-3
+
+
+def test_importing_the_loader_leaves_the_environment_alone():
+    # KMP_DUPLICATE_LIB_OK is process-wide; it is only set once a scene is
+    # actually loaded, not as a side effect of the import.
+    import subprocess
+    import sys
+
+    code = (
+        "import os; os.environ.pop('KMP_DUPLICATE_LIB_OK', None); "
+        "import metalsplat.data.colmap; "
+        "print(os.environ.get('KMP_DUPLICATE_LIB_OK'))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "None"

@@ -103,6 +103,44 @@ def test_max_points_stops_densification():
     assert stats.n_split == 0 and stats.n_cloned == 0
 
 
+def test_max_points_still_prunes():
+    # At the cap no gaussian may be added, but pruning is independent of
+    # growth: it used to be skipped along with split/clone.
+    n = 10
+    model = _model(n)
+    with torch.no_grad():
+        model.raw_opacities[3] = -10.0
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+
+    new_model, stats = densify_and_prune_2dgs(
+        model, grad_accum, grad_count, max_points=n
+    )
+
+    assert stats.n_split == 0 and stats.n_cloned == 0
+    assert stats.n_pruned == 1
+    assert new_model.num_points == n - 1
+
+
+def test_max_points_is_a_hard_cap():
+    # 5 candidates above the bar, room for 2: only the 2 highest-gradient
+    # ones are densified instead of overshooting the cap by 3.
+    n = 10
+    model = _model(n)
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+    grad_accum[:5] = torch.tensor([5.0, 9.0, 6.0, 8.0, 7.0])
+
+    new_model, stats = densify_and_prune_2dgs(
+        model, grad_accum, grad_count, grad_threshold=2.0, max_points=n + 2
+    )
+
+    assert stats.n_split + stats.n_cloned == 2
+    assert new_model.num_points == n + 2
+    kept_parents = set(stats.parent_index[n:].tolist())
+    assert kept_parents == {1, 3}  # the two largest gradients
+
+
 def test_split_clone_and_prune_preserves_sh_coefficients():
     n = 10
     means = torch.zeros(n, 3)
@@ -410,3 +448,33 @@ def test_no_op_round_reports_no_threshold():
     # A round that actually ran reports the bar it used.
     _, stats = densify_and_prune_2dgs(model, grad_accum, torch.ones(n))
     assert stats.grad_threshold is not None
+
+
+def test_pruning_runs_after_split_and_clone_like_the_reference():
+    # Mirrors metalsplat.densify's test: prune the densified set, not the
+    # originals, so large candidates split and low-opacity clones go too.
+    from metalsplat.densify2dgs import densify_and_prune_2dgs
+    from metalsplat.gaussians_2dgs import Gaussian2DModel
+
+    n = 4
+    scales = torch.tensor([[3.0, 1.0], [3.0, 1.0], [0.1, 0.1], [0.1, 0.1]])
+    opacities = torch.tensor([0.5, 0.5, 1e-4, 0.5])
+    model = Gaussian2DModel(torch.zeros(n, 3), scales=scales, opacities=opacities)
+    grad_accum = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+    new_model, stats = densify_and_prune_2dgs(
+        model,
+        grad_accum,
+        torch.ones(n),
+        grad_threshold=0.5,
+        prune_opacity_thresh=0.005,
+        max_world_size=2.0,
+    )
+
+    # 0: large candidate -> split; children (3.0 / 1.6) fit under the bar.
+    # 1: too large, not a candidate -> pruned. 2: faint candidate -> cloned,
+    # and both it and its clone are pruned. 3: kept.
+    assert stats.n_split == 1 and stats.n_cloned == 1
+    assert stats.n_pruned == 3
+    assert new_model.num_points == 3
+    assert sorted(stats.parent_index.tolist()) == [0, 0, 3]

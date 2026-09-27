@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from metalsplat.gaussians import GaussianModel
 from metalsplat.gaussians_2dgs import Gaussian2DModel
 
 
@@ -54,6 +55,14 @@ def test_increase_sh_degree_caps_at_sh_degree():
     assert model.increase_sh_degree() == 1
     assert model.increase_sh_degree() == 2
     assert model.increase_sh_degree() == 2
+
+
+@pytest.mark.parametrize("model_cls", [Gaussian2DModel, GaussianModel])
+def test_active_sh_degree_above_sh_degree_raises(model_cls):
+    # The SH kernel indexes coefficients by the active degree, so one above
+    # what the model stores would read other gaussians' coefficients.
+    with pytest.raises(ValueError, match="active_sh_degree"):
+        model_cls(_means(2), sh_degree=1, active_sh_degree=3)
 
 
 def test_random_classmethod():

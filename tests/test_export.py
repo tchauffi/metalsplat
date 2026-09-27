@@ -151,3 +151,78 @@ def test_degree_3_ply_has_the_reference_45_f_rest_entries(tmp_path):
     header = path.read_bytes().split(b"end_header")[0].decode()
     assert sum(1 for line in header.splitlines() if "f_rest_" in line) == 45
     assert "f_rest_44" in header and "f_rest_45" not in header
+
+
+def test_save_ply_bakes_3d_filter(tmp_path):
+    from metalsplat.filter3d import apply_3d_filter
+
+    scales = torch.tensor([[0.01, 0.02, 0.03], [0.1, 0.1, 0.1]])
+    opacities = torch.tensor([0.8, 0.4])
+    model = GaussianModel(
+        torch.zeros(2, 3), scales=scales, opacities=opacities, sh_degree=1
+    )
+    filter_3d = torch.tensor([0.02, 0.0])
+
+    path = tmp_path / "baked.ply"
+    save_ply(model, path, filter_3d=filter_3d)
+    loaded = load_ply(path)
+
+    expected_scales, expected_opacities = apply_3d_filter(
+        model.scales.detach(), model.opacities.detach(), filter_3d
+    )
+    assert torch.allclose(loaded.scales, expected_scales, rtol=1e-5)
+    assert torch.allclose(loaded.opacities, expected_opacities, atol=1e-5)
+    # An unobserved gaussian (radius 0) is written unchanged.
+    assert torch.allclose(loaded.scales[1], scales[1], rtol=1e-5)
+    assert torch.allclose(loaded.opacities[1], opacities[1], atol=1e-5)
+
+
+def _patch_header(src, dst, old: bytes, new: bytes, extra: bytes = b""):
+    content = src.read_bytes()
+    assert content.count(old) == 1
+    dst.write_bytes(content.replace(old, new) + extra)
+
+
+def test_non_float_vertex_property_is_rejected_not_misread(tmp_path):
+    # A uchar colour property changes the per-vertex stride; reading the
+    # rest as float32 would scramble every field after it.
+    model = GaussianModel(torch.randn(4, 3))
+    save_ply(model, tmp_path / "a.ply")
+    _patch_header(
+        tmp_path / "a.ply",
+        tmp_path / "b.ply",
+        b"property float nx\n",
+        b"property uchar red\nproperty float nx\n",
+    )
+    with pytest.raises(ValueError, match="red"):
+        load_ply(tmp_path / "b.ply")
+
+
+def test_trailing_element_is_ignored(tmp_path):
+    model = GaussianModel(torch.randn(4, 3))
+    save_ply(model, tmp_path / "a.ply")
+    _patch_header(
+        tmp_path / "a.ply",
+        tmp_path / "b.ply",
+        b"end_header\n",
+        b"element face 1\nproperty list uchar int vertex_indices\nend_header\n",
+        extra=b"\x03\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00",
+    )
+    loaded = load_ply(tmp_path / "b.ply")
+    assert torch.allclose(loaded.means, model.means)
+
+
+@pytest.mark.parametrize("sh_degree", [0, 3])
+def test_empty_model_round_trips(tmp_path, sh_degree):
+    # Densify/prune can take a model to zero gaussians; saving it used to
+    # fail on a reshape(0, -1).
+    from metalsplat.export2dgs import load_ply as load_ply_2dgs
+    from metalsplat.export2dgs import save_ply as save_ply_2dgs
+    from metalsplat.gaussians_2dgs import Gaussian2DModel
+
+    save_ply(GaussianModel(torch.zeros(0, 3), sh_degree=sh_degree), tmp_path / "a.ply")
+    assert load_ply(tmp_path / "a.ply").num_points == 0
+    save_ply_2dgs(
+        Gaussian2DModel(torch.zeros(0, 3), sh_degree=sh_degree), tmp_path / "b.ply"
+    )
+    assert load_ply_2dgs(tmp_path / "b.ply").num_points == 0

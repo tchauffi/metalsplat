@@ -64,11 +64,9 @@ inline float ray_splat_alpha(
     // `FilterSize = 0.707106 // sqrt(2)/2` / `FilterInvSquare = 2.0f`.
     // Sub-pixel by design -- and since `rho` below is a min(), it is a
     // lower bound on every splat's footprint, so widening it stops the
-    // optimizer sharpening detail by shrinking a splat. Deliberately
-    // *not* the projection's covariance dilation, a px^2 quantity for the
-    // EWA/tile-culling bound: sharing one number made neither tunable
-    // without breaking the other. See rasterize_2dgs_ref's
-    // DEFAULT_FILTER_SIZE.
+    // optimizer sharpening detail by shrinking a splat. It widens every
+    // splat's footprint, so the projection's tile rectangles include it
+    // too. See rasterize_2dgs_ref's DEFAULT_FILTER_SIZE.
     float dx = px - mean2d.x, dy = py - mean2d.y;
     float filter_var = filter_size * filter_size;
     float rho_screen = (dx * dx + dy * dy) / filter_var;
@@ -361,17 +359,18 @@ kernel void rasterize_2dgs_backward(
         int count = batch_end - batch_start;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((int)local_idx < count) {
-            int gid = sorted_ids[batch_start + int(local_idx)];
-            sh_gid[local_idx] = gid;
-            sh_row0[local_idx] = float3(transform[gid*9+0], transform[gid*9+1], transform[gid*9+2]);
-            sh_row1[local_idx] = float3(transform[gid*9+3], transform[gid*9+4], transform[gid*9+5]);
-            sh_row2[local_idx] = float3(transform[gid*9+6], transform[gid*9+7], transform[gid*9+8]);
-            sh_mean2d[local_idx] = float2(means2d[gid*2+0], means2d[gid*2+1]);
-            sh_opacity[local_idx] = opacities[gid];
-            sh_color[local_idx] = float3(colors[gid*3+0], colors[gid*3+1], colors[gid*3+2]);
-            sh_normal[local_idx] = float3(normal[gid*3+0], normal[gid*3+1], normal[gid*3+2]);
-            sh_depth_fallback[local_idx] = depths[gid];
+        // Strided: tile_size^2 threads can be fewer than BACKWARD_BATCH.
+        for (int s = int(local_idx); s < count; s += tile_size * tile_size) {
+            int gid = sorted_ids[batch_start + s];
+            sh_gid[s] = gid;
+            sh_row0[s] = float3(transform[gid*9+0], transform[gid*9+1], transform[gid*9+2]);
+            sh_row1[s] = float3(transform[gid*9+3], transform[gid*9+4], transform[gid*9+5]);
+            sh_row2[s] = float3(transform[gid*9+6], transform[gid*9+7], transform[gid*9+8]);
+            sh_mean2d[s] = float2(means2d[gid*2+0], means2d[gid*2+1]);
+            sh_opacity[s] = opacities[gid];
+            sh_color[s] = float3(colors[gid*3+0], colors[gid*3+1], colors[gid*3+2]);
+            sh_normal[s] = float3(normal[gid*3+0], normal[gid*3+1], normal[gid*3+2]);
+            sh_depth_fallback[s] = depths[gid];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

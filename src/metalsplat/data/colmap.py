@@ -21,21 +21,16 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
-
-# torch and pycolmap each bundle their own OpenMP runtime; loading both in
-# one process aborts with "OMP: Error #15: Initializing libomp.dylib, but
-# found libomp.dylib already initialized" unless this is set before
-# pycolmap is imported. Benign here -- there's no shared OpenMP state
-# between the two libraries in this codebase.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
-import pycolmap
 import torch
 from PIL import Image
 
 from metalsplat.camera import Camera
+
+if TYPE_CHECKING:
+    import pycolmap
 
 _SUPPORTED_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
 
@@ -88,6 +83,25 @@ class ColmapScene:
     colors: torch.Tensor  # (P, 3) float32 in [0, 1]
 
 
+def _import_pycolmap():
+    """Imports pycolmap, allowing its OpenMP runtime next to torch's.
+
+    torch and pycolmap each bundle their own OpenMP runtime; loading both in
+    one process aborts with "OMP: Error #15: Initializing libomp.dylib, but
+    found libomp.dylib already initialized" unless KMP_DUPLICATE_LIB_OK is
+    set before pycolmap loads. That flag is process-wide, and Intel
+    documents it as unsafe in general (two runtimes can then disagree), so
+    it is set here -- only when a scene is actually loaded, and only if the
+    caller has not set it either way -- rather than as a side effect of
+    importing this module. Nothing here shares OpenMP state between the two
+    libraries. See the README's Requirements.
+    """
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    import pycolmap
+
+    return pycolmap
+
+
 def _camera_intrinsics(cam: pycolmap.Camera) -> tuple[float, float, float, float]:
     model = cam.model.name
     if model not in _SUPPORTED_MODELS:
@@ -114,13 +128,14 @@ def load_colmap_scene(
     (e.g. `downscale=2.0` halves both dimensions) -- a plain training-speed
     knob (fewer pixels per render/backward), matching 3DGS/2DGS's
     convention of a resolution downscale factor. Intrinsics don't need any
-    special handling for this: the existing `scale = actual_width /
-    colmap_cam.width` rescaling below already reacts to whatever size the
-    image actually is after resizing, the same way it already handles
+    special handling for this: the per-axis rescaling below (image size on
+    disk over COLMAP's calibration size) already reacts to whatever size
+    the image actually is after resizing, the same way it already handles
     scenes shipped with pre-downsampled image directories (e.g.
     MipNeRF360's `images_4`).
     """
     scene_root = Path(scene_root)
+    pycolmap = _import_pycolmap()
     rec = pycolmap.Reconstruction(str(scene_root / sparse_subdir))
 
     images_by_name = sorted(rec.images.values(), key=lambda im: im.name)
@@ -142,8 +157,13 @@ def load_colmap_scene(
 
         colmap_cam = rec.cameras[colmap_image.camera_id]
         fx, fy, cx, cy = _camera_intrinsics(colmap_cam)
-        scale = actual_width / colmap_cam.width
-        fx, fy, cx, cy = fx * scale, fy * scale, cx * scale, cy * scale
+        # Per axis: rounding a downsampled size to whole pixels makes the
+        # two ratios differ slightly (garden's images_4: 1297/5187 against
+        # 840/3361), so the vertical intrinsics follow the height.
+        scale_x = actual_width / colmap_cam.width
+        scale_y = actual_height / colmap_cam.height
+        fx, cx = fx * scale_x, cx * scale_x
+        fy, cy = fy * scale_y, cy * scale_y
 
         cam_from_world = colmap_image.cam_from_world()
         R_wc = torch.from_numpy(

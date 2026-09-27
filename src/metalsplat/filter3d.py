@@ -17,9 +17,12 @@ training camera saw it at. For a pinhole camera, that rate is f/z, so a
 gaussian observed no closer than z_min has a smallest resolvable world
 extent of about z_min/f. Dilating its 3D covariance by
 
-    Sigma' = Sigma + r^2 I,   r = sampling_scale * z_min / f
+    Sigma' = Sigma + r^2 I,   r^2 = sampling_scale * (z_min / f)^2
 
-removes everything below that scale.
+removes everything below that scale. `sampling_scale` multiplies the
+*variance*, as in the paper (Sigma + s/nu^2 I) and the reference code
+(`distance / focal * 0.2 ** 0.5`), so the radius is sqrt(sampling_scale)
+times the pixel footprint.
 
 This needs no kernel change. A covariance is R diag(s^2) R^T, and the
 identity is rotation-invariant, so
@@ -54,7 +57,8 @@ def compute_3d_filter(
 
     For each gaussian, finds the smallest z/f over the training cameras
     that actually see it -- the finest world-space detail any of them could
-    resolve there -- and scales it by `sampling_scale`.
+    resolve there -- and scales it by `sqrt(sampling_scale)`, since
+    `sampling_scale` is a variance factor (see the module docstring).
 
     `frustum_margin` accepts gaussians slightly outside the image bounds,
     so one sitting just off the edge of every view is still band-limited by
@@ -108,7 +112,7 @@ def compute_3d_filter(
         best = torch.minimum(best, extent.min(dim=1).values)
 
     unseen = torch.isinf(best)
-    return torch.where(unseen, torch.zeros_like(best), sampling_scale * best)
+    return torch.where(unseen, torch.zeros_like(best), sampling_scale**0.5 * best)
 
 
 def apply_3d_filter(

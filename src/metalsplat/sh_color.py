@@ -2,16 +2,14 @@
 
 Used by both `GaussianModel` (3D) and `Gaussian2DModel` (2D): color is
 either plain per-gaussian RGB (`sh_degree=0`: color = sigmoid(raw_color),
-in [0, 1]) or degree<=2 spherical harmonics (`sh_degree=1..3`:
-view-dependent color = eval_sh(raw_sh, view_dir) + 0.5, matching standard
-3DGS convention -- unconstrained/unclamped internally, consumers clamp to
-[0, 1] for display).
+in [0, 1]) or degree<=3 spherical harmonics (`sh_degree=1..3`:
+view-dependent color = max(eval_sh(raw_sh, view_dir) + 0.5, 0), matching
+standard 3DGS convention -- clamped below at 0 but not above, consumers
+clamp to [0, 1] for display).
 
-Extracted out of `GaussianModel` so the two model classes share one
-implementation instead of two copies that can drift; both classes register
-the returned tensor as their own `nn.Parameter` and hold their own
-`sh_degree`/`active_sh_degree` state, so this module stays plain functions,
-not a base class.
+Plain functions used by `metalsplat.splat_model.SplatModel`, the base both
+model classes share, which registers the returned tensor as its own
+`nn.Parameter` and holds the `sh_degree`/`active_sh_degree` state.
 """
 
 from __future__ import annotations
@@ -32,6 +30,19 @@ def validate_sh_degree(sh_degree: int) -> None:
         raise ValueError(
             f"sh_degree must be between 0 and {MAX_SH_DEGREE}, got {sh_degree}"
         )
+
+
+def resolve_active_sh_degree(sh_degree: int, active_sh_degree: int | None) -> int:
+    """`active_sh_degree`, defaulting to `sh_degree`; it may not exceed the
+    degree the model actually stores coefficients for."""
+    if active_sh_degree is None:
+        return sh_degree
+    if not 0 <= active_sh_degree <= sh_degree:
+        raise ValueError(
+            f"active_sh_degree must be between 0 and sh_degree={sh_degree}, "
+            f"got {active_sh_degree}"
+        )
+    return active_sh_degree
 
 
 def init_color_param(
@@ -68,8 +79,14 @@ def init_color_param(
 def colors_from_view(
     raw_sh: torch.Tensor, active_sh_degree: int, view_dirs: torch.Tensor
 ) -> torch.Tensor:
-    """view_dirs: (N, 3) unit vectors from each gaussian to the camera."""
-    return eval_sh(raw_sh, view_dirs, active_sh_degree) + 0.5
+    """view_dirs: (N, 3) unit vectors from the camera to each gaussian.
+
+    Clamped at 0 like the reference rasterizer: without it training can use
+    negative colours to subtract light, which every external viewer clamps
+    away, so an exported scene would render differently there. The clamp
+    also blocks gradient on clamped channels, as the reference does.
+    """
+    return (eval_sh(raw_sh, view_dirs, active_sh_degree) + 0.5).clamp_min(0.0)
 
 
 def increase_sh_degree(sh_degree: int, active_sh_degree: int) -> int:

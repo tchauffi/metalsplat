@@ -92,3 +92,12 @@ class Camera:
             img_width=img_width,
             img_height=img_height,
         )
+
+
+def camera_extent(cameras: list[Camera]) -> float:
+    """Radius of a camera rig, the reference's `cameras_extent`: 1.1x the
+    largest distance from any camera centre to their mean. Pass the
+    training cameras only, as the reference does.
+    """
+    centers = torch.stack([c.position for c in cameras])
+    return 1.1 * (centers - centers.mean(dim=0)).norm(dim=-1).max().item()

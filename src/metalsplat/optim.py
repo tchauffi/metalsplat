@@ -122,6 +122,12 @@ class SparseAdam(torch.optim.Optimizer):
     alike -- untouched, as if the step had not happened for it. The step
     counter still advances every call regardless of `visible`, so bias
     correction reflects elapsed training steps, matching the reference.
+
+    A param group may carry an optional `lr_scale` tensor, broadcast against
+    each parameter's trailing dimensions, to give parts of one tensor
+    different learning rates. The reference trains SH as two tensors --
+    DC at `lr` and the higher bands at `lr / 20` -- while this package keeps
+    them in one `raw_sh`; `sh_lr_scale` builds the matching multiplier.
     """
 
     def __init__(
@@ -153,6 +159,7 @@ class SparseAdam(torch.optim.Optimizer):
             lr = group["lr"]
             beta1, beta2 = group["betas"]
             eps = group["eps"]
+            lr_scale = group.get("lr_scale")
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -189,4 +196,18 @@ class SparseAdam(torch.optim.Optimizer):
                 bias_correction2 = 1 - beta2**step
                 denom = (avg_sq / bias_correction2).sqrt_().add_(eps)
                 update = avg.div(denom).mul_(lr / bias_correction1)
+                if lr_scale is not None:
+                    update.mul_(lr_scale)
                 p.index_copy_(0, idx, p.index_select(0, idx) - update)
+
+
+def sh_lr_scale(raw_sh: torch.Tensor, rest_factor: float = 1.0 / 20.0) -> torch.Tensor:
+    """(K, 1) `lr_scale` for a `raw_sh` param group: 1 for the DC
+    coefficient, `rest_factor` for every higher band, matching the
+    reference's `feature_lr` / `feature_lr / 20` split.
+    """
+    scale = torch.full(
+        (raw_sh.shape[1], 1), rest_factor, device=raw_sh.device, dtype=raw_sh.dtype
+    )
+    scale[0] = 1.0
+    return scale

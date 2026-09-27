@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -18,7 +20,6 @@ FX = FY = 50.0
 CX = CY = 32.0
 W = H = 64
 NEAR = 0.1
-EPS2D = 0.3  # projection: 2D covariance dilation, px^2
 FILTER_SIZE = DEFAULT_FILTER_SIZE  # rasterizer: screen-space fallback sigma, px
 
 
@@ -44,8 +45,9 @@ def _random_scene(n, seed=0):
 
     R_wc, t_wc = torch.eye(3), torch.zeros(3)
     proj = project_gaussians_2dgs_ref(
-        means, scales, quats, R_wc, t_wc, FX, FY, CX, CY, W, H, near=NEAR, eps2d=EPS2D
-    )
+        means, scales, quats, R_wc, t_wc, FX, FY, CX, CY, W, H, near=NEAR,
+        opacities=opacities,
+    )  # fmt: skip
     return proj, opacities, colors
 
 
@@ -74,9 +76,8 @@ def test_forward_matches_reference(n):
         opacities.to("mps"),
         colors.to("mps"),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -91,9 +92,8 @@ def test_forward_matches_reference(n):
     # (see rasterize_2dgs.metal's uv_active gating), so a handful of pixels
     # can cross the alpha>=1/255 or T<1e-4 cutoff on one platform and not
     # the other -- ordinary GPU-vs-CPU float32 noise, not gradient bias.
-    # Empirically bounded well under these across many random scenes/seeds
-    # (see RADIUS_SAFETY_MARGIN in project_2dgs_ref.py for the tile-culling
-    # margin that keeps this rare).
+    # Empirically bounded well under these across many random scenes/seeds.
+    # (Tile binning itself is exact -- see project_2dgs_ref.surfel_rects.)
     assert torch.allclose(image, ref["image"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(depth, ref["depth"], atol=1e-2, rtol=1e-2)
     assert torch.allclose(normal, ref["normal"], atol=1e-2, rtol=1e-2)
@@ -161,9 +161,8 @@ def test_backward_matches_reference(n):
         opacities_mps,
         colors_mps,
         depths_mps,
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -224,9 +223,8 @@ def test_abs_grad_accum_mutates_in_place_and_nonzero():
         opacities.to("mps"),
         colors.to("mps"),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -287,9 +285,8 @@ def test_distortion_backward_matches_reference_in_isolation(n):
         opacities_mps,
         colors.to("mps"),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -381,9 +378,8 @@ def test_pixel_count_accum_counts_covered_pixels():
         opacities.to("mps").requires_grad_(),
         colors.to("mps").requires_grad_(),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -425,9 +421,8 @@ def test_pixel_count_accum_matches_a_brute_force_count():
         opacities.to("mps").requires_grad_(),
         colors.to("mps").requires_grad_(),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -485,7 +480,6 @@ def test_abs_grad_uses_the_mean_depth_not_the_hit_depth():
         w,
         h,
         near=NEAR,
-        eps2d=EPS2D,
     )
     assert bool(proj.valid[0]), "scene setup: the splat must survive culling"
 
@@ -514,9 +508,8 @@ def test_abs_grad_uses_the_mean_depth_not_the_hit_depth():
         opacities.to("mps").requires_grad_(),
         colors.to("mps").requires_grad_(),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         w,
         h,
         near=NEAR,
@@ -576,7 +569,6 @@ def test_depth_gradient_flows_through_the_fallback():
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
     )
     assert bool(proj.valid[0]), "scene setup: the splat must survive culling"
 
@@ -604,9 +596,8 @@ def test_depth_gradient_flows_through_the_fallback():
         opacities.to("mps"),
         colors.to("mps"),
         depths_mps,
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -654,7 +645,6 @@ def test_screen_space_fallback_uses_the_paper_filter_width():
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
     )
     out = rasterize_gaussians_2dgs(
         proj.means2d.to("mps"),
@@ -663,9 +653,8 @@ def test_screen_space_fallback_uses_the_paper_filter_width():
         opacities.to("mps"),
         colors.to("mps"),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -739,7 +728,6 @@ def test_transmittance_cutoff_drops_the_same_gaussian_as_the_kernel():
         W,
         H,
         near=NEAR,
-        eps2d=EPS2D,
     )
     assert bool(proj.valid.all()), "scene setup: every disk must survive culling"
 
@@ -763,9 +751,8 @@ def test_transmittance_cutoff_drops_the_same_gaussian_as_the_kernel():
         opacities.to("mps"),
         colors.to("mps"),
         proj.depths.to("mps"),
-        proj.radii.to("mps"),
+        proj.rects.to("mps"),
         proj.valid.to("mps"),
-        proj.conics.to("mps"),
         W,
         H,
         near=NEAR,
@@ -783,3 +770,33 @@ def test_transmittance_cutoff_drops_the_same_gaussian_as_the_kernel():
     # so no blue reaches the center pixel.
     center = image[int(CY), int(CX)]
     assert center[2] < 1e-7, f"blue leaked into the center pixel: {center.tolist()}"
+
+
+@pytest.mark.parametrize("tile_size", [4, 8])
+def test_backward_independent_of_tile_size(tile_size):
+    # A tile list longer than the tile_size^2 threads of a small threadgroup:
+    # the backward's shared-memory staging must still cover every slot.
+    from metalsplat import Camera, Gaussian2DModel, render_2dgs
+
+    torch.manual_seed(0)
+    model = Gaussian2DModel.random(n=600, bound=1.0, device="mps")
+    with torch.no_grad():
+        model.means[:, 2] += 3.0
+        model.raw_scales.fill_(math.log(0.08))
+        model.raw_opacities.fill_(-2.0)
+    camera = Camera.identity(
+        fx=40, fy=40, cx=16, cy=16, img_width=32, img_height=32
+    ).to("mps")
+
+    def grads(ts):
+        model.zero_grad()
+        aux = render_2dgs(model, camera, tile_size=ts, return_aux=True)
+        loss = (
+            aux.image.sum() + aux.depth.sum() + aux.normal.sum() + aux.distortion.sum()
+        )
+        loss.backward()
+        torch.mps.synchronize()
+        return [p.grad.cpu().clone() for p in model.parameters()]
+
+    for got, expected in zip(grads(tile_size), grads(16)):
+        assert torch.allclose(got, expected, atol=1e-3, rtol=1e-3)

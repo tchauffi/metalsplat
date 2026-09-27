@@ -24,8 +24,9 @@ class RenderAux(NamedTuple):
     image: torch.Tensor  # (H, W, 3)
     means2d: torch.Tensor  # (N, 2), with retain_grad() called
     valid: torch.Tensor  # (N,)
-    final_T: torch.Tensor  # (H, W) per-pixel transmittance
-    depth: torch.Tensor  # (H, W) alpha-weighted expected depth, forward-only
+    final_T: torch.Tensor  # (H, W) per-pixel transmittance, requires_grad=False
+    depth: torch.Tensor  # (H, W) alpha-weighted expected depth, requires_grad=False
+    radii: torch.Tensor  # (N,) projected 3-sigma pixel radius, 0 if culled
 
 
 def render(
@@ -49,7 +50,8 @@ def render(
     loops to count how many steps each gaussian was visible for; `final_T`
     (per-pixel transmittance, close to 1 where ~no gaussian contributed) is
     used by metalsplat.seed to find uncovered regions; `depth` is the
-    alpha-weighted expected depth (forward-only, no gradient).
+    alpha-weighted expected depth (forward-only, no gradient); `radii` is
+    each gaussian's projected pixel radius (0 if culled).
 
     `abs_grad_accum`, if given, is passed through to rasterize_gaussians:
     an (N,) tensor that backward() atomically adds each gaussian's
@@ -154,7 +156,12 @@ def render(
     if return_aux:
         image, depth, final_T = result
         return RenderAux(
-            image=image, means2d=means2d, valid=valid, final_T=final_T, depth=depth
+            image=image,
+            means2d=means2d,
+            valid=valid,
+            final_T=final_T,
+            depth=depth,
+            radii=radii,
         )
     return result
 
@@ -170,7 +177,7 @@ class Render2DGSAux(NamedTuple):
     image: torch.Tensor  # (H, W, 3)
     means2d: torch.Tensor  # (N, 2), with retain_grad() called
     valid: torch.Tensor  # (N,)
-    final_T: torch.Tensor  # (H, W) per-pixel transmittance, forward-only
+    final_T: torch.Tensor  # (H, W) per-pixel transmittance, requires_grad=False
     depth: (
         torch.Tensor
     )  # (H, W) alpha-weighted ray-splat-intersection depth, differentiable
@@ -184,7 +191,6 @@ def render_2dgs(
     model: Gaussian2DModel,
     camera: Camera,
     near: float = 0.2,
-    eps2d: float = 0.3,
     filter_size: float = DEFAULT_FILTER_SIZE,
     tile_size: int = DEFAULT_TILE_SIZE,
     background: torch.Tensor | None = None,
@@ -210,12 +216,13 @@ def render_2dgs(
     alpha-weighted *sums*, so neither can be interpreted without it (see
     that function's docstring).
 
-    `eps2d` and `filter_size` are two different low-pass widths and are
-    deliberately separate knobs: `eps2d` dilates the projected 2D
-    covariance (px^2) for the EWA/tile-culling bound, while `filter_size`
-    is the pixel standard deviation of the rasterizer's own screen-space
-    fallback for near-edge-on splats. See
-    `metalsplat.reference.rasterize_2dgs_ref.DEFAULT_FILTER_SIZE`.
+    `filter_size` is the pixel standard deviation of the rasterizer's own
+    screen-space fallback for near-edge-on splats (see
+    `metalsplat.reference.rasterize_2dgs_ref.DEFAULT_FILTER_SIZE`). It
+    also widens every splat's screen footprint, so the projection's tile
+    bounds use it too. (There is no `eps2d`: that dilated the 3DGS EWA
+    covariance this path used to borrow for its tile bounds, which are now
+    exact -- see `metalsplat.reference.project_2dgs_ref.surfel_rects`.)
 
     `abs_grad_accum`, if given, is passed through to
     `rasterize_gaussians_2dgs`: an (N,) tensor that backward() atomically
@@ -225,22 +232,24 @@ def render_2dgs(
     covered-pixel counts that normalize that signal per pixel rather
     than per screen area.
     """
-    means2d, depths, conics, radii, valid, _compensation, transform, normal = (
-        project_gaussians_2dgs(
-            model.means,
-            model.scales,
-            model.quats,
-            camera.R_wc,
-            camera.t_wc,
-            camera.fx,
-            camera.fy,
-            camera.cx,
-            camera.cy,
-            camera.img_width,
-            camera.img_height,
-            near=near,
-            eps2d=eps2d,
-        )
+    opacities = model.opacities
+    means2d, depths, rects, valid, transform, normal = project_gaussians_2dgs(
+        model.means,
+        model.scales,
+        model.quats,
+        camera.R_wc,
+        camera.t_wc,
+        camera.fx,
+        camera.fy,
+        camera.cx,
+        camera.cy,
+        camera.img_width,
+        camera.img_height,
+        near=near,
+        filter_size=filter_size,
+        # Opacity-aware tile bounds, as 3DGS's binning does: a faint splat's
+        # alpha clears the cutoff over a much smaller area.
+        opacities=opacities.detach(),
     )
     if return_aux and means2d.requires_grad:
         means2d.retain_grad()
@@ -255,12 +264,11 @@ def render_2dgs(
         means2d,
         transform,
         normal,
-        model.opacities,
+        opacities,
         colors,
         depths,
-        radii,
+        rects,
         valid,
-        conics,
         camera.img_width,
         camera.img_height,
         tile_size=tile_size,

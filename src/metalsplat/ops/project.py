@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
+from metalsplat.ops._validate import check_float32, check_shape, require_mps
 
 
 class ProjectGaussians(torch.autograd.Function):
@@ -74,6 +75,8 @@ class ProjectGaussians(torch.autograd.Function):
         ctx.img_width, ctx.img_height = img_width, img_height
         ctx.near, ctx.eps2d = near, eps2d
         ctx.n = n
+        # Integer radii and a 0/1 flag: structural, never differentiated.
+        ctx.mark_non_differentiable(radii, valid)
         return means2d, depths, conics, radii, valid, compensations
 
     @staticmethod
@@ -157,6 +160,14 @@ def project_gaussians(
     Returns (means2d, depths, conics, radii, valid, compensation) -- see
     metalsplat.reference.project_ref.ProjectionResult for field semantics.
     """
+    device = means.device
+    n = means.shape[0]
+    require_mps("means", device)
+    check_float32("means", means, (n, 3), device)
+    check_float32("scales", scales, (n, 3), device)
+    check_float32("quats", quats, (n, 4), device)
+    check_shape("R_wc", R_wc, (3, 3))
+    check_shape("t_wc", t_wc, (3,))
     return ProjectGaussians.apply(
         means,
         scales,

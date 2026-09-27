@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -344,3 +346,18 @@ def test_ray_cache_is_bounded_and_still_caches():
     finally:
         losses._RAY_CACHE.clear()
         losses._RAY_CACHE.update(saved)
+
+
+def test_psnr_clamps_the_prediction():
+    from metalsplat.losses import psnr
+
+    target = torch.full((4, 4, 3), 0.5)
+    pred = target.clone()
+    pred[0, 0] = 1.0
+    # Out-of-range values render identically to 1.0, so they score the same.
+    over = pred.clone()
+    over[0, 0] = 3.0
+    assert torch.allclose(psnr(over, target), psnr(pred, target))
+    expected = -10.0 * math.log10(0.25 * 3 / pred.numel())
+    assert psnr(pred, target).item() == pytest.approx(expected, rel=1e-5)
+    assert psnr(target, target).item() == float("inf")

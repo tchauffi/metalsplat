@@ -1,20 +1,20 @@
 """Pure-PyTorch reference projection of 2D gaussian splats ("surfels") to
-2D screen space. Executable spec / CPU fallback for
+2D screen space. Executable spec (runnable on CPU) for
 ``metalsplat.kernels.project_2dgs``, same role as ``project_ref`` for 3DGS.
 
 This does two distinct jobs:
 
-1. **Tile-culling bound.** Reuses the *exact* 3DGS EWA/conic approximation
-   (``reference.project_ref.project_gaussians``) by treating the splat as a
-   degenerate 3D ellipsoid whose missing depth-axis scale is a fixed small
-   ``EPS_3RD_AXIS``. This produces ``means2d``/``depths``/``conics``/
-   ``radii``/``valid``/``compensation`` in the exact layout 3DGS uses, so
-   ``ops.tiling.bin_and_sort_gaussians``/``kernels/tiling.metal`` are reused
-   completely unmodified for tile binning. Because that linear
-   approximation can *underestimate* a flat disk's true screen footprint
-   near edge-on views (where the exact ray-splat silhouette extends further
-   than the first-order Taylor expansion predicts), ``RADIUS_SAFETY_MARGIN``
-   inflates the resulting radius before it's used for culling.
+1. **Exact screen footprint** for tile binning and culling (`rects`,
+   `valid`), from the same transform the rasterizer intersects -- see
+   ``surfel_rects``. The rasterizer composites a pixel wherever
+   ``min(rho_uv, rho_screen)`` is under the alpha cutoff, so the
+   footprint is the perspective image of the local ellipse
+   ``u^2 + v^2 <= c^2`` joined with the screen-space filter's disk, and
+   both have closed-form bounding boxes. This replaced a reused 3DGS EWA
+   (local-affine) bound inflated by a 2.5x safety margin: the affine
+   approximation underestimates a tilted or near-camera disk's true
+   perspective footprint, and the margin that papered over that also made
+   every face-on splat's box ~2.5x too wide in each axis.
 2. **Exact per-gaussian data for the ray-splat intersection** the
    rasterizer performs per pixel (``rasterize_2dgs``): the 9 independent
    entries of ``M = W @ H`` and the camera-facing world-space normal.
@@ -49,23 +49,87 @@ from dataclasses import dataclass
 
 import torch
 
-from metalsplat.reference.project_ref import project_gaussians as _project_gaussians_3d
+from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
+from metalsplat.reference.tiling_ref import EMPTY_RECT, MAX_SIGMA_EXTENT, sigma_extent
 from metalsplat.utils.quaternion import quat_to_rotmat
-
-EPS_3RD_AXIS = 1e-6  # world units; stand-in for the missing depth-axis scale
-RADIUS_SAFETY_MARGIN = 2.5  # tile-culling radius multiplier, see module docstring
 
 
 @dataclass
 class Projection2DGSResult:
     means2d: torch.Tensor  # (N, 2) pixel-space centers
     depths: torch.Tensor  # (N,) camera-space z of the gaussian mean
-    conics: torch.Tensor  # (N, 3) tile-culling-only inverse-2D-covariance (a, b, c)
-    radii: torch.Tensor  # (N,) integer pixel radius (tile-culling bound), 0 if culled
+    rects: (
+        torch.Tensor
+    )  # (N, 4) exact screen footprint, xmin/ymin/xmax/ymax; empty if culled
     valid: torch.Tensor  # (N,) bool, False for culled gaussians
-    compensation: torch.Tensor  # (N,) anti-aliasing opacity scale in [0, 1]
     transform: torch.Tensor  # (N, 3, 3) M's 9 independent entries, row-major
     normal: torch.Tensor  # (N, 3) world-space normal, flipped to face the camera
+
+
+def surfel_rects(
+    transform: torch.Tensor,  # (N, 3, 3), rows as in Projection2DGSResult.transform
+    means2d: torch.Tensor,  # (N, 2)
+    cutoff: torch.Tensor,  # (N,) alpha cutoff radius in splat sigmas
+    filter_size: float,
+    img_width: int,
+    img_height: int,
+) -> torch.Tensor:
+    """(N, 4) exact screen rectangle of everywhere each splat composites.
+
+    The rasterizer's alpha falls below its cutoff where
+    ``min(rho_uv, rho_screen) > c^2``, so the footprint is the union of:
+
+    - the perspective image of the local ellipse ``u^2 + v^2 <= c^2``.
+      With ``T`` the transform (rows: x-numerator, y-numerator, w), a local
+      point ``p = (u, v, 1)`` lands at screen ``(T0.p / T2.p, T1.p /
+      T2.p)``. The ellipse is the conic ``diag(1, 1, -c^2)``; its image's
+      *dual* conic is ``C* = T diag(c^2, c^2, -1) T^T``, and an axis-aligned
+      tangent ``x = x0`` satisfies ``C*_00 - 2 x0 C*_02 + x0^2 C*_22 = 0``,
+      giving center ``C*_02 / C*_22`` and half-extent
+      ``sqrt(center^2 - C*_00 / C*_22)``. This is exact, where the old EWA
+      bound was a first-order approximation. The image is a bounded
+      ellipse iff ``C*_22 < 0`` -- i.e. the local ellipse stays entirely
+      in front of the camera plane; otherwise its image is unbounded and
+      the whole frame is the only safe bound. Computed in coordinates
+      relative to the projected center (``T0 - mx*T2``, ``T1 - my*T2``) so
+      that a small splat far from the principal point does not lose its
+      extent to float32 cancellation.
+    - the screen-space filter's disk, radius ``c * filter_size`` around
+      ``means2d``.
+    """
+    mx, my = means2d[:, 0:1], means2d[:, 1:2]
+    r2 = transform[:, 2, :]
+    r0 = transform[:, 0, :] - mx * r2
+    r1 = transform[:, 1, :] - my * r2
+    c2 = cutoff * cutoff
+    d = torch.stack([c2, c2, -torch.ones_like(c2)], dim=-1)  # (N, 3)
+
+    c22 = (d * r2 * r2).sum(-1)
+    bounded = c22 < 0
+    c22_safe = torch.where(bounded, c22, -torch.ones_like(c22))
+    ox = (d * r0 * r2).sum(-1) / c22_safe
+    oy = (d * r1 * r2).sum(-1) / c22_safe
+    hx = (ox * ox - (d * r0 * r0).sum(-1) / c22_safe).clamp_min(0.0).sqrt()
+    hy = (oy * oy - (d * r1 * r1).sum(-1) / c22_safe).clamp_min(0.0).sqrt()
+    mx, my = mx[:, 0], my[:, 0]
+    ellipse = torch.stack([mx + ox - hx, my + oy - hy, mx + ox + hx, my + oy + hy], -1)
+    frame = torch.tensor(
+        [0.0, 0.0, float(img_width), float(img_height)],
+        device=transform.device,
+        dtype=transform.dtype,
+    ).expand_as(ellipse)
+    rect = torch.where(bounded[:, None], ellipse, frame)
+
+    s = cutoff * filter_size
+    return torch.stack(
+        [
+            torch.minimum(rect[:, 0], mx - s),
+            torch.minimum(rect[:, 1], my - s),
+            torch.maximum(rect[:, 2], mx + s),
+            torch.maximum(rect[:, 3], my + s),
+        ],
+        dim=-1,
+    )
 
 
 def project_gaussians_2dgs(
@@ -81,45 +145,25 @@ def project_gaussians_2dgs(
     img_width: int,
     img_height: int,
     near: float = 0.2,
-    eps2d: float = 0.3,
+    filter_size: float = DEFAULT_FILTER_SIZE,
+    opacities: torch.Tensor | None = None,  # (N,), tightens `rects`; see below
 ) -> Projection2DGSResult:
+    """`valid` is judged at the largest cutoff any opacity reaches
+    (MAX_SIGMA_EXTENT), so visibility does not depend on opacity, as in
+    3DGS. `rects` uses each splat's own opacity-aware cutoff when
+    `opacities` is given (see tiling_ref.sigma_extent), and full opacity
+    otherwise; a culled splat gets EMPTY_RECT.
+    """
     n = means.shape[0]
     device, dtype = means.device, means.dtype
 
-    scales3 = torch.cat(
-        [scales, torch.full((n, 1), EPS_3RD_AXIS, device=device, dtype=dtype)], dim=-1
+    mean_cam = means @ R_wc.T + t_wc  # (N, 3)
+    depths = mean_cam[:, 2]
+    z_safe = depths.clamp_min(near)
+    means2d = torch.stack(
+        [fx * mean_cam[:, 0] / z_safe + cx, fy * mean_cam[:, 1] / z_safe + cy],
+        dim=-1,
     )
-    culling = _project_gaussians_3d(
-        means,
-        scales3,
-        quats,
-        R_wc,
-        t_wc,
-        fx,
-        fy,
-        cx,
-        cy,
-        img_width,
-        img_height,
-        near=near,
-        eps2d=eps2d,
-        # Inflate *inside* the culling test rather than afterwards: a splat
-        # whose un-margined footprint falls outside the frame but whose
-        # margined one reaches back in has to stay valid, or the margin
-        # would be doing nothing for exactly the frame-edge splats it
-        # exists to keep. kernels/project_2dgs.metal tests `in_bounds`
-        # against the inflated radius for the same reason, and the two
-        # must agree gaussian-for-gaussian.
-        radius_margin=RADIUS_SAFETY_MARGIN,
-    )
-    # ops.tiling/kernels/tiling.metal derive the actual per-tile bounding
-    # box from `conics` (via the 2D covariance's diagonal), not from
-    # `radii` -- radii only gates whether a gaussian is culled at all. So
-    # the safety margin has to inflate the covariance the conic represents
-    # too, or a tilted disk's silhouette can still fall outside every tile
-    # it got binned into even with a margined `radii`. Scaling Sigma2d by
-    # margin^2 is scaling its inverse (the conic) by 1/margin^2.
-    conics = culling.conics / (RADIUS_SAFETY_MARGIN * RADIUS_SAFETY_MARGIN)
 
     rotmat = quat_to_rotmat(quats)  # (N, 3, 3)
     t_u = rotmat[..., :, 0] * scales[:, 0:1]
@@ -135,7 +179,6 @@ def project_gaussians_2dgs(
     flip = (normal * view_dir).sum(-1, keepdim=True) < 0
     normal = torch.where(flip, -normal, normal)
 
-    mean_cam = means @ R_wc.T + t_wc  # (N, 3)
     tu_cam = t_u @ R_wc.T  # (N, 3), direction: no translation
     tv_cam = t_v @ R_wc.T  # (N, 3), direction: no translation
 
@@ -158,13 +201,33 @@ def project_gaussians_2dgs(
     row2 = torch.stack([tu_cam[:, 2], tv_cam[:, 2], mean_cam[:, 2]], dim=-1)
     transform = torch.stack([row0, row1, row2], dim=-2)  # (N, 3, 3)
 
+    with torch.no_grad():
+        full = torch.full((n,), MAX_SIGMA_EXTENT, device=device, dtype=dtype)
+        vis = surfel_rects(transform, means2d, full, filter_size, img_width, img_height)
+        in_bounds = (
+            (vis[:, 2] >= 0)
+            & (vis[:, 0] < img_width)
+            & (vis[:, 3] >= 0)
+            & (vis[:, 1] < img_height)
+        )
+        valid = (depths > near) & in_bounds
+
+        cutoff = (
+            full
+            if opacities is None
+            else sigma_extent(opacities.detach(), n, device).to(dtype)
+        )
+        rects = surfel_rects(
+            transform, means2d, cutoff, filter_size, img_width, img_height
+        )
+        empty = torch.tensor(EMPTY_RECT, device=device, dtype=dtype)
+        rects = torch.where((valid & (cutoff > 0))[:, None], rects, empty)
+
     return Projection2DGSResult(
-        means2d=culling.means2d,
-        depths=culling.depths,
-        conics=conics,
-        radii=culling.radii,
-        valid=culling.valid,
-        compensation=culling.compensation,
+        means2d=means2d,
+        depths=depths,
+        rects=rects,
+        valid=valid,
         transform=transform,
         normal=normal,
     )

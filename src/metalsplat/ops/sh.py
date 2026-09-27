@@ -9,7 +9,23 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
-from metalsplat.reference.sh_ref import MAX_SH_DEGREE
+from metalsplat.ops._validate import check_float32, require_mps
+from metalsplat.reference.sh_ref import MAX_SH_DEGREE, num_sh_coeffs
+
+
+def buffer_sh_degree(num_coeffs: int) -> int:
+    """The SH degree a buffer of `num_coeffs` coefficients per channel holds.
+
+    Raises ValueError unless it is exactly (degree+1)^2 for a degree in
+    0..MAX_SH_DEGREE.
+    """
+    for degree in range(MAX_SH_DEGREE + 1):
+        if num_sh_coeffs(degree) == num_coeffs:
+            return degree
+    raise ValueError(
+        f"{num_coeffs} SH coefficients per channel is not (degree+1)^2 for any "
+        f"degree in 0..{MAX_SH_DEGREE}"
+    )
 
 
 class EvalSH(torch.autograd.Function):
@@ -60,14 +76,30 @@ class EvalSH(torch.autograd.Function):
 
 
 def eval_sh(
-    sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int = MAX_SH_DEGREE
+    sh_coeffs: torch.Tensor, dirs: torch.Tensor, active_degree: int | None = None
 ) -> torch.Tensor:
     """Evaluates degree<=3 spherical harmonics color using the Metal kernel.
 
     sh_coeffs: (N, K, 3) where K = (degree+1)^2 for the model's own degree,
     dirs: (N, 3) unit view directions -> (N, 3) color. `active_degree`
     restricts evaluation to that degree; coefficients above it are skipped
-    in both passes, so they receive zero gradient. It must not exceed what
-    K holds.
+    in both passes, so they receive zero gradient. It defaults to the degree
+    K holds, and may not exceed it: the kernel indexes each gaussian's
+    coefficients by degree, so a higher one would read the next gaussian's.
     """
+    if sh_coeffs.dim() != 3 or sh_coeffs.shape[2] != 3:
+        raise ValueError(f"sh_coeffs must be (N, K, 3), got {tuple(sh_coeffs.shape)}")
+    require_mps("sh_coeffs", sh_coeffs.device)
+    n = sh_coeffs.shape[0]
+    check_float32("sh_coeffs", sh_coeffs, (n, sh_coeffs.shape[1], 3), sh_coeffs.device)
+    check_float32("dirs", dirs, (n, 3), sh_coeffs.device)
+    stored_degree = buffer_sh_degree(sh_coeffs.shape[1])
+    if active_degree is None:
+        active_degree = stored_degree
+    if not 0 <= active_degree <= stored_degree:
+        raise ValueError(
+            f"active_degree={active_degree} needs {num_sh_coeffs(active_degree)} "
+            f"coefficients per channel, but sh_coeffs holds {sh_coeffs.shape[1]} "
+            f"(degree {stored_degree})"
+        )
     return EvalSH.apply(sh_coeffs, dirs, active_degree)

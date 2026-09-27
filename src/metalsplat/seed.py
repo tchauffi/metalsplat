@@ -25,9 +25,8 @@ from dataclasses import dataclass
 import torch
 
 from metalsplat.camera import Camera
-from metalsplat.gaussians import GaussianModel
 from metalsplat.optim import NEW_GAUSSIAN
-from metalsplat.reference.sh_ref import SH_C0
+from metalsplat.splat_model import SplatModel
 
 
 @dataclass
@@ -44,7 +43,7 @@ class SeedStats:
 
 
 def seed_uncovered_regions(
-    model: GaussianModel,
+    model: SplatModel,
     camera: Camera,
     pred: torch.Tensor,  # (H, W, 3) rendered image this step
     target: torch.Tensor,  # (H, W, 3) ground truth
@@ -56,7 +55,7 @@ def seed_uncovered_regions(
     fallback_depth_percentile: float = 0.8,
     near: float = 0.2,
     max_points: int | None = None,
-) -> tuple[GaussianModel, SeedStats]:
+) -> tuple[SplatModel, SeedStats]:
     device = model.means.device
     n_before = model.num_points
     if max_points is not None and n_before >= max_points:
@@ -83,14 +82,29 @@ def seed_uncovered_regions(
 
     # A purely uncovered pixel (e.g. true sky) has no real depth to
     # estimate from, so fall back to a representative "far" depth: a high
-    # percentile of this camera's *currently visible* gaussian depths.
+    # percentile of the depths of the gaussians this camera actually sees
+    # (centre in front and inside the frame). Everything merely in front of
+    # the camera would include geometry far off to the side, which says
+    # nothing about how deep this view's content is. If none are in frame,
+    # everything in front is the best remaining guess.
     with torch.no_grad():
         means_cam = model.means.detach() @ camera.R_wc.T + camera.t_wc
         depths_cam = means_cam[:, 2]
         in_front = depths_cam > near
+        z_safe = depths_cam.clamp_min(near)
+        u = camera.fx * means_cam[:, 0] / z_safe + camera.cx
+        v = camera.fy * means_cam[:, 1] / z_safe + camera.cy
+        in_frame = (
+            in_front
+            & (u >= 0)
+            & (u < camera.img_width)
+            & (v >= 0)
+            & (v < camera.img_height)
+        )
+        pool = in_frame if bool(in_frame.any()) else in_front
         fallback_depth = (
-            torch.quantile(depths_cam[in_front], fallback_depth_percentile).item()
-            if bool(in_front.any())
+            torch.quantile(depths_cam[pool], fallback_depth_percentile).item()
+            if bool(pool.any())
             else 10.0 * init_scale
         )
 
@@ -105,48 +119,28 @@ def seed_uncovered_regions(
     # = R_wc^T @ cam + camera.position (row-vector form: cam_pts @ R_wc).
     new_means = cam_pts @ camera.R_wc + camera.position
 
-    new_scales = torch.full((k, 3), init_scale, device=device)
+    new_scales = torch.full((k, model.NUM_SCALE_AXES), init_scale, device=device)
     new_quats = torch.zeros(k, 4, device=device)
     new_quats[:, 0] = 1.0
     new_opacities = torch.full((k,), 0.1, device=device)
     new_colors = target[ys, xs]  # bootstrap color directly from ground truth
 
-    means = model.means.detach()
-    scales = model.scales.detach()
-    quats = model.quats.detach()
-    opacities = model.opacities.detach()
-    color_like = (model.colors if model.sh_degree == 0 else model.raw_sh).detach()
+    # Existing gaussians are carried over losslessly from their raw
+    # parameters; only the seeded ones are built from activated values. For
+    # an SH model the constructor puts the colour in the DC band and zeroes
+    # the rest, at the model's own coefficient count.
+    seeded = type(model)(
+        new_means,
+        scales=new_scales,
+        quats=new_quats,
+        opacities=new_opacities,
+        colors=new_colors,
+        sh_degree=model.sh_degree,
+        active_sh_degree=model.active_sh_degree,
+    )
+    new_model = model.cat(seeded)
 
-    final_means = torch.cat([means, new_means], dim=0)
-    final_scales = torch.cat([scales, new_scales], dim=0)
-    final_quats = torch.cat([quats, new_quats], dim=0)
-    final_opacities = torch.cat([opacities, new_opacities], dim=0)
-
-    if model.sh_degree == 0:
-        final_color_like = torch.cat([color_like, new_colors], dim=0)
-        new_model = GaussianModel(
-            final_means,
-            scales=final_scales,
-            quats=final_quats,
-            opacities=final_opacities,
-            colors=final_color_like,
-        ).to(device)
-    else:
-        # Match the model's own coefficient count, which depends on its degree.
-        new_sh = torch.zeros(k, color_like.shape[1], 3, device=device)
-        new_sh[:, 0, :] = (new_colors - 0.5) / SH_C0
-        final_color_like = torch.cat([color_like, new_sh], dim=0)
-        new_model = GaussianModel(
-            final_means,
-            scales=final_scales,
-            quats=final_quats,
-            opacities=final_opacities,
-            sh_degree=model.sh_degree,
-            sh_coeffs=final_color_like,
-            active_sh_degree=model.active_sh_degree,
-        ).to(device)
-
-    n_after = final_means.shape[0]
+    n_after = new_model.num_points
     source_index = torch.cat(
         [
             torch.arange(n_before, device=device),

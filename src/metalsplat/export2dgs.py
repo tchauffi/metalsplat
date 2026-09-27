@@ -44,8 +44,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from metalsplat._ply import (
+    color_columns,
+    model_color_kwargs,
+    read_ply,
+    stack_columns,
+    write_ply,
+)
 from metalsplat.gaussians_2dgs import Gaussian2DModel
-from metalsplat.reference.sh_ref import MAX_SH_DEGREE, SH_C0, num_sh_coeffs
 
 # log-space gap below a splat's thinner in-plane axis used for the synthetic
 # scale_2 in viewer_compatible mode -- exp(-4) ~ 1.8% of that axis, thin
@@ -57,154 +63,46 @@ _VIEWER_COMPAT_LOG_MARGIN = 4.0
 def save_ply(
     model: Gaussian2DModel, path: str | Path, viewer_compatible: bool = False
 ) -> None:
-    path = Path(path)
-    n = model.num_points
-
-    xyz = model.means.detach().cpu().numpy().astype(np.float32)
-    normals = np.zeros_like(xyz)
-
-    if model.sh_degree == 0:
-        dc = (
-            ((model.colors.detach() - 0.5) / SH_C0).cpu().numpy().astype(np.float32)
-        )  # (N, 3)
-        rest = np.zeros((n, 24), dtype=np.float32)
-    else:
-        sh = model.raw_sh.detach().cpu()  # (N, K, 3)
-        dc = sh[:, 0, :].numpy().astype(np.float32)  # (N, 3)
-        rest = (
-            sh[:, 1:, :]
-            .transpose(1, 2)
-            .contiguous()
-            .reshape(n, -1)
-            .numpy()
-            .astype(np.float32)
-        )
-
-    opacity = (
-        model.raw_opacities.detach().cpu().numpy().astype(np.float32).reshape(n, 1)
-    )
-    scale = (
-        model.raw_scales.detach().cpu().numpy().astype(np.float32)
-    )  # (N, 2), log-space
+    xyz = model.means.detach().cpu().numpy()
+    dc, rest = color_columns(model)
+    scale = model.raw_scales.detach().cpu().numpy()  # (N, 2), log-space
     if viewer_compatible:
-        thin_axis = (
-            np.minimum(scale[:, 0], scale[:, 1]) - _VIEWER_COMPAT_LOG_MARGIN
-        ).reshape(n, 1)
-        scale = np.concatenate([scale, thin_axis], axis=1)  # (N, 3)
-    rot = model.quats.detach().cpu().numpy().astype(np.float32)  # (N, 4), unit, w x y z
+        thin_axis = np.minimum(scale[:, 0], scale[:, 1]) - _VIEWER_COMPAT_LOG_MARGIN
+        scale = np.concatenate([scale, thin_axis[:, None]], axis=1)  # (N, 3)
 
-    data = np.concatenate([xyz, normals, dc, rest, opacity, scale, rot], axis=1).astype(
-        np.float32
+    write_ply(
+        path,
+        {
+            "x": xyz[:, 0],
+            "y": xyz[:, 1],
+            "z": xyz[:, 2],
+            "nx": np.zeros(len(xyz)),
+            "ny": np.zeros(len(xyz)),
+            "nz": np.zeros(len(xyz)),
+            "f_dc": dc,
+            "f_rest": rest,
+            "opacity": model.raw_opacities.detach().cpu().numpy(),
+            "scale": scale,
+            "rot": model.quats.detach().cpu().numpy(),  # (N, 4), unit, w x y z
+        },
     )
-
-    names = (
-        ["x", "y", "z", "nx", "ny", "nz"]
-        + [f"f_dc_{i}" for i in range(3)]
-        + [f"f_rest_{i}" for i in range(rest.shape[1])]
-        + ["opacity"]
-        + [f"scale_{i}" for i in range(scale.shape[1])]
-        + [f"rot_{i}" for i in range(4)]
-    )
-    assert data.shape[1] == len(names)
-
-    header = (
-        "\n".join(
-            [
-                "ply",
-                "format binary_little_endian 1.0",
-                f"element vertex {n}",
-                *[f"property float {name}" for name in names],
-                "end_header",
-            ]
-        )
-        + "\n"
-    )
-
-    with open(path, "wb") as f:
-        f.write(header.encode("ascii"))
-        f.write(np.ascontiguousarray(data).tobytes())
 
 
 def load_ply(path: str | Path, device: str = "cpu") -> Gaussian2DModel:
     """Inverse of save_ply: reads a 2DGS .ply back into a Gaussian2DModel.
 
-    See `metalsplat.export.load_ply` for the SH-degree-detection logic --
-    identical here, just building a `Gaussian2DModel` from 2 `scale_*`
-    columns instead of 3.
+    Same as `metalsplat.export.load_ply`, but builds the model from the two
+    `scale_0`/`scale_1` columns; a viewer-compatible file's synthetic
+    `scale_2` is ignored.
     """
-    import warnings
-
     path = Path(path)
-    with open(path, "rb") as f:
-        content = f.read()
-
-    marker = b"end_header\n"
-    header_end = content.index(marker) + len(marker)
-    lines = content[:header_end].decode("ascii").splitlines()
-    if lines[1] != "format binary_little_endian 1.0":
-        raise ValueError(
-            f"Only binary_little_endian .ply is supported, got: {lines[1]}"
-        )
-
-    n = int(
-        next(line for line in lines if line.startswith("element vertex")).split()[-1]
+    col = read_ply(path)
+    model = Gaussian2DModel(
+        stack_columns(col, "x", "y", "z"),
+        # stored as log-scale; Gaussian2DModel takes activated values
+        scales=stack_columns(col, "scale_0", "scale_1").exp(),
+        quats=stack_columns(col, "rot_0", "rot_1", "rot_2", "rot_3"),
+        opacities=torch.sigmoid(torch.from_numpy(col["opacity"].copy())),
+        **model_color_kwargs(col, path),
     )
-    names = [line.split()[-1] for line in lines if line.startswith("property float")]
-    data = np.frombuffer(content[header_end:], dtype="<f4").reshape(n, len(names))
-    col = {name: data[:, i] for i, name in enumerate(names)}
-
-    means = torch.from_numpy(np.stack([col["x"], col["y"], col["z"]], axis=1).copy())
-    scales = torch.from_numpy(
-        np.stack([col["scale_0"], col["scale_1"]], axis=1).copy()
-    ).exp()  # stored as log-scale; Gaussian2DModel takes activated values
-    quats = torch.from_numpy(
-        np.stack(
-            [col["rot_0"], col["rot_1"], col["rot_2"], col["rot_3"]], axis=1
-        ).copy()
-    )
-    opacities = torch.sigmoid(
-        torch.from_numpy(col["opacity"].copy())
-    )  # stored pre-sigmoid
-    dc = torch.from_numpy(
-        np.stack([col["f_dc_0"], col["f_dc_1"], col["f_dc_2"]], axis=1).copy()
-    )
-
-    n_rest = sum(1 for name in names if name.startswith("f_rest_"))
-    coeffs_per_channel = n_rest // 3
-    max_coeffs = num_sh_coeffs(MAX_SH_DEGREE)
-    if coeffs_per_channel > max_coeffs - 1:
-        warnings.warn(
-            f"{path.name} has {coeffs_per_channel + 1} SH coefficients/channel; this package "
-            f"supports {max_coeffs}. Dropping the higher-degree ones.",
-            stacklevel=2,
-        )
-
-    if n_rest == 0 or not np.any(np.stack([col[f"f_rest_{i}"] for i in range(n_rest)])):
-        colors = (dc * SH_C0 + 0.5).clamp(0, 1)
-        model = Gaussian2DModel(
-            means, scales=scales, quats=quats, opacities=opacities, colors=colors
-        )
-    else:
-        keep = min(coeffs_per_channel + 1, max_coeffs)
-        degree = 0
-        while num_sh_coeffs(degree + 1) <= keep:
-            degree += 1
-        n_coeffs = num_sh_coeffs(degree)
-
-        sh = torch.zeros(n, n_coeffs, 3)
-        sh[:, 0, :] = dc
-        for ch in range(3):
-            for k in range(n_coeffs - 1):
-                sh[:, k + 1, ch] = torch.from_numpy(
-                    col[f"f_rest_{ch * coeffs_per_channel + k}"].copy()
-                )
-        model = Gaussian2DModel(
-            means,
-            scales=scales,
-            quats=quats,
-            opacities=opacities,
-            sh_degree=degree,
-            sh_coeffs=sh,
-        )
-
     return model.to(device)

@@ -18,6 +18,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from metalsplat import Camera, GaussianModel, render
+from metalsplat.training import save_image
 
 DEVICE = "mps"
 IMG_SIZE = 128
@@ -40,11 +41,6 @@ def make_target_image(size: int) -> torch.Tensor:
     )
     arr = torch.from_numpy(np.array(img)).float() / 255.0
     return arr  # (H, W, 3)
-
-
-def save_image(tensor: torch.Tensor, path: Path) -> None:
-    arr = (tensor.clamp(0, 1).detach().cpu().numpy() * 255).astype("uint8")
-    Image.fromarray(arr).save(path)
 
 
 def main() -> None:

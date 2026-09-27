@@ -9,7 +9,14 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
-from metalsplat.ops.tiling import DEFAULT_TILE_SIZE, bin_and_sort_gaussians
+from metalsplat.ops._validate import (
+    check_accumulator,
+    check_float32,
+    check_shape,
+    kernel_background,
+    require_mps,
+)
+from metalsplat.ops.tiling import DEFAULT_TILE_SIZE, bin_and_sort_rects
 from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 
 
@@ -139,6 +146,9 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         ctx.n = n
         ctx.abs_grad_accum = abs_grad_accum
         ctx.pixel_count_accum = pixel_count_accum
+        # final_T has no backward (see there); marked so it comes out with
+        # requires_grad=False rather than looking differentiable.
+        ctx.mark_non_differentiable(out_final_T)
         return out_image, out_depth, out_normal, out_distortion, out_final_T
 
     @staticmethod
@@ -150,8 +160,8 @@ class _Rasterize2DGSImpl(torch.autograd.Function):
         grad_out_distortion,
         grad_final_T,
     ):
-        # grad_final_T is ignored: forward-only structural output (coverage
-        # detection), same convention as 3DGS's rasterize.py.
+        # grad_final_T is always zero: final_T is marked non-differentiable
+        # in forward (coverage detection only), same as 3DGS's rasterize.py.
         (
             means2d,
             transform,
@@ -265,9 +275,8 @@ def rasterize_gaussians_2dgs(
     opacities: torch.Tensor,
     colors: torch.Tensor,
     depths: torch.Tensor,
-    radii: torch.Tensor,
+    rects: torch.Tensor,
     valid: torch.Tensor,
-    conics: torch.Tensor,
     img_width: int,
     img_height: int,
     tile_size: int = DEFAULT_TILE_SIZE,
@@ -284,15 +293,13 @@ def rasterize_gaussians_2dgs(
     `project_gaussians_2dgs`). `depths` is differentiable because the
     per-pixel math falls back to the mean's depth for the intersection
     depth wherever the ray-splat solution is unusable -- it is a real
-    input on those pixels, not only a sort key. `radii`, `valid` and
-    `conics` are used only for (non-differentiable) tile binning --
-    `conics`/`radii` are the tile-culling approximation
-    project_gaussians_2dgs derives via the reused 3DGS EWA path, not used
-    for shading.
+    input on those pixels, not only a sort key. `rects` and `valid` are
+    used only for (non-differentiable) tile binning: `rects` is each
+    splat's exact screen footprint from project_gaussians_2dgs, which must
+    have used the same `filter_size` and opacities.
 
     `filter_size` is the standard deviation, in pixels, of the
-    screen-space low-pass fallback (see `DEFAULT_FILTER_SIZE`); it is a
-    different quantity from the projection's `eps2d`.
+    screen-space low-pass fallback (see `DEFAULT_FILTER_SIZE`).
 
     Returns `(image, depth, normal, distortion, final_T)`. Unlike 3DGS's
     `rasterize_gaussians`, `depth` and `normal` here carry real gradients
@@ -324,19 +331,24 @@ def rasterize_gaussians_2dgs(
     orders of magnitude below a near one covering hundreds, whatever
     their actual reconstruction error. See `metalsplat.densify2dgs`.
     """
-    binning = bin_and_sort_gaussians(
-        means2d.detach(),
-        depths.detach(),
-        conics.detach(),
-        radii.detach(),
-        valid,
-        img_width,
-        img_height,
-        tile_size,
-    )
     device = means2d.device
-    if background is None:
-        background = torch.zeros(3, device=device, dtype=torch.float32)
+    n = means2d.shape[0]
+    require_mps("means2d", device)
+    check_float32("means2d", means2d, (n, 2), device)
+    check_float32("transform", transform, (n, 9), device)
+    check_float32("normal", normal, (n, 3), device)
+    check_float32("opacities", opacities, (n,), device)
+    check_float32("colors", colors, (n, 3), device)
+    check_float32("depths", depths, (n,), device)
+    check_shape("rects", rects, (n, 4))
+    check_shape("valid", valid, (n,))
+    check_accumulator("abs_grad_accum", abs_grad_accum, n, device)
+    check_accumulator("pixel_count_accum", pixel_count_accum, n, device)
+    background = kernel_background(background, device)
+
+    binning = bin_and_sort_rects(
+        rects.detach(), depths.detach(), valid, img_width, img_height, tile_size
+    )
 
     return _Rasterize2DGSImpl.apply(
         means2d,

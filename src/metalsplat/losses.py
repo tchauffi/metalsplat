@@ -69,6 +69,19 @@ def ssim(
     return ssim_map.mean()
 
 
+def psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Peak signal-to-noise ratio in dB for images in [0, 1], as a scalar
+    tensor (inf for an exact match).
+
+    `pred` is clamped to [0, 1] first, as the reference evaluation does.
+    Rendered colour is only bounded below (SH colour is clamped at 0, not
+    at 1), and anything above 1 is clipped by every saved image and viewer
+    -- scoring the unclamped render would penalise error nobody can see.
+    """
+    mse = (pred.clamp(0.0, 1.0) - target).pow(2).mean()
+    return -10.0 * torch.log10(mse)
+
+
 def gaussian_splatting_loss(
     pred: torch.Tensor, target: torch.Tensor, lambda_dssim: float = DEFAULT_LAMBDA_DSSIM
 ) -> torch.Tensor:

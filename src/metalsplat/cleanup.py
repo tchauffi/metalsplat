@@ -14,40 +14,12 @@ from __future__ import annotations
 
 import torch
 
-from metalsplat.gaussians import GaussianModel
-
-
-def _rebuild(
-    model: GaussianModel, keep: torch.Tensor, sh: torch.Tensor | None = None
-) -> GaussianModel:
-    device = model.means.device
-    means = model.means.detach()[keep]
-    scales = model.scales.detach()[keep]
-    quats = model.quats.detach()[keep]
-    opacities = model.opacities.detach()[keep]
-    if model.sh_degree == 0:
-        return GaussianModel(
-            means,
-            scales=scales,
-            quats=quats,
-            opacities=opacities,
-            colors=model.colors.detach()[keep],
-        ).to(device)
-    coeffs = (model.raw_sh.detach() if sh is None else sh)[keep]
-    return GaussianModel(
-        means,
-        scales=scales,
-        quats=quats,
-        opacities=opacities,
-        sh_degree=model.sh_degree,
-        sh_coeffs=coeffs,
-        active_sh_degree=model.active_sh_degree,
-    ).to(device)
+from metalsplat.splat_model import SplatModel
 
 
 def prune_isolated(
-    model: GaussianModel, cell_size: float = 0.4, min_per_cell: int = 8
-) -> tuple[GaussianModel, int]:
+    model: SplatModel, cell_size: float = 0.4, min_per_cell: int = 8
+) -> tuple[SplatModel, int]:
     """Drops gaussians sitting in sparsely-populated regions of space.
 
     Voxelises positions and removes anything in a cell holding fewer than
@@ -70,10 +42,10 @@ def prune_isolated(
     n_pruned = int((~keep).sum().item())
     if n_pruned == 0:
         return model, 0
-    return _rebuild(model, keep), n_pruned
+    return model.select(keep), n_pruned
 
 
-def damp_view_dependence(model: GaussianModel, factor: float = 0.75) -> GaussianModel:
+def damp_view_dependence(model: SplatModel, factor: float = 0.75) -> SplatModel:
     """Scales the non-DC spherical-harmonics coefficients by `factor`.
 
     With a few hundred training views and no regularisation on the SH
@@ -92,8 +64,8 @@ def damp_view_dependence(model: GaussianModel, factor: float = 0.75) -> Gaussian
     """
     if model.sh_degree == 0:
         return model  # nothing view-dependent to damp
-    sh = model.raw_sh.detach().clone()
+    rows = model.raw_rows()
+    sh = rows["raw_sh"].clone()
     sh[:, 1:, :] *= factor
-    return _rebuild(
-        model, torch.ones(model.num_points, dtype=torch.bool, device=sh.device), sh
-    )
+    rows["raw_sh"] = sh
+    return model.with_rows(rows)

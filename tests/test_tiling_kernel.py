@@ -228,3 +228,32 @@ def test_tight_box_still_covers_every_tile_the_ellipse_reaches():
         if 0 <= tx < res.tiles_x and 0 <= ty < res.tiles_y
     }
     assert touched == expected
+
+
+def test_opacity_aware_extent_matches_reference():
+    means2d, depths, radii, valid = _scene(2000, seed=11)
+    g = torch.Generator().manual_seed(12)
+    # Includes opacities below 1/255, which must be culled outright.
+    opacities = torch.rand(means2d.shape[0], generator=g) ** 3
+    conics = _isotropic_conic(radii)
+
+    ref = bin_ref(means2d, depths, conics, radii, valid, W, H, 16, opacities)
+    got = bin_and_sort_gaussians(
+        means2d.to("mps"),
+        depths.to("mps"),
+        conics.to("mps"),
+        radii.to("mps"),
+        valid.to("mps"),
+        W,
+        H,
+        16,
+        opacities=opacities.to("mps"),
+    )
+    torch.mps.synchronize()
+
+    assert ref.sorted_gaussian_ids.numel() > 0
+    assert torch.equal(got.sorted_gaussian_ids.cpu(), ref.sorted_gaussian_ids)
+    assert torch.equal(got.tile_bins.cpu(), ref.tile_bins)
+    faint = (opacities <= 1.0 / 255.0).nonzero().flatten()
+    assert faint.numel() > 0
+    assert not torch.isin(ref.sorted_gaussian_ids, faint.to(torch.int32)).any()
