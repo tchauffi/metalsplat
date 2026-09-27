@@ -7,11 +7,9 @@ view-dependent color = max(eval_sh(raw_sh, view_dir) + 0.5, 0), matching
 standard 3DGS convention -- clamped below at 0 but not above, consumers
 clamp to [0, 1] for display).
 
-Extracted out of `GaussianModel` so the two model classes share one
-implementation instead of two copies that can drift; both classes register
-the returned tensor as their own `nn.Parameter` and hold their own
-`sh_degree`/`active_sh_degree` state, so this module stays plain functions,
-not a base class.
+Plain functions used by `metalsplat.splat_model.SplatModel`, the base both
+model classes share, which registers the returned tensor as its own
+`nn.Parameter` and holds the `sh_degree`/`active_sh_degree` state.
 """
 
 from __future__ import annotations
