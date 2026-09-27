@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
-from metalsplat.ops._validate import check_float32, check_shape
+from metalsplat.ops._validate import check_float32, check_shape, require_mps
 from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
 from metalsplat.reference.tiling_ref import MAX_SIGMA_EXTENT, sigma_extent
 
@@ -155,6 +155,7 @@ def project_gaussians_2dgs(
     """
     device = means.device
     n = means.shape[0]
+    require_mps("means", device)
     check_float32("means", means, (n, 3), device)
     check_float32("scales", scales, (n, 2), device)
     check_float32("quats", quats, (n, 4), device)

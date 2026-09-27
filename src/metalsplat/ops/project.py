@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
-from metalsplat.ops._validate import check_float32, check_shape
+from metalsplat.ops._validate import check_float32, check_shape, require_mps
 
 
 class ProjectGaussians(torch.autograd.Function):
@@ -162,6 +162,7 @@ def project_gaussians(
     """
     device = means.device
     n = means.shape[0]
+    require_mps("means", device)
     check_float32("means", means, (n, 3), device)
     check_float32("scales", scales, (n, 3), device)
     check_float32("quats", quats, (n, 4), device)

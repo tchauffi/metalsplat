@@ -4,8 +4,8 @@ This is the executable spec for the ``project`` pipeline stage: it is plain
 differentiable torch ops, so ``torch.autograd`` gives a correct backward for
 free. The Metal kernels in ``metalsplat.kernels.project`` reimplement this
 same math for speed; this module is what their forward *and* backward
-outputs get numerically checked against, and it doubles as a CPU-compatible
-fallback.
+outputs get numerically checked against. It runs on any device, CPU
+included, but `render()` does not dispatch to it: that needs MPS.
 
 Conventions (matching the original 3D Gaussian Splatting paper / gsplat):
 - World-space covariance: ``Sigma = R(quat) @ diag(scale)^2 @ R(quat)^T``.

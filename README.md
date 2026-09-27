@@ -173,7 +173,9 @@ Every kernel-backed stage has a pure-PyTorch reference implementation
 oracle the kernels are tested against (`tests/test_project.py`,
 `tests/test_rasterize.py`) -- both forward values and backward gradients,
 via `torch.autograd` on the reference vs. the kernel's hand-written
-backward. It also works as a CPU-compatible fallback.
+backward. It runs on any device, CPU included, so it can be called
+directly on small scenes -- but `render()` / `render_2dgs()` always use the
+Metal kernels and need tensors on the `mps` device.
 
 Training-loop logic (no Metal kernels -- runs between steps, not inside
 the differentiable render): `metalsplat/densify.py` (split/clone/prune,
@@ -399,8 +401,9 @@ automatically.
   format except 2 `scale_*` properties instead of 3).
 
 As with the 3DGS path, every kernel-backed stage has a pure-PyTorch twin
-under `metalsplat/reference/` that serves as the executable spec, the CPU
-fallback, and -- being plain differentiable torch -- the gradient oracle
+under `metalsplat/reference/` that serves as the executable spec, a
+CPU-runnable implementation for small scenes, and -- being plain
+differentiable torch -- the gradient oracle
 the hand-written Metal backward passes are tested against.
 
 ### Status

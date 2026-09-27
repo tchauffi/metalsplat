@@ -108,3 +108,17 @@ def test_non_float32_projection_input_raises():
             torch.zeros(3, device=DEV),
             10.0, 10.0, 8.0, 8.0, 16, 16,
         )  # fmt: skip
+
+
+@pytest.mark.parametrize("pipeline", ["3dgs", "2dgs"])
+def test_rendering_on_cpu_says_it_needs_mps(pipeline):
+    # Used to surface as torch's generic "Passed CPU tensor to MPS op".
+    from metalsplat import GaussianModel, render, render_2dgs
+
+    cam = Camera.identity(fx=16, fy=16, cx=8, cy=8, img_width=16, img_height=16)
+    if pipeline == "3dgs":
+        call = lambda: render(GaussianModel.random(4), cam)
+    else:
+        call = lambda: render_2dgs(Gaussian2DModel.random(4), cam)
+    with pytest.raises(ValueError, match="'mps' device"):
+        call()

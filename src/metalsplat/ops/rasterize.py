@@ -14,6 +14,7 @@ from metalsplat.ops._validate import (
     check_float32,
     check_shape,
     kernel_background,
+    require_mps,
 )
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE, bin_and_sort_gaussians
 
@@ -234,6 +235,7 @@ def rasterize_gaussians(
     """
     device = means2d.device
     n = means2d.shape[0]
+    require_mps("means2d", device)
     check_float32("means2d", means2d, (n, 2), device)
     check_float32("depths", depths, (n,), device)
     check_float32("conics", conics, (n, 3), device)

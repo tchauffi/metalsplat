@@ -6,8 +6,8 @@ gaussian (see ``project_2dgs_ref``'s module docstring for the ``M``/``H``/
 Not tile-based and not remotely fast -- every pixel walks every gaussian in
 depth order -- this is deliberately the simplest possible correct
 implementation, used only as the executable spec / gradient oracle for the
-Metal ``rasterize_2dgs`` kernel on small test scenes, and as a
-CPU-compatible fallback. It is plain differentiable torch ops, so
+Metal ``rasterize_2dgs`` kernel on small test scenes (it runs on CPU as
+well as MPS). It is plain differentiable torch ops, so
 ``torch.autograd`` gives its backward for free -- including for the
 distortion loss, whose closed-form backward (see `rasterize_2dgs.metal`)
 would otherwise be the hardest thing in this feature to hand-derive and

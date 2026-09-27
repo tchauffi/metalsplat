@@ -14,6 +14,7 @@ from metalsplat.ops._validate import (
     check_float32,
     check_shape,
     kernel_background,
+    require_mps,
 )
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE, bin_and_sort_rects
 from metalsplat.reference.rasterize_2dgs_ref import DEFAULT_FILTER_SIZE
@@ -332,6 +333,7 @@ def rasterize_gaussians_2dgs(
     """
     device = means2d.device
     n = means2d.shape[0]
+    require_mps("means2d", device)
     check_float32("means2d", means2d, (n, 2), device)
     check_float32("transform", transform, (n, 9), device)
     check_float32("normal", normal, (n, 3), device)

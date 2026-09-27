@@ -22,6 +22,21 @@ from __future__ import annotations
 import torch
 
 
+def require_mps(name: str, device: torch.device) -> None:
+    """Raises unless `device` is MPS, the only device the kernels run on.
+
+    Without this a CPU tensor reached the kernel dispatch and failed there
+    with torch's generic "Passed CPU tensor to MPS op".
+    """
+    if device.type != "mps":
+        raise ValueError(
+            f"{name} is on '{device}', but metalsplat's Metal kernels need tensors "
+            "on the 'mps' device (Apple Silicon). The pure-PyTorch implementations "
+            "in metalsplat.reference run anywhere, but are brute-force oracles for "
+            "small scenes rather than a render() backend."
+        )
+
+
 def check_float32(
     name: str, tensor: torch.Tensor, shape: tuple[int, ...], device: torch.device
 ) -> None:

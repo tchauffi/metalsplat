@@ -1,5 +1,5 @@
 """Pure-PyTorch reference projection of 2D gaussian splats ("surfels") to
-2D screen space. Executable spec / CPU fallback for
+2D screen space. Executable spec (runnable on CPU) for
 ``metalsplat.kernels.project_2dgs``, same role as ``project_ref`` for 3DGS.
 
 This does two distinct jobs:
