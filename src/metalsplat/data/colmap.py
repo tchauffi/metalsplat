@@ -128,9 +128,9 @@ def load_colmap_scene(
     (e.g. `downscale=2.0` halves both dimensions) -- a plain training-speed
     knob (fewer pixels per render/backward), matching 3DGS/2DGS's
     convention of a resolution downscale factor. Intrinsics don't need any
-    special handling for this: the existing `scale = actual_width /
-    colmap_cam.width` rescaling below already reacts to whatever size the
-    image actually is after resizing, the same way it already handles
+    special handling for this: the per-axis rescaling below (image size on
+    disk over COLMAP's calibration size) already reacts to whatever size
+    the image actually is after resizing, the same way it already handles
     scenes shipped with pre-downsampled image directories (e.g.
     MipNeRF360's `images_4`).
     """
@@ -157,8 +157,13 @@ def load_colmap_scene(
 
         colmap_cam = rec.cameras[colmap_image.camera_id]
         fx, fy, cx, cy = _camera_intrinsics(colmap_cam)
-        scale = actual_width / colmap_cam.width
-        fx, fy, cx, cy = fx * scale, fy * scale, cx * scale, cy * scale
+        # Per axis: rounding a downsampled size to whole pixels makes the
+        # two ratios differ slightly (garden's images_4: 1297/5187 against
+        # 840/3361), so the vertical intrinsics follow the height.
+        scale_x = actual_width / colmap_cam.width
+        scale_y = actual_height / colmap_cam.height
+        fx, cx = fx * scale_x, cx * scale_x
+        fy, cy = fy * scale_y, cy * scale_y
 
         cam_from_world = colmap_image.cam_from_world()
         R_wc = torch.from_numpy(

@@ -93,9 +93,13 @@ def test_downscale_halves_resolution_and_rescales_intrinsics():
 
     # Intrinsics rescale with the actual image size, same mechanism that
     # already handles pre-downsampled image directories (e.g. images_4).
-    scale = cam_half.img_width / cam_full.img_width
-    assert abs(cam_half.fx - cam_full.fx * scale) < 1e-3
-    assert abs(cam_half.cx - cam_full.cx * scale) < 1e-3
+    scale_x = cam_half.img_width / cam_full.img_width
+    scale_y = cam_half.img_height / cam_full.img_height
+    assert abs(cam_half.fx - cam_full.fx * scale_x) < 1e-3
+    assert abs(cam_half.cx - cam_full.cx * scale_x) < 1e-3
+    # Vertical intrinsics follow the height, which rounds independently.
+    assert abs(cam_half.fy - cam_full.fy * scale_y) < 1e-3
+    assert abs(cam_half.cy - cam_full.cy * scale_y) < 1e-3
 
 
 def test_importing_the_loader_leaves_the_environment_alone():
