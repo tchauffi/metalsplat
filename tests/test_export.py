@@ -210,3 +210,19 @@ def test_trailing_element_is_ignored(tmp_path):
     )
     loaded = load_ply(tmp_path / "b.ply")
     assert torch.allclose(loaded.means, model.means)
+
+
+@pytest.mark.parametrize("sh_degree", [0, 3])
+def test_empty_model_round_trips(tmp_path, sh_degree):
+    # Densify/prune can take a model to zero gaussians; saving it used to
+    # fail on a reshape(0, -1).
+    from metalsplat.export2dgs import load_ply as load_ply_2dgs
+    from metalsplat.export2dgs import save_ply as save_ply_2dgs
+    from metalsplat.gaussians_2dgs import Gaussian2DModel
+
+    save_ply(GaussianModel(torch.zeros(0, 3), sh_degree=sh_degree), tmp_path / "a.ply")
+    assert load_ply(tmp_path / "a.ply").num_points == 0
+    save_ply_2dgs(
+        Gaussian2DModel(torch.zeros(0, 3), sh_degree=sh_degree), tmp_path / "b.ply"
+    )
+    assert load_ply_2dgs(tmp_path / "b.ply").num_points == 0

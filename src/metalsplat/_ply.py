@@ -32,7 +32,9 @@ def color_columns(model: SplatModel) -> tuple[np.ndarray, np.ndarray]:
         return dc, np.zeros((n, 24), dtype=np.float32)
     sh = model.raw_sh.detach().cpu()  # (N, K, 3)
     dc = sh[:, 0, :].numpy().astype(np.float32)
-    rest = sh[:, 1:, :].transpose(1, 2).contiguous().reshape(n, -1).numpy()
+    # Explicit width, not -1: reshape cannot infer it for an empty model.
+    n_rest = (sh.shape[1] - 1) * 3
+    rest = sh[:, 1:, :].transpose(1, 2).contiguous().reshape(n, n_rest).numpy()
     return dc, rest.astype(np.float32)
 
 
