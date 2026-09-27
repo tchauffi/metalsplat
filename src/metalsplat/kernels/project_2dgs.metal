@@ -10,26 +10,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// sqrt(2 ln 255): the farthest (in splat sigmas) any splat composites
-// before its alpha falls below the rasterizer's 1/255 cutoff. Matches
-// reference/tiling_ref.py MAX_SIGMA_EXTENT.
-constant float MAX_SIGMA_EXTENT = 3.3290429;
-
-inline float3x3 mat3_from_rowmajor(constant float* flat) {
-    return float3x3(float3(flat[0], flat[3], flat[6]),
-                     float3(flat[1], flat[4], flat[7]),
-                     float3(flat[2], flat[5], flat[8]));
-}
-
-inline float3x3 quat_to_rotmat(float w, float x, float y, float z) {
-    float xx = x * x, yy = y * y, zz = z * z;
-    float xy = x * y, xz = x * z, yz = y * z;
-    float wx = w * x, wy = w * y, wz = w * z;
-    float3 col0 = float3(1 - 2 * (yy + zz), 2 * (xy + wz), 2 * (xz - wy));
-    float3 col1 = float3(2 * (xy - wz), 1 - 2 * (xx + zz), 2 * (yz + wx));
-    float3 col2 = float3(2 * (xz + wy), 2 * (yz - wx), 1 - 2 * (xx + yy));
-    return float3x3(col0, col1, col2);
-}
+#include "common.metal"
 
 // Exact screen rectangle (xmin, ymin, xmax, ymax) of everywhere the splat
 // can composite at alpha cutoff radius `c` (in splat sigmas). See
@@ -242,19 +223,9 @@ kernel void project_2dgs_backward(
     float3 D_Rq1 = d_t_v * sv;
     float3 D_Rq2 = flip_sign * d_normal_up;
 
-    float d_R00 = D_Rq0[0], d_R10 = D_Rq0[1], d_R20 = D_Rq0[2];
-    float d_R01 = D_Rq1[0], d_R11 = D_Rq1[1], d_R21 = D_Rq1[2];
-    float d_R02 = D_Rq2[0], d_R12 = D_Rq2[1], d_R22 = D_Rq2[2];
-
-    float w = q.x, qx = q.y, qy = q.z, qz = q.w;
-
-    float d_w = 2.0 * qz * (d_R10 - d_R01) + 2.0 * qy * (d_R02 - d_R20) + 2.0 * qx * (d_R21 - d_R12);
-    float d_qx = 2.0 * qy * (d_R10 + d_R01) + 2.0 * qz * (d_R20 + d_R02) + 2.0 * w * (d_R21 - d_R12) - 4.0 * qx * (d_R11 + d_R22);
-    float d_qy = 2.0 * qx * (d_R10 + d_R01) + 2.0 * qz * (d_R21 + d_R12) + 2.0 * w * (d_R02 - d_R20) - 4.0 * qy * (d_R00 + d_R22);
-    float d_qz = 2.0 * w * (d_R10 - d_R01) + 2.0 * qx * (d_R20 + d_R02) + 2.0 * qy * (d_R21 + d_R12) - 4.0 * qz * (d_R00 + d_R11);
-
-    d_quats[gid * 4 + 0] = d_w;
-    d_quats[gid * 4 + 1] = d_qx;
-    d_quats[gid * 4 + 2] = d_qy;
-    d_quats[gid * 4 + 3] = d_qz;
+    float4 d_q = quat_to_rotmat_backward(q, float3x3(D_Rq0, D_Rq1, D_Rq2));
+    d_quats[gid * 4 + 0] = d_q.x;
+    d_quats[gid * 4 + 1] = d_q.y;
+    d_quats[gid * 4 + 2] = d_q.z;
+    d_quats[gid * 4 + 3] = d_q.w;
 }
