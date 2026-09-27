@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from metalsplat.densify import DensifyStats
+from metalsplat.densify import DensifyStats, select_candidates
 from metalsplat.gaussians_2dgs import Gaussian2DModel
 from metalsplat.optim import NEW_GAUSSIAN
 from metalsplat.utils.quaternion import quat_to_rotmat
@@ -120,6 +120,9 @@ def densify_and_prune_2dgs(
     is too; a gaussian covering one pixel in every view is unaffected by
     the paper's weighting and rescued by this.
 
+    `max_points` is a hard cap on split/clone growth, as in
+    `metalsplat.densify.densify_and_prune`; pruning runs at the cap too.
+
     `grad_count` is still what defines visibility, so a gaussian that was
     in frustum but composited into no pixel is skipped rather than
     dividing by zero.
@@ -135,55 +138,26 @@ def densify_and_prune_2dgs(
     """
     device = model.means.device
     n = model.num_points
+    n_before = n
 
     visible = grad_count > 0
-    n_before = n
-    if not bool(visible.any()) or (max_points is not None and n >= max_points):
-        unchanged = torch.arange(n, device=device)
-        return model, DensifyStats(
-            n_before,
-            0,
-            0,
-            0,
-            n_before,
-            grad_threshold,
-            unchanged,
-            unchanged,
-        )
-
     avg_grad = torch.zeros(n, device=device)
     if pixel_count is None:
         avg_grad[visible] = grad_accum[visible] / grad_count[visible]
     else:
         # Only gaussians that actually covered a pixel have a meaningful
         # per-pixel mean; the rest keep 0 and fall below any threshold.
+        # `pixel_count` is wired up independently of `grad_count` (it needs
+        # `pixel_count_accum=` on `render_2dgs`), so a caller who passes one
+        # and forgets the other narrows every gaussian away here, and
+        # select_candidates then selects nothing rather than calibrating on
+        # an empty set.
         covered = visible & (pixel_count > 0)
         avg_grad[covered] = grad_accum[covered] / pixel_count[covered]
         visible = covered
-    if not bool(visible.any()):
-        # Re-checked after the narrowing above, not just at the top of the
-        # function: `pixel_count` is wired up independently of
-        # `grad_count` (it needs `pixel_count_accum=` on `render_2dgs`),
-        # so a caller who passes one and forgets the other arrives here
-        # with every gaussian narrowed away. Without this, the
-        # self-calibrating first round hits `torch.quantile` with an empty
-        # tensor and raises instead of simply doing nothing.
-        unchanged = torch.arange(n, device=device)
-        return model, DensifyStats(
-            n_before,
-            0,
-            0,
-            0,
-            n_before,
-            grad_threshold,
-            unchanged,
-            unchanged,
-        )
-    if grad_threshold is None:
-        threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
-    else:
-        threshold = float(grad_threshold)
-    candidates = visible & (avg_grad >= threshold)
+    candidates, threshold = select_candidates(
+        avg_grad, visible, grad_percentile, grad_threshold, max_points
+    )
 
     means = model.means.detach()
     scales = model.scales.detach()  # (N, 2)
@@ -197,8 +171,11 @@ def densify_and_prune_2dgs(
     # candidates, so it answers "is this larger than typical for the
     # model?" rather than "is it larger than the other high-error ones?".
     extent = scales.max(dim=-1).values
-    split_bar = torch.quantile(extent, split_scale_quantile)
-    is_large = candidates & (extent > split_bar)
+    if bool(candidates.any()):
+        split_bar = torch.quantile(extent, split_scale_quantile)
+        is_large = candidates & (extent > split_bar)
+    else:
+        is_large = candidates
     is_small = candidates & ~is_large
 
     split_idx = is_large.nonzero(as_tuple=True)[0]
@@ -266,6 +243,11 @@ def densify_and_prune_2dgs(
     if max_world_size is not None:
         prune |= rows_scales.max(dim=-1).values > max_world_size
     keep = ~prune
+    if n_new == 0 and not bool(prune.any()):
+        unchanged = torch.arange(n, device=device)
+        return model, DensifyStats(
+            n_before, 0, 0, 0, n_before, threshold, unchanged, unchanged
+        )
 
     final_means = rows_means[keep]
     final_scales = rows_scales[keep]

@@ -79,6 +79,49 @@ def test_max_points_stops_densification():
     assert stats.n_split == 0 and stats.n_cloned == 0
 
 
+def test_max_points_still_prunes():
+    # At the cap no gaussian may be added, but pruning is independent of
+    # growth: it used to be skipped along with split/clone.
+    n = 10
+    model = _model(n)
+    with torch.no_grad():
+        model.raw_opacities[3] = -10.0
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+
+    new_model, stats = densify_and_prune(
+        model, grad_accum, grad_count, scene_scale=SCENE_SCALE, max_points=n
+    )
+
+    assert stats.n_split == 0 and stats.n_cloned == 0
+    assert stats.n_pruned == 1
+    assert new_model.num_points == n - 1
+
+
+def test_max_points_is_a_hard_cap():
+    # 5 candidates above the bar, room for 2: only the 2 highest-gradient
+    # ones are densified instead of overshooting the cap by 3.
+    n = 10
+    model = _model(n)
+    grad_count = torch.ones(n)
+    grad_accum = torch.full((n,), 1.0)
+    grad_accum[:5] = torch.tensor([5.0, 9.0, 6.0, 8.0, 7.0])
+
+    new_model, stats = densify_and_prune(
+        model,
+        grad_accum,
+        grad_count,
+        scene_scale=SCENE_SCALE,
+        grad_threshold=2.0,
+        max_points=n + 2,
+    )
+
+    assert stats.n_split + stats.n_cloned == 2
+    assert new_model.num_points == n + 2
+    kept_parents = set(stats.parent_index[n:].tolist())
+    assert kept_parents == {1, 3}  # the two largest gradients
+
+
 def test_split_clone_and_prune_preserves_sh_coefficients():
     n = 10
     means = torch.zeros(n, 3)

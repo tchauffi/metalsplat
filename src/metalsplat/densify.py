@@ -51,6 +51,45 @@ class DensifyStats:
     parent_index: torch.Tensor | None = None
 
 
+def select_candidates(
+    avg_grad: torch.Tensor,  # (N,) average densification signal
+    visible: torch.Tensor,  # (N,) bool, gaussians with a meaningful avg_grad
+    grad_percentile: float,
+    grad_threshold: float | None,
+    max_points: int | None,
+) -> tuple[torch.Tensor, float | None]:
+    """Split/clone candidates for one densify round, and the bar used.
+
+    Returns `(candidates, threshold)`. When nothing is visible, or the model
+    is already at `max_points`, no gaussian is selected and no bar is
+    computed, so `threshold` is just `grad_threshold` passed back (None if
+    the caller has not frozen one yet -- see DensifyStats.grad_threshold).
+
+    Every candidate adds exactly one gaussian net (a split replaces one with
+    two, a clone adds one), so under `max_points` the candidates are cut to
+    the `max_points - N` highest-gradient ones: the cap holds exactly rather
+    than being overshot by a whole round's worth of candidates.
+    """
+    n = avg_grad.shape[0]
+    none = torch.zeros(n, dtype=torch.bool, device=avg_grad.device)
+    budget = None if max_points is None else max_points - n
+    if not bool(visible.any()) or (budget is not None and budget <= 0):
+        return none, grad_threshold
+
+    if grad_threshold is None:
+        threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
+    else:
+        threshold = float(grad_threshold)
+    candidates = visible & (avg_grad >= threshold)
+
+    if budget is not None:
+        idx = candidates.nonzero(as_tuple=True)[0]
+        if idx.numel() > budget:
+            candidates = none.clone()
+            candidates[idx[avg_grad[idx].topk(budget).indices]] = True
+    return candidates, threshold
+
+
 def densify_and_prune(
     model: GaussianModel,
     grad_accum: torch.Tensor,  # (N,) accumulated means2d-grad norms since last call
@@ -86,6 +125,10 @@ def densify_and_prune(
     is not, so the returned `stats.grad_threshold` lets a caller calibrate
     on the first round and freeze it thereafter.
 
+    `max_points` is a hard cap on split/clone growth: a round keeps only as
+    many of the highest-gradient candidates as fit under it, and selects
+    none at the cap. Pruning still runs either way.
+
     Pruning follows the reference's order: split and clone first, then
     prune the *result*, so a large gaussian with a high gradient is split
     rather than dropped, and a clone or split child is pruned by the same
@@ -104,29 +147,14 @@ def densify_and_prune(
     """
     device = model.means.device
     n = model.num_points
+    n_before = n
 
     visible = grad_count > 0
-    n_before = n
-    if not bool(visible.any()) or (max_points is not None and n >= max_points):
-        unchanged = torch.arange(n, device=device)
-        return model, DensifyStats(
-            n_before,
-            0,
-            0,
-            0,
-            n_before,
-            grad_threshold,
-            unchanged,
-            unchanged,
-        )
-
     avg_grad = torch.zeros(n, device=device)
     avg_grad[visible] = grad_accum[visible] / grad_count[visible]
-    if grad_threshold is None:
-        threshold = float(torch.quantile(avg_grad[visible], grad_percentile))
-    else:
-        threshold = float(grad_threshold)
-    candidates = visible & (avg_grad >= threshold)
+    candidates, threshold = select_candidates(
+        avg_grad, visible, grad_percentile, grad_threshold, max_points
+    )
 
     means = model.means.detach()
     scales = model.scales.detach()
@@ -215,6 +243,11 @@ def densify_and_prune(
         screen_big[: unsplit_idx.numel()] = max_radii2d[unsplit] > max_screen_size
         prune |= screen_big
     keep = ~prune
+    if n_new == 0 and not bool(prune.any()):
+        unchanged = torch.arange(n, device=device)
+        return model, DensifyStats(
+            n_before, 0, 0, 0, n_before, threshold, unchanged, unchanged
+        )
 
     final_means = rows_means[keep]
     final_scales = rows_scales[keep]
