@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
+from metalsplat.ops._validate import check_float32
 from metalsplat.reference.sh_ref import MAX_SH_DEGREE, num_sh_coeffs
 
 
@@ -88,10 +89,9 @@ def eval_sh(
     """
     if sh_coeffs.dim() != 3 or sh_coeffs.shape[2] != 3:
         raise ValueError(f"sh_coeffs must be (N, K, 3), got {tuple(sh_coeffs.shape)}")
-    if dirs.shape != (sh_coeffs.shape[0], 3):
-        raise ValueError(
-            f"dirs must be ({sh_coeffs.shape[0]}, 3), got {tuple(dirs.shape)}"
-        )
+    n = sh_coeffs.shape[0]
+    check_float32("sh_coeffs", sh_coeffs, (n, sh_coeffs.shape[1], 3), sh_coeffs.device)
+    check_float32("dirs", dirs, (n, 3), sh_coeffs.device)
     stored_degree = buffer_sh_degree(sh_coeffs.shape[1])
     if active_degree is None:
         active_degree = stored_degree

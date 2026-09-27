@@ -9,6 +9,12 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
+from metalsplat.ops._validate import (
+    check_accumulator,
+    check_float32,
+    check_shape,
+    kernel_background,
+)
 from metalsplat.ops.tiling import DEFAULT_TILE_SIZE, bin_and_sort_gaussians
 
 
@@ -222,6 +228,18 @@ def rasterize_gaussians(
     means2d.grad's signed sum can). Pass the same persistent tensor across
     many steps to accumulate; it's mutated in place, not returned.
     """
+    device = means2d.device
+    n = means2d.shape[0]
+    check_float32("means2d", means2d, (n, 2), device)
+    check_float32("depths", depths, (n,), device)
+    check_float32("conics", conics, (n, 3), device)
+    check_float32("opacities", opacities, (n,), device)
+    check_float32("colors", colors, (n, 3), device)
+    check_shape("radii", radii, (n,))
+    check_shape("valid", valid, (n,))
+    check_accumulator("abs_grad_accum", abs_grad_accum, n, device)
+    background = kernel_background(background, device)
+
     binning = bin_and_sort_gaussians(
         means2d.detach(),
         depths.detach(),
@@ -236,9 +254,6 @@ def rasterize_gaussians(
         # off at a tile border (see tiling_ref.sigma_extent).
         opacities=opacities.detach(),
     )
-    device = means2d.device
-    if background is None:
-        background = torch.zeros(3, device=device, dtype=torch.float32)
 
     image, depth, final_T = _RasterizeGaussiansImpl.apply(
         means2d,

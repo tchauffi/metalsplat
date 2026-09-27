@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 
 from metalsplat.kernels import load as load_kernel
+from metalsplat.ops._validate import check_float32, check_shape
 
 
 class Project2DGSGaussians(torch.autograd.Function):
@@ -168,6 +169,13 @@ def project_gaussians_2dgs(
     metalsplat.reference.project_2dgs_ref.Projection2DGSResult for field
     semantics.
     """
+    device = means.device
+    n = means.shape[0]
+    check_float32("means", means, (n, 3), device)
+    check_float32("scales", scales, (n, 2), device)
+    check_float32("quats", quats, (n, 4), device)
+    check_shape("R_wc", R_wc, (3, 3))
+    check_shape("t_wc", t_wc, (3,))
     return Project2DGSGaussians.apply(
         means,
         scales,
