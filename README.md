@@ -21,7 +21,10 @@ Trained by `examples/train_garden.py` and rendered by
 `examples/render_video.py`: 15000 iterations in 42 minutes on an M-series
 GPU, reaching **23.5 dB PSNR / 0.741 SSIM** on the 24 held-out views with
 330k gaussians. The trained scene renders back at **93 fps** at
-1297x840 (`examples/benchmark.py`).
+1297x840 (`examples/benchmark.py`). That run trained at the images' full
+1297x840 for 15000 steps; the script's current defaults differ
+(`NUM_ITERS = 30_000`, `RESOLUTION_DOWNSCALE = 2.0`) -- its constants
+block is the source of truth for what a run uses.
 
 ## Requirements
 
@@ -34,7 +37,9 @@ GPU, reaching **23.5 dB PSNR / 0.741 SSIM** on the 24 held-out views with
   `KMP_DUPLICATE_LIB_OK=TRUE` for the process, unless already set: torch
   and pycolmap each bundle an OpenMP runtime, and the process aborts on the
   second one otherwise. Set it yourself (either way) to take control of
-  that choice.
+  that choice -- and set it before your own `import pycolmap` if you
+  import pycolmap directly alongside torch, since the loader only sets it
+  when it runs.
 
 ```bash
 uv sync
@@ -151,10 +156,11 @@ CUDA kernels.
   covariance from scale+quaternion, the EWA/affine perspective
   approximation, and the resulting 2D conic (inverse covariance) and pixel
   radius. Forward and backward are both hand-written MSL kernels.
-- **`metalsplat/ops/tiling.py`** (plain torch/MPS ops, no kernel): bins
-  projected gaussians into 16x16-pixel tiles and sorts them by (tile,
-  depth) via a single packed sort key -- gsplat itself doesn't use a
-  custom kernel for this stage either, relying on a generic sort.
+- **`metalsplat/ops/tiling.py`** (Metal kernels, `kernels/tiling.metal`,
+  plus torch's sort): bins each gaussian's screen rectangle into
+  16x16-pixel tiles and sorts the (gaussian, tile) pairs by (tile, depth)
+  via a single packed sort key. Two small kernels count and emit the
+  pairs; the ordering itself is a generic sort, as in gsplat.
 - **`metalsplat/ops/rasterize.py`** (Metal kernel, `kernels/rasterize.metal`):
   tile-based front-to-back alpha compositing. One thread per pixel, one
   threadgroup per tile. Backward accumulates per-gaussian gradients via
@@ -365,8 +371,9 @@ automatically.
   `(N, 2)` -- the tangent-plane extents `(s_u, s_v)` -- with no third,
   depth-axis scale. `quat_to_rotmat`'s columns 0/1 are the disk's tangent
   axes, column 2 its surface normal (`.normals`, sign-flipped to face the
-  camera at render time). Color/SH parameterization is shared with
-  `GaussianModel` via `metalsplat/sh_color.py`.
+  camera at render time). Everything but the scale count -- activations,
+  color/SH, lossless row operations -- is shared with `GaussianModel`
+  through `metalsplat/splat_model.py`.
 - **`metalsplat/ops/project_2dgs.py`** (Metal kernel,
   `kernels/project_2dgs.metal`): outputs the 9 independent entries of
   `M = W @ H` (the composition of the camera's projection with the local
@@ -394,12 +401,13 @@ automatically.
   implementation's handling of accumulated alpha -- the rasterizer's depth
   and normal outputs are alpha-weighted *sums*, so the normal loss needs
   `1 - final_T` to interpret either of them.
-- **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`/
-  `prune_low_opacity_2dgs`, adaptive density control for `Gaussian2DModel`
-  -- a parallel module to `metalsplat/densify.py`, differing only in
-  split-offset sampling (confined to the tangent plane, since a 2D splat
-  has no third axis to offset along). `reset_opacity` is reused unchanged
-  from the 3DGS module.
+- **`metalsplat/densify2dgs.py`**: `densify_and_prune_2dgs`, adaptive
+  density control for `Gaussian2DModel`. Candidate selection, the
+  split/clone/prune step, `reset_opacity` and `prune_low_opacity` are
+  shared with `metalsplat/densify.py`; this module adds only what differs
+  for a flat splat -- split offsets confined to the tangent plane, a split
+  bar relative to the model's own sizes, and optional per-pixel
+  normalization of the densification signal.
 - **`metalsplat/export2dgs.py`**: `save_ply`/`load_ply` for
   `Gaussian2DModel`, matching the official 2DGS reference implementation's
   own `.ply` layout exactly (identical to `metalsplat/export.py`'s 3DGS

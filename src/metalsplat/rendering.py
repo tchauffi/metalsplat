@@ -51,8 +51,7 @@ def render(
     (per-pixel transmittance, close to 1 where ~no gaussian contributed) is
     used by metalsplat.seed to find uncovered regions; `depth` is the
     alpha-weighted expected depth (forward-only, no gradient); `radii` is
-    each gaussian's projected pixel radius, which training tracks the
-    maximum of for densify_and_prune's screen-size pruning.
+    each gaussian's projected pixel radius (0 if culled).
 
     `abs_grad_accum`, if given, is passed through to rasterize_gaussians:
     an (N,) tensor that backward() atomically adds each gaussian's

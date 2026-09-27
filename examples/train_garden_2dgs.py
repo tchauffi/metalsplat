@@ -562,8 +562,9 @@ def main() -> None:
             reset_opacity(state.model, optimizer=state.optimizer)
             print(f"  opacity reset @ step {step}", flush=True)
 
-        # Standalone prune: keeps running after DENSIFY_STOP, unlike
-        # densify_and_prune_2dgs's own inline prune -- see module docstring.
+        # Standalone prune on its own interval, in addition to
+        # densify_and_prune_2dgs's inline one; it stops at DENSIFY_STOP too
+        # (see PRUNE_STOP for why).
         if PRUNE_START <= step <= PRUNE_STOP and step % PRUNE_INTERVAL == 0:
             model, n_pruned, prune_index = prune_low_opacity_2dgs(
                 state.model, prune_opacity_thresh=STANDALONE_PRUNE_OPACITY_THRESH

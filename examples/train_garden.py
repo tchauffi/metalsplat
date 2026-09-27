@@ -4,7 +4,7 @@ loss, SparseAdam (see metalsplat.optim) with a decayed means learning rate so
 gaussians outside the sampled view this step aren't spuriously decayed,
 periodic adaptive density control (split/clone/prune), and periodic
 loss/PSNR logging with saved renders for a couple of held-out eval views.
-Optional spherical harmonics (SH_DEGREE=2) for view-dependent color.
+Spherical harmonics for view-dependent color (SH_DEGREE, 3 by default).
 
 Usage: uv run python examples/train_garden.py
 """
